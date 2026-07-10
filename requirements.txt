@@ -1,0 +1,4 @@
+pygame
+hid
+lammps
+numpy
