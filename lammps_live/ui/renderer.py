@@ -80,39 +80,60 @@ class Renderer:
             hy = end[1] + ARROWHEAD_LEN * math.sin(head_angle)
             pygame.draw.line(self.screen, color, end, (hx, hy), width)
 
-    def _draw_trail(self, trail, color):
-        """Puller motion trail: a thin same-colored polyline over the last
-        trail.window_seconds, fading (alpha towards 0) the further back in
-        time each segment is. Drawn on a dedicated per-pixel-alpha surface
-        (cleared and reused each frame) since the main screen surface has no
-        alpha channel of its own -- pygame.draw.line would just ignore it."""
+    def _draw_trails(self, trails):
+        """Every atom's motion trail: a thin same-colored (puller vs.
+        crystal) polyline per atom over the last trails.window_seconds,
+        fading (alpha towards 0) the further back in time each segment is.
+        Drawn on a dedicated per-pixel-alpha surface (cleared and reused
+        each frame) since the main screen surface has no alpha channel of
+        its own -- pygame.draw.line would just ignore it.
+
+        Segments are found by walking consecutive frame snapshots and
+        matching atom ids present in both -- see AtomTrails' docstring for
+        why id (not array position) is the right join key.
+
+        The box is periodic in x (see systems' "boundary p f p"): an atom
+        drifting across that edge has its coordinate wrap from one side of
+        the box to the other between two samples, which -- read naively --
+        looks like a giant one-frame jump straight across the box. Segments
+        whose endpoints are more than half the box apart are that wrap
+        artifact, not real motion, and are skipped rather than drawn."""
         self.trail_surface.fill((0, 0, 0, 0))
-        pts = list(trail.points)
-        if len(pts) < 2:
+        frames = list(trails.frames)
+        if len(frames) < 2:
             return
-        now = pts[-1][0]
-        window = trail.window_seconds
-        r, g, b = color
-        for (_, x0, y0), (t1, x1, y1) in zip(pts, pts[1:]):
+        now = frames[-1][0]
+        window = trails.window_seconds
+        max_dx, max_dy = self.box_x * 0.5, self.box_y * 0.5
+        for (_, snap0), (t1, snap1) in zip(frames, frames[1:]):
             age = now - t1
             alpha = 255.0 * (1.0 - age / window)
             if alpha <= 1.0:
                 continue
-            p0 = self.sim_to_screen(x0, y0)
-            p1 = self.sim_to_screen(x1, y1)
-            pygame.draw.line(self.trail_surface, (r, g, b, int(alpha)), p0, p1, 1)
+            alpha_i = int(alpha)
+            for atom_id, (x1, y1, is_puller) in snap1.items():
+                prev = snap0.get(atom_id)
+                if prev is None:
+                    continue
+                x0, y0, _ = prev
+                if abs(x1 - x0) > max_dx or abs(y1 - y0) > max_dy:
+                    continue  # periodic-boundary wrap, not real motion
+                r, g, b = PULLER_COLOR if is_puller else CRYSTAL_COLOR
+                p0 = self.sim_to_screen(x0, y0)
+                p1 = self.sim_to_screen(x1, y1)
+                pygame.draw.line(self.trail_surface, (r, g, b, alpha_i), p0, p1, 1)
         self.screen.blit(self.trail_surface, (0, 0))
 
     def draw_sim(self, positions, is_puller, puller_pos, input_force, reaction_force,
-                 fps, spec, heat_fraction=0.0, sim_time_ps=0.0, puller_trail=None):
+                 fps, spec, heat_fraction=0.0, sim_time_ps=0.0, atom_trails=None):
         self.screen.fill(BG)
 
         top_left = self.sim_to_screen(0, self.box_y)
         size = (self.box_x * self.scale, self.box_y * self.scale)
         pygame.draw.rect(self.screen, BOX_OUTLINE, (*top_left, *size), width=1)
 
-        if puller_trail is not None:
-            self._draw_trail(puller_trail, PULLER_COLOR)
+        if atom_trails is not None:
+            self._draw_trails(atom_trails)
 
         puller_xy = None
         for (x, y), p in zip(positions, is_puller):
@@ -277,9 +298,9 @@ class Renderer:
     def draw(self, positions, is_puller, puller_pos, input_force, reaction_force, fps,
               spec, systems, current_key, sliders, thermo_now, puller_energy,
               history, rdf, heat_fraction=0.0, sim_time_ps=0.0, puller_speed_m_s=None,
-              puller_trail=None):
+              atom_trails=None):
         self.draw_sim(positions, is_puller, puller_pos, input_force, reaction_force,
-                       fps, spec, heat_fraction, sim_time_ps, puller_trail)
+                       fps, spec, heat_fraction, sim_time_ps, atom_trails)
         self.draw_panel(systems, current_key, sliders, thermo_now, puller_energy,
                          history, rdf, spec, puller_speed_m_s)
         pygame.display.flip()

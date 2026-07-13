@@ -114,7 +114,12 @@ class MDSystem(ABC):
 
     @abstractmethod
     def get_all_positions(self):
-        """Returns (positions Nx2, is_puller boolarray N)."""
+        """Returns (ids N, positions Nx2, is_puller boolarray N). ids are
+        LAMMPS atom ids, stable identities across frames -- needed (rather
+        than array index) because LAMMPS is free to reorder its local atom
+        arrays between steps (e.g. periodic spatial sorting), which array
+        index alone can't survive (see ui/trail.py, which keys per-atom
+        motion trails by id for exactly this reason)."""
 
     @abstractmethod
     def get_box_size(self):

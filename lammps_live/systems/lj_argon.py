@@ -291,7 +291,7 @@ class LJArgonSystem(MDSystem):
         nlocal = self.lmp.get_natoms()
         xs = self.lmp.numpy.extract_atom("x")[:nlocal]
         ids = self.lmp.numpy.extract_atom("id")[:nlocal]
-        return xs[:, :2].copy(), (ids == self.puller_id)
+        return ids.copy(), xs[:, :2].copy(), (ids == self.puller_id)
 
     def get_box_size(self):
         return self.xhi - self.xlo, self.yhi - self.ylo

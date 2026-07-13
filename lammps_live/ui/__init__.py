@@ -1,6 +1,6 @@
 from .plotting import RollingHistory
 from .renderer import Renderer
-from .trail import Trail
+from .trail import AtomTrails
 from .widgets import Slider
 
-__all__ = ["Renderer", "Slider", "RollingHistory", "Trail"]
+__all__ = ["Renderer", "Slider", "RollingHistory", "AtomTrails"]

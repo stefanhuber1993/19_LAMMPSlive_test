@@ -15,7 +15,7 @@ from .forcefeedback import (
 )
 from .input import CP_OFFSET_MAX, DAMPER_COEFFICIENT_MAX, JoystickInput, MouseInput, SPRING_STIFFNESS_MAX
 from .systems import get_system_class, list_systems
-from .ui import Renderer, RollingHistory, Slider, Trail
+from .ui import AtomTrails, Renderer, RollingHistory, Slider
 
 STEPS_PER_FRAME_CAP = 200  # sanity cap if a system's timestep is set absurdly small
 
@@ -50,7 +50,8 @@ class App:
         self.temp_slider = None
         self.damping_slider = None
         self.history = None
-        self.puller_trail = None
+        self.atom_trails = None
+        self._trail_frame_counter = 0
         self.energy_baseline = None
         self.sim_wall_time = 0.0
         self.steps_per_frame = 1
@@ -84,10 +85,11 @@ class App:
             self.history = RollingHistory(config.HISTORY_WINDOW_SECONDS, ["temp", "press", "ke", "pe", "etotal"])
         else:
             self.history.reset()
-        if self.puller_trail is None:
-            self.puller_trail = Trail(config.TRAIL_WINDOW_SECONDS)
+        if self.atom_trails is None:
+            self.atom_trails = AtomTrails(config.TRAIL_WINDOW_SECONDS)
         else:
-            self.puller_trail.reset()
+            self.atom_trails.reset()
+        self._trail_frame_counter = 0
         self.energy_baseline = None
         self.sim_wall_time = 0.0
 
@@ -193,8 +195,6 @@ class App:
         ke0, pe0, etotal0 = self.energy_baseline
         self.history.add(self.sim_wall_time, temp=temp, press=press,
                           ke=ke - ke0, pe=pe - pe0, etotal=etotal - etotal0)
-        if pos is not None:
-            self.puller_trail.add(self.sim_wall_time, pos[0], pos[1])
         t_min = spec.temperature.vmin
         t_max = spec.temperature.vmax
         heat_fraction = max(0.0, min(1.0, (temp - t_min) / (t_max - t_min)))
@@ -204,7 +204,10 @@ class App:
         sim_time_ps = self.system.get_sim_time()
         puller_speed_m_s = units.speed_to_m_per_s(math.hypot(*vel)) if vel is not None else None
 
-        positions, is_puller = self.system.get_all_positions()
+        ids, positions, is_puller = self.system.get_all_positions()
+        self._trail_frame_counter += 1
+        if self._trail_frame_counter % config.TRAIL_SAMPLE_EVERY_N_FRAMES == 0:
+            self.atom_trails.add(self.sim_wall_time, ids, positions, is_puller)
         self.renderer.draw(
             positions, is_puller, pos,
             (input_fx, input_fy), interaction_force, self.clock.get_fps(),
@@ -213,7 +216,7 @@ class App:
             (temp, press, ke, pe, etotal), (puller_ke, puller_pe),
             self.history, rdf, heat_fraction=heat_fraction,
             sim_time_ps=sim_time_ps, puller_speed_m_s=puller_speed_m_s,
-            puller_trail=self.puller_trail,
+            atom_trails=self.atom_trails,
         )
 
         new_dt = self.clock.tick(60) / 1000.0
