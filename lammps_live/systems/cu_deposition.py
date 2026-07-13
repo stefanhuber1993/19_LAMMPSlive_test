@@ -137,6 +137,7 @@ class CopperEAMSystem(MDSystem):
         self.lmp = lammps(cmdargs=["-log", "none", "-screen", "none"])
         self._build()
         self.set_input_force(0.0, 0.0)
+        self._interactive_ps = 0.0  # elapsed sim time since settle finished, see get_sim_time
 
     def _build(self):
         lmp = self.lmp
@@ -301,6 +302,10 @@ class CopperEAMSystem(MDSystem):
 
     def step(self, n=4):
         self.lmp.command(f"run {n}")
+        self._interactive_ps += n * TIMESTEP
+
+    def get_sim_time(self):
+        return self._interactive_ps
 
     def get_puller_state(self):
         nlocal = self.lmp.get_natoms()

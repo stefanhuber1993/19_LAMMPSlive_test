@@ -6,6 +6,7 @@ import random
 
 import pygame
 
+from .. import units
 from .plotting import draw_plot
 from .theme import (
     ARROWHEAD_ANGLE, ARROWHEAD_LEN, BG, BOX_OUTLINE, CRYSTAL_COLOR, CRYSTAL_RADIUS,
@@ -74,7 +75,7 @@ class Renderer:
             pygame.draw.line(self.screen, color, end, (hx, hy), width)
 
     def draw_sim(self, positions, is_puller, puller_pos, input_force, reaction_force,
-                 fps, spec, heat_fraction=0.0):
+                 fps, spec, heat_fraction=0.0, sim_time_ps=0.0):
         self.screen.fill(BG)
 
         top_left = self.sim_to_screen(0, self.box_y)
@@ -110,8 +111,9 @@ class Renderer:
 
         ix, iy = input_force
         rx, ry = reaction_force
+        sim_time_str = units.format_sim_time(sim_time_ps)
         label = self.font.render(
-            f"{spec.name}  |  input force: ({ix:4.1f}, {iy:4.1f}) eV/A   "
+            f"{spec.name}  |  sim time: {sim_time_str}   input force: ({ix:4.1f}, {iy:4.1f}) eV/A   "
             f"interaction force: ({rx:5.1f}, {ry:5.1f}) eV/A   fps: {fps:4.0f}",
             True, (200, 200, 200),
         )
@@ -124,7 +126,7 @@ class Renderer:
         self.screen.blit(legend, (10, 30))
 
     def draw_panel(self, systems, current_key, sliders, thermo_now, puller_energy,
-                    history, rdf, spec):
+                    history, rdf, spec, puller_speed_m_s=None):
         pygame.draw.rect(self.screen, PANEL_BG, self.panel_rect)
         pygame.draw.line(self.screen, PANEL_DIVIDER, (self.panel_rect.x, 0),
                           (self.panel_rect.x, self.window_size[1]), 1)
@@ -173,8 +175,12 @@ class Renderer:
 
         puller_ke, puller_pe = puller_energy
         if puller_ke is not None:
+            speed_bit = ""
+            if puller_speed_m_s is not None:
+                speed_a_per_ps = puller_speed_m_s / units.ANGSTROM_PER_PS_TO_M_PER_S
+                speed_bit = f"   speed={puller_speed_m_s:7.1f} m/s ({speed_a_per_ps:.3f} A/ps)"
             puller_readout = self.small_font.render(
-                f"puller atom:   KE={puller_ke:7.4f} eV   PE={puller_pe:8.4f} eV", True, DIM_TEXT_COLOR
+                f"puller atom:   KE={puller_ke:7.4f} eV   PE={puller_pe:8.4f} eV{speed_bit}", True, DIM_TEXT_COLOR
             )
             self.screen.blit(puller_readout, (x, y))
         y += 20
@@ -238,9 +244,9 @@ class Renderer:
 
     def draw(self, positions, is_puller, puller_pos, input_force, reaction_force, fps,
               spec, systems, current_key, sliders, thermo_now, puller_energy,
-              history, rdf, heat_fraction=0.0):
+              history, rdf, heat_fraction=0.0, sim_time_ps=0.0, puller_speed_m_s=None):
         self.draw_sim(positions, is_puller, puller_pos, input_force, reaction_force,
-                       fps, spec, heat_fraction)
+                       fps, spec, heat_fraction, sim_time_ps)
         self.draw_panel(systems, current_key, sliders, thermo_now, puller_energy,
-                         history, rdf, spec)
+                         history, rdf, spec, puller_speed_m_s)
         pygame.display.flip()

@@ -163,6 +163,7 @@ lammps_live/
   config.py         global constants that don't vary by system (window size, smoothing, ...)
   forcefeedback.py  force -> device-feedback signal shaping, parameterized by each
                      system's ForceFeedbackProfile
+  units.py          metal-units -> SI display conversions (sim time, puller speed)
   systems/
     base.py           MDSystem interface + SystemSpec/SliderSpec/ForceFeedbackProfile
     cu_deposition.py  copper EAM system
@@ -213,6 +214,16 @@ existing systems.
   physical scales the whole way through, not reduced/dimensionless LJ
   units. A force reading of `1.2 eV/A` is literally `-dE/dx` in those
   units, the same as in any other physics context.
+- **Sim time** (top-left of the sim view) is elapsed *simulated* MD time --
+  nsteps x timestep -- not wall-clock time, and not counted during each
+  system's silent pre-roll settle. It's shown auto-scaled (fs / ps / ns,
+  see `lammps_live/units.py`) since a play session spans from
+  sub-picosecond up to a few hundred ps, rarely a clean fit for one fixed
+  unit. **Puller speed** in the side panel is converted from the native
+  Angstrom/ps to m/s (`1 A/ps = 100 m/s` exactly, since 1 A = 1e-10 m and
+  1 ps = 1e-12 s) -- both units are shown side by side. Typical values land
+  in the hundreds of m/s, the same range as real atomic thermal speeds at
+  room temperature; that's not a coincidence, it's the same physics.
 - Both bundled systems are 2D (a one-atom-thick cross-section), which
   changes some physics from the 3D case you might expect:
   - The equilibrium lattice is a 2D close-packed **hexagonal/triangular**

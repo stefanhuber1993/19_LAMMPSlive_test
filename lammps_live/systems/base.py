@@ -102,6 +102,13 @@ class MDSystem(ABC):
         """Returns (temp[K], press[bar], ke[eV], pe[eV], etotal[eV])."""
 
     @abstractmethod
+    def get_sim_time(self):
+        """Elapsed simulated (physical MD) time, in ps, since interactive
+        control began -- i.e. since __init__'s silent settle run finished,
+        not since the LAMMPS instance itself was created. This is real
+        simulated time (nsteps * timestep), not wall-clock render time."""
+
+    @abstractmethod
     def get_rdf(self):
         """Returns (r, g(r)) arrays or None if not yet warmed up."""
 

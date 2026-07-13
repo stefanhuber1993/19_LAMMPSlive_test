@@ -8,7 +8,7 @@ import math
 
 import pygame
 
-from . import config
+from . import config, units
 from .forcefeedback import (
     ExponentialSmoother2D, shape_damper_coefficient, shape_interaction_force,
     shape_stiffness, shape_velocity_damping,
@@ -194,6 +194,9 @@ class App:
         self.source.update_jitter(heat_fraction)
         rdf = self.system.get_rdf()
 
+        sim_time_ps = self.system.get_sim_time()
+        puller_speed_m_s = units.speed_to_m_per_s(math.hypot(*vel)) if vel is not None else None
+
         positions, is_puller = self.system.get_all_positions()
         self.renderer.draw(
             positions, is_puller, pos,
@@ -202,6 +205,7 @@ class App:
             (self.temp_slider, self.damping_slider),
             (temp, press, ke, pe, etotal), (puller_ke, puller_pe),
             self.history, rdf, heat_fraction=heat_fraction,
+            sim_time_ps=sim_time_ps, puller_speed_m_s=puller_speed_m_s,
         )
 
         new_dt = self.clock.tick(60) / 1000.0
