@@ -140,6 +140,10 @@ lammps-live --list-systems                          # print available systems an
 - `Up`/`Down` arrow keys or the mouse scroll wheel -- nudge Temperature
 - `Esc` or closing the window -- quit
 
+The puller leaves a thin, same-colored motion trail behind it (last 3
+seconds of wall-clock time, fading to transparent with age) -- useful for
+seeing the swoop of a recent approach or bounce after the fact.
+
 While actively dragging a slider in `--input mouse` mode, the puller's
 input force is held at zero instead of also reading that same mouse
 position as a deflection.
@@ -180,6 +184,7 @@ lammps_live/
     theme.py    colors/sizes
     widgets.py  Slider
     plotting.py RollingHistory + generic line-plot drawer
+    trail.py    rolling position buffer behind the puller's fading motion trail
     renderer.py the sim box + instrumentation panel
 ```
 

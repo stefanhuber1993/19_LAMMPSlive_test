@@ -13,6 +13,7 @@ SIM_TIME_PER_FRAME = 0.01  # ps
 TEMP_KEY_RATE_FRACTION = 0.05     # fraction of a system's temperature range, per second, while Up/Down is held
 TEMP_WHEEL_STEP_FRACTION = 0.02   # fraction of a system's temperature range, per mouse-wheel notch
 HISTORY_WINDOW_SECONDS = 20.0
+TRAIL_WINDOW_SECONDS = 3.0   # how far back the puller's fading motion trail reaches, in wall-clock seconds
 
 # Force-feedback signal smoothing (see forcefeedback.py): recomputed from
 # scratch every frame from instantaneous LAMMPS state, which is jerky

@@ -34,6 +34,12 @@ class Renderer:
         self.box_x = self.box_y = None
         self.scale = self.ox = self.oy = None
 
+        # Per-pixel-alpha scratch surface for the puller's fading motion
+        # trail, reused every frame (cleared, not reallocated) -- the sim
+        # view's main screen surface has no per-pixel alpha, so a true fade
+        # needs a separate SRCALPHA surface blitted on top.
+        self.trail_surface = pygame.Surface((self.sim_width, window_size[1]), pygame.SRCALPHA)
+
     def set_box_size(self, box_size):
         """(Re)compute the sim<->screen mapping for a box size in Angstrom
         -- called on startup and again whenever the active system changes
@@ -74,13 +80,39 @@ class Renderer:
             hy = end[1] + ARROWHEAD_LEN * math.sin(head_angle)
             pygame.draw.line(self.screen, color, end, (hx, hy), width)
 
+    def _draw_trail(self, trail, color):
+        """Puller motion trail: a thin same-colored polyline over the last
+        trail.window_seconds, fading (alpha towards 0) the further back in
+        time each segment is. Drawn on a dedicated per-pixel-alpha surface
+        (cleared and reused each frame) since the main screen surface has no
+        alpha channel of its own -- pygame.draw.line would just ignore it."""
+        self.trail_surface.fill((0, 0, 0, 0))
+        pts = list(trail.points)
+        if len(pts) < 2:
+            return
+        now = pts[-1][0]
+        window = trail.window_seconds
+        r, g, b = color
+        for (_, x0, y0), (t1, x1, y1) in zip(pts, pts[1:]):
+            age = now - t1
+            alpha = 255.0 * (1.0 - age / window)
+            if alpha <= 1.0:
+                continue
+            p0 = self.sim_to_screen(x0, y0)
+            p1 = self.sim_to_screen(x1, y1)
+            pygame.draw.line(self.trail_surface, (r, g, b, int(alpha)), p0, p1, 1)
+        self.screen.blit(self.trail_surface, (0, 0))
+
     def draw_sim(self, positions, is_puller, puller_pos, input_force, reaction_force,
-                 fps, spec, heat_fraction=0.0, sim_time_ps=0.0):
+                 fps, spec, heat_fraction=0.0, sim_time_ps=0.0, puller_trail=None):
         self.screen.fill(BG)
 
         top_left = self.sim_to_screen(0, self.box_y)
         size = (self.box_x * self.scale, self.box_y * self.scale)
         pygame.draw.rect(self.screen, BOX_OUTLINE, (*top_left, *size), width=1)
+
+        if puller_trail is not None:
+            self._draw_trail(puller_trail, PULLER_COLOR)
 
         puller_xy = None
         for (x, y), p in zip(positions, is_puller):
@@ -244,9 +276,10 @@ class Renderer:
 
     def draw(self, positions, is_puller, puller_pos, input_force, reaction_force, fps,
               spec, systems, current_key, sliders, thermo_now, puller_energy,
-              history, rdf, heat_fraction=0.0, sim_time_ps=0.0, puller_speed_m_s=None):
+              history, rdf, heat_fraction=0.0, sim_time_ps=0.0, puller_speed_m_s=None,
+              puller_trail=None):
         self.draw_sim(positions, is_puller, puller_pos, input_force, reaction_force,
-                       fps, spec, heat_fraction, sim_time_ps)
+                       fps, spec, heat_fraction, sim_time_ps, puller_trail)
         self.draw_panel(systems, current_key, sliders, thermo_now, puller_energy,
                          history, rdf, spec, puller_speed_m_s)
         pygame.display.flip()
