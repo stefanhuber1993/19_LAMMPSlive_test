@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lammps-live"
+version = "0.1.0"
+description = "Interactive real-time MD demos built on LAMMPS -- pull an atom onto a live, thermostatted 2D crystal with mouse or force-feedback joystick control."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pygame>=2.1",
+    "hid",
+    "lammps",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+lammps-live = "lammps_live.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lammps_live*"]
+
+[tool.setuptools.package-data]
+"lammps_live.systems" = ["data/*.eam"]

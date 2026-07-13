@@ -5,3 +5,6 @@ __pycache__/
 log.lammps
 log.cite
 .claude/settings.local.json
+*.egg-info/
+build/
+dist/
