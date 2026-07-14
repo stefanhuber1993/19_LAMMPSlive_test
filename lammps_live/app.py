@@ -158,10 +158,16 @@ class App:
         ui_capturing_mouse = self.temp_slider.dragging or self.damping_slider.dragging
         if self.input_mode == "mouse" and ui_capturing_mouse:
             jx, jy = 0.0, 0.0
+            yaw = 0.0
         else:
             jx, jy = self.source.poll()
+            yaw = self.source.poll_yaw()
         input_fx, input_fy = jx * ff_profile.input_force_scale, jy * ff_profile.input_force_scale
         self.system.set_input_force(input_fx, input_fy)
+        # Yaw (joystick twist axis, or Q/E in mouse mode) steers the puller's
+        # in-plane orientation -- a no-op for systems whose puller is a lone
+        # atom, used by the lipid system to rotate the control lipid's director.
+        self.system.steer_orientation(yaw, dt)
 
         self.system.step(self.steps_per_frame)
 
@@ -204,7 +210,8 @@ class App:
         sim_time_ps = self.system.get_sim_time()
         puller_speed_m_s = units.speed_to_m_per_s(math.hypot(*vel)) if vel is not None else None
 
-        ids, positions, is_puller = self.system.get_all_positions()
+        ids, positions, is_puller, species = self.system.get_all_positions()
+        bond_pairs = self.system.get_bond_pairs()
         self._trail_frame_counter += 1
         if self._trail_frame_counter % config.TRAIL_SAMPLE_EVERY_N_FRAMES == 0:
             self.atom_trails.add(self.sim_wall_time, ids, positions, is_puller)
@@ -216,7 +223,7 @@ class App:
             (temp, press, ke, pe, etotal), (puller_ke, puller_pe),
             self.history, rdf, heat_fraction=heat_fraction,
             sim_time_ps=sim_time_ps, puller_speed_m_s=puller_speed_m_s,
-            atom_trails=self.atom_trails,
+            atom_trails=self.atom_trails, species=species, bond_pairs=bond_pairs,
         )
 
         new_dt = self.clock.tick(60) / 1000.0

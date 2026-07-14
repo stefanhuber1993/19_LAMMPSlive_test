@@ -549,6 +549,21 @@ class FF2Device:
         Returns (x, y) each normalized to -1.0 .. 1.0 (center = 0.0).
         Returns None if no report-1 packet was available within 20ms.
         """
+        st = self.read_state()
+        return None if st is None else (st[0], st[1])
+
+    def read_state(self) -> tuple:
+        """
+        Read X/Y plus the twist (Rz / yaw) axis from the HID interrupt IN report.
+        Returns (x, y, twist_raw) with x, y normalized to -1.0..1.0 and twist_raw
+        the raw 6-bit twist value (0..63, center ~32), or None on timeout.
+
+        NOTE: the twist byte offset is a best-effort read of the SideWinder FF2
+        report layout -- X/Y sit in bytes 1-4 (10 bits each), and the 6-bit
+        twist axis follows. If a given unit lays the report out differently, the
+        caller (JoystickInput) auto-centers and deadzones this value, so a wrong
+        guess degrades to "twist does nothing" rather than a spurious signal.
+        """
         data = self._h.read(32, 20)   # 20ms timeout; empty list on timeout
         if not data or data[0] != 1:
             return None
@@ -556,7 +571,8 @@ class FF2Device:
         y_raw = data[3] | ((data[4] & 0x03) << 8)
         if x_raw >= 512: x_raw -= 1024
         if y_raw >= 512: y_raw -= 1024
-        return (x_raw / 512.0, y_raw / 512.0)
+        twist_raw = (data[5] & 0x3F) if len(data) > 5 else 32
+        return (x_raw / 512.0, y_raw / 512.0, twist_raw)
 
     def __repr__(self) -> str:
         return f"<FF2Device VID=0x{VID:04x} PID=0x{PID:04x}>"

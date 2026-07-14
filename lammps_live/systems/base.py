@@ -58,6 +58,17 @@ class SystemSpec:
     melt_temp: float          # K -- approximate dial marker (see each system's docstring)
     force_feedback: ForceFeedbackProfile
     puller_speed_cap: float   # Angstrom/ps -- nve/limit-derived velocity ceiling, for velocity-damping scale
+    # Per-species rendering, for systems whose atoms aren't a single
+    # indistinguishable species (see get_all_positions' `species`). None ->
+    # every crystal atom drawn the same flat color (Cu, Ar). Otherwise an RGB
+    # tuple per species index, with an optional matching glyph per species
+    # (e.g. "+"/"-" for ions; None entries draw no glyph).
+    species_colors: tuple = None   # (RGB, RGB, ...) indexed by species, or None
+    species_labels: tuple = None   # (str-or-None, ...) indexed by species, or None
+    # Whether to draw the generic "faint line between atoms near their
+    # equilibrium spacing" bond overlay. On for crystals; off for systems that
+    # supply their own explicit bonds to draw (see get_bond_pairs), e.g. lipids.
+    bond_overlay: bool = True
 
 
 class MDSystem(ABC):
@@ -114,12 +125,32 @@ class MDSystem(ABC):
 
     @abstractmethod
     def get_all_positions(self):
-        """Returns (ids N, positions Nx2, is_puller boolarray N). ids are
-        LAMMPS atom ids, stable identities across frames -- needed (rather
-        than array index) because LAMMPS is free to reorder its local atom
-        arrays between steps (e.g. periodic spatial sorting), which array
-        index alone can't survive (see ui/trail.py, which keys per-atom
-        motion trails by id for exactly this reason)."""
+        """Returns (ids N, positions Nx2, is_puller boolarray N, species).
+        ids are LAMMPS atom ids, stable identities across frames -- needed
+        (rather than array index) because LAMMPS is free to reorder its local
+        atom arrays between steps (e.g. periodic spatial sorting), which array
+        index alone can't survive (see ui/trail.py, which keys per-atom motion
+        trails by id for exactly this reason).
+
+        species is a per-atom int array (aligned with positions) indexing into
+        the SystemSpec's species_colors/species_labels, or None for
+        single-species systems (Cu, Ar) where every crystal atom is drawn the
+        same. E.g. NaCl uses 0=cation, 1=anion; lipids use 0=head, 1=tail."""
+
+    def get_bond_pairs(self):
+        """Optional: explicit bonds to draw, as an (M, 2) int array of index
+        pairs into the CURRENT get_all_positions ordering (so it must be called
+        in the same frame, before stepping again). Used to draw molecular
+        backbones, e.g. each lipid's head-tail-tail chain. None (default) means
+        the system has no explicit bonds to draw."""
+        return None
+
+    def steer_orientation(self, rate, dt):
+        """Optional: steer the puller's in-plane orientation. rate is a control
+        signal in [-1, 1] (joystick yaw / twist axis, or Q/E in mouse mode); dt
+        is the frame time in seconds. No-op for systems whose puller has no
+        meaningful orientation (a lone atom); lipids integrate it into the
+        control lipid's director angle."""
 
     @abstractmethod
     def get_box_size(self):

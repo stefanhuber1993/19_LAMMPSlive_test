@@ -36,6 +36,8 @@ switchable *while the demo is running* -- press `1`/`2`/... or `Tab`:
 |---|---|---|---|
 | `cu_eam` | Copper deposition (EAM) | real Cu EAM (`Cu_u3.eam`) | strong metallic bonding, high melting range (dial goes to 6000 K) |
 | `lj_argon` | Argon melting (Lennard-Jones) | generic `lj/cut`, real argon parameters | much softer/weaker, melts near 84 K (argon's real melting point) |
+| `nacl` | Salt crystal (ionic, NaCl) | Born-Mayer + damped shifted-force Coulomb (`born/coul/dsf`) | alternating Na(+)/Cl(-) ions (labeled `+`/`-`) on a checkerboard square lattice -- the bipartite, 2D-stable ionic arrangement -- bound by Coulomb (Madelung) attraction |
+| `lipid` | Lipid membrane (coarse-grained) | soft repulsion + cosine-squared tail attraction (`cosine/squared`), harmonic bonds/angles, Langevin implicit solvent | a solvent-free 2D lipid bilayer of 3-bead amphiphiles (head + 2 tails); the puller is a lipid you also **orient** (joystick yaw / Q-E) to insert into the membrane. Inspired by the MesoMem model (Sillano, Marrink & Idema 2026); see the module docstring |
 
 Run `lammps-live --list-systems` to print this from the code. See
 "Adding a new system" below to add your own.
@@ -135,6 +137,10 @@ lammps-live --list-systems                          # print available systems an
 **Controls:**
 - `1`-`9` -- jump directly to a system; `Tab` -- cycle to the next one
   (rebuilds the simulation; takes a moment)
+- Move the puller with the mouse / joystick, as usual
+- **Orientation** (`lipid` system): the joystick's **yaw (twist) axis** -- or
+  the **`Q`/`E`** keys in mouse mode -- rotate the control lipid's in-plane
+  angle, so you can turn it head-out and insert it into the bilayer
 - Mouse-drag the **Temperature** / **Puller damping** sliders in the
   right-hand panel (works regardless of `--input` mode)
 - `Up`/`Down` arrow keys or the mouse scroll wheel -- nudge Temperature
@@ -200,7 +206,8 @@ minimum:
    `__init__`/a private `_build` method -- `cu_deposition.py` and
    `lj_argon.py` are two working examples with the same region/group/fix
    layout (crystal + frozen floor + interactively-controlled puller +
-   Langevin thermostat + RDF), just with different pair styles/constants.
+   csvr velocity-rescaling thermostat + RDF), just with different pair
+   styles/constants.
 2. Define a module-level `SystemSpec` (temperature/damping slider ranges,
    melt-temp dial mark, and a `ForceFeedbackProfile` scaled to your
    potential's characteristic force magnitude -- see the comments on
@@ -259,11 +266,19 @@ existing systems.
   atoms only (excludes the permanently-frozen floor and the
   user-driven puller, both of which would otherwise dilute or bias the
   reading), and LAMMPS handles the 2D degrees-of-freedom accounting
-  automatically via `dimension 2`. The Langevin thermostat's own
-  Tstart/Tstop setpoint needs an empirical calibration factor
-  (`LANGEVIN_TARGET_CALIB` in each system module) to match what actually
-  gets measured -- documented per-system since it's a DOF-accounting
-  artifact of the group layout, not a physical effect.
+  automatically via `dimension 2`. The crystal is held at temperature by a
+  canonical-sampling velocity-rescaling thermostat (Bussi et al. 2007,
+  LAMMPS `temp/csvr`), **not** a Langevin bath: atoms move under the real
+  interatomic forces alone and the thermostat only rescales the crystal's
+  *total* kinetic energy toward the target by one global factor per step --
+  never a per-atom random kick -- so on screen you see genuine phonon motion
+  rather than white-noise buzz, the RDF/temperature plots stay canonically
+  faithful, and a quench actually reaches 0 K. The thermostat is bound (via
+  `fix_modify ... temp`) to the same `compute temp` shown on screen, so its
+  setpoint equals the measured temperature with no calibration fudge factor.
+  A `fix momentum` zeroes the crystal's slow net drift once per frame so that
+  drift isn't miscounted as a temperature floor (and the substrate stays
+  put); see each system module's thermostat note for the full rationale.
 - **Energy plot** is relative to the value at the start of the current
   session (`t=0`), not an absolute zero -- LAMMPS's zero of energy is
   potential-dependent and not physically meaningful on its own; only

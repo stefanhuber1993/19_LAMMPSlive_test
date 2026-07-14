@@ -8,19 +8,19 @@ WINDOW_SIZE = (1300, 900)
 # step count (SIM_TIME_PER_FRAME / system.spec.timestep) rather than a fixed
 # step count, so systems with a smaller timestep (see lj_argon.py) still
 # advance at the same physical rate instead of appearing in slow motion.
-SIM_TIME_PER_FRAME = 0.01  # ps
+SIM_TIME_PER_FRAME = 0.003  # ps
 
 TEMP_KEY_RATE_FRACTION = 0.05     # fraction of a system's temperature range, per second, while Up/Down is held
 TEMP_WHEEL_STEP_FRACTION = 0.02   # fraction of a system's temperature range, per mouse-wheel notch
 HISTORY_WINDOW_SECONDS = 20.0
-TRAIL_WINDOW_SECONDS = 1.0   # how far back every atom's fading motion trail reaches, in wall-clock seconds
+TRAIL_WINDOW_SECONDS = 2.0   # how far back every atom's fading motion trail reaches, in wall-clock seconds
 # Trail snapshots are recorded every Nth rendered frame rather than every
 # frame: with ~250+ atoms in cu_eam, drawing a full-rate (60Hz) trail for
 # every atom costs several ms/frame just in per-segment pygame.draw.line
 # calls (measured). Sampling at a lower rate cuts that roughly linearly
 # while staying visually smooth -- the trail is a short, fast-fading smear,
 # not a precision plot.
-TRAIL_SAMPLE_EVERY_N_FRAMES = 3
+TRAIL_SAMPLE_EVERY_N_FRAMES = 5
 
 # Force-feedback signal smoothing (see forcefeedback.py): recomputed from
 # scratch every frame from instantaneous LAMMPS state, which is jerky

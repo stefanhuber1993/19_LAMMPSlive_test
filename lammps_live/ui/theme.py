@@ -18,6 +18,37 @@ SLIDER_HANDLE = (230, 230, 235)
 SLIDER_HANDLE_ACTIVE = (255, 210, 90)
 MELT_MARK_COLOR = (255, 110, 90)
 
+# Faint "bond" lines between atom pairs, with opacity encoding how close their
+# separation is to the system's equilibrium nearest-neighbor spacing
+# (spec.lattice_spacing -- the optimal bonding distance). Alpha peaks at
+# BOND_PEAK_ALPHA when a pair sits exactly at the optimum and falls off
+# exponentially in either direction:
+#     alpha = BOND_PEAK_ALPHA * exp(-|d - d_opt| / (BOND_FALLOFF * d_opt))
+# so BOND_FALLOFF is the decay length (lambda) as a fraction of d_opt. Pairs
+# whose alpha would drop below BOND_MIN_ALPHA are skipped -- both a visibility
+# floor and the distance cutoff that bounds how many pairs get drawn. All
+# tunable:
+BOND_LINES_ENABLED = True
+BOND_COLOR = (255, 255, 255)   # white
+BOND_PEAK_ALPHA = 128          # out of 255 -> 50% opacity exactly at the optimum
+BOND_FALLOFF = 0.10            # decay length (lambda) as a fraction of the optimal distance
+BOND_MIN_ALPHA = 3             # skip lines fainter than this (also sets the effective cutoff)
+BOND_WIDTH = 1                 # line thickness, px
+
+# Glyph color for per-species atom labels (e.g. the +/- stamped on ions).
+# Per-species fill colors themselves live on each system's SystemSpec
+# (species_colors), since they're system-specific.
+ION_LABEL_COLOR = (20, 20, 26)
+
+# Explicit molecular backbone bonds (e.g. lipid head-tail-tail chains):
+# subtle gray for ordinary molecules, bright cyan for the control lipid so
+# "your lipid" and the way it points stand out.
+BOND_STICK_COLOR = (95, 95, 110)
+PULLER_BOND_COLOR = (110, 220, 255)
+# Tail beads of the multi-bead control lipid -- dimmer than the head's
+# PULLER_COLOR so the head (and thus the lipid's orientation) is legible.
+PULLER_TAIL_COLOR = (45, 120, 165)
+
 CRYSTAL_RADIUS = 5
 PULLER_RADIUS = 8
 # Arrow length: soft-saturating (tanh) rather than linear, since the

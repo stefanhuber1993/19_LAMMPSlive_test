@@ -89,13 +89,31 @@ class JoystickInput(InputSource):
         self.damper = self.ff.damper(coefficient=DAMPER_COEFFICIENT_MIN, saturation=DAMPER_SATURATION)
         self.jitter = self.ff.sine(magnitude=0, period_ms=JITTER_PERIOD_MS)
         self._last_xy = (0.0, 0.0)
+        self._last_yaw = 0.0
+        self._twist_center = None  # captured from the first reading (see poll_yaw)
 
     def poll(self):
-        result = self.ff.read_position()
+        result = self.ff.read_state()
         if result is not None:
-            x, y = result
+            x, y, twist = result
             self._last_xy = (x, -y)  # device convention -> sim convention (+y up)
+            self._last_yaw = self._process_twist(twist)
         return self._last_xy
+
+    def _process_twist(self, twist_raw):
+        # Auto-center on the first reading so the resting twist maps to 0 (this
+        # also means a mis-read report byte, constant at rest, degrades to "no
+        # yaw" rather than a spurious steady spin), then normalize the 6-bit
+        # axis to -1..1 with a deadzone against jitter around center.
+        if self._twist_center is None:
+            self._twist_center = twist_raw
+        val = (twist_raw - self._twist_center) / 31.0  # half of the 0..63 range
+        if abs(val) < 0.15:
+            return 0.0
+        return max(-1.0, min(1.0, val))
+
+    def poll_yaw(self):
+        return self._last_yaw
 
     def calibrate(self, n=200):
         """Print live stick position for a few seconds, for basic sanity checking."""

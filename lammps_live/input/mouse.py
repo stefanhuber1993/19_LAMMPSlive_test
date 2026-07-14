@@ -22,3 +22,10 @@ class MouseInput(InputSource):
         if mag > 1.0:
             dx, dy = dx / mag, dy / mag
         return dx, -dy  # screen y grows downward; flip so up = positive
+
+    def poll_yaw(self):
+        # Q / E rotate the puller's orientation (the mouse has no twist axis).
+        # E = +1 (counter-clockwise), Q = -1 (clockwise); both/neither = 0.
+        import pygame
+        keys = pygame.key.get_pressed()
+        return (1.0 if keys[pygame.K_e] else 0.0) - (1.0 if keys[pygame.K_q] else 0.0)

@@ -7,6 +7,12 @@ class InputSource:
         """Return (x, y) deflection in [-1, 1], sim convention: +y is up."""
         raise NotImplementedError
 
+    def poll_yaw(self):
+        """Return a rotation control signal in [-1, 1] for steering the puller's
+        in-plane orientation (joystick twist/yaw axis, or Q/E keys in mouse
+        mode). 0 = no rotation. Default: no yaw input."""
+        return 0.0
+
     def send_force(self, fx, fy, stiffness=None):
         """Feed back a force (sim units) the device should resist with, and
         optionally how stiffly (device-specific range; None = default/max).

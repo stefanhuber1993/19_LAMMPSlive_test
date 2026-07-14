@@ -33,11 +33,11 @@ below *were* empirically checked here, the same way -- not just guessed:
   depositing a real 1 eV atom (same calibration energy as copper's),
   and picked a value from the range that reliably settles into a stuck,
   non-oscillating state.
-- Langevin measured-vs-setpoint calibration: same DOF-accounting mismatch
-  copper's has (see LANGEVIN_TARGET_CALIB there) -- measured directly here
-  rather than assumed equal, and came out close (~1.45 vs copper's ~1.5),
-  consistent with it being a geometry effect rather than a potential-
-  specific one.
+- thermostat: same canonical velocity-rescaling (csvr) scheme copper uses
+  (see that module's thermostat note for the full rationale) -- no per-atom
+  random forcing, cools cleanly to 0 K, and, being bound to the displayed
+  temperature compute, needs no setpoint-vs-measured fudge factor (unlike the
+  Langevin bath this replaced, which did).
 """
 import math
 import random
@@ -56,21 +56,35 @@ LATTICE_SPACING = 3.784884  # Angstrom; empirically-found 2D-hex zero-pressure s
 LATTICE_N = 16
 ROW_HEIGHT = LATTICE_SPACING * math.sqrt(3) / 2
 ROW_EPS = 0.1 * ROW_HEIGHT
-CRYSTAL_ROWS = 10
-FLOOR_ROWS = 2
+CRYSTAL_ROWS = 7
+FLOOR_ROWS = 0
 PULLER_GAP = 3 * LATTICE_SPACING
 SETTLE_STEPS = 600
-TIMESTEP = 0.0002  # ps -- 5x smaller than copper's; see module docstring
+TIMESTEP = 0.0001  # ps -- 10x smaller than copper's; see module docstring
 
 PULLER_DAMPING_DEFAULT = 0.0015  # eV*ps/Angstrom^2
 PULLER_DAMPING_MIN = 0.0
 PULLER_DAMPING_MAX = 0.005
 
-T_MIN = 0.0
-T_MAX = 400.0     # K -- well past melting, into a clearly gas-like RDF
+# Thermostat: a canonical-sampling velocity-rescaling thermostat (Bussi et
+# al. 2007, "temp/csvr"), identical in spirit to copper's -- see the thermostat
+# note in cu_deposition.py for the full rationale. In short: atoms move under
+# real LJ forces only (plain nve), and each step the crystal's *total* kinetic
+# energy is nudged toward the target by one global velocity-scaling factor --
+# never a per-atom random force -- so the on-screen motion is genuine lattice
+# dynamics, the RDF/temperature plots stay canonically correct, and a quench
+# reaches a true 0 K instead of the noise floor a Langevin bath leaves behind.
+T_MIN = 1.0       # K -- csvr toward 0 K is a pure, deterministic quench
+T_MAX = 800.0     # K -- well past melting, into a clearly gas-like RDF
 T_MELT = 84.0     # K -- real argon's melting point (these are its actual LJ parameters, not a dial guess)
-LANGEVIN_TARGET_CALIB = 1.45  # measured directly for this geometry, see module docstring
-LANGEVIN_DAMP = 0.1  # ps
+THERMOSTAT_DAMP = 0.5  # ps -- relaxation time for total KE toward target (not user-adjustable)
+COLD_SEED_TEMP = 5.0    # K -- below this the lattice is at rest; heating from here is seeded, not rescaled
+# Bulk-drift handling (see cu_deposition.py for the full rationale): the
+# thermostat is COM-blind, so a very weak per-frame drag bleeds off free drift
+# without touching thermal motion or pinning a rising gas, and a one-shot
+# momentum zero on a sharp quench stops a hot cloud from launching as it freezes.
+DRIFT_DAMP_PER_FRAME = 0.03   # fraction of COM velocity removed each rendered frame
+QUENCH_ZERO_DROP_FRAC = 0.3   # setpoint drop (fraction of current T) that triggers the one-shot zero
 
 RDF_NBINS = 100
 RDF_CUTOFF = 4.0 * LATTICE_SPACING
@@ -175,12 +189,28 @@ class LJArgonSystem(MDSystem):
 
         lmp.command("fix freeze floor setforce 0.0 0.0 0.0")
         lmp.command("fix integ_crystal crystal_mobile nve")
+        # Crystal temperature compute, defined before the thermostat so the
+        # thermostat can rescale toward this exact temperature (fix_modify
+        # below). temp/com subtracts the crystal's bulk translation so only
+        # thermal motion counts -- see cu_deposition.py for the full rationale
+        # (it's what lets a quench reach 0 K and a hot gas rise to fill the box
+        # instead of being pinned at the bottom).
+        lmp.command("compute crystal_temp crystal_mobile temp/com")
+        # COM velocity of the crystal, read each frame by step() for the weak
+        # drift drag (see DRIFT_DAMP_PER_FRAME).
+        lmp.command("variable vcmx equal vcm(crystal_mobile,x)")
+        lmp.command("variable vcmy equal vcm(crystal_mobile,y)")
+        # csvr thermostat on top of the plain nve integrator: global velocity
+        # rescaling toward the target, no per-atom random forcing. Redefined
+        # with a literal setpoint by set_target_temp (Tstart/Tstop take no
+        # variable reference), same pattern as set_puller_damping.
         self._seed = random.randint(1, 900_000_000)
         self._target_temp = T_MIN
         lmp.command(
-            f"fix damp_crystal crystal_mobile langevin {T_MIN / LANGEVIN_TARGET_CALIB} "
-            f"{T_MIN / LANGEVIN_TARGET_CALIB} {LANGEVIN_DAMP} {self._seed} zero yes"
+            f"fix damp_crystal crystal_mobile temp/csvr {T_MIN} {T_MIN} "
+            f"{THERMOSTAT_DAMP} {self._seed}"
         )
+        lmp.command("fix_modify damp_crystal temp crystal_temp")
         # Tighter displacement cap than copper's (0.05*a vs 0.1*a): LJ's
         # stiffer repulsive core needs it, same reasoning as the smaller
         # timestep above (see module docstring).
@@ -198,7 +228,6 @@ class LJArgonSystem(MDSystem):
         lmp.command(f"run {SETTLE_STEPS}")
         lmp.command("velocity mobile set 0.0 0.0 0.0")
 
-        lmp.command("compute crystal_temp crystal_mobile temp")
         lmp.command("compute ke_atom all ke/atom")
         lmp.command("compute pe_atom all pe/atom")
 
@@ -219,11 +248,27 @@ class LJArgonSystem(MDSystem):
         if T == self._target_temp:
             return
         self._target_temp = T
-        setpoint = T / LANGEVIN_TARGET_CALIB
+        # Seed a Maxwell-Boltzmann distribution when heating up from an
+        # effectively-frozen lattice (a velocity rescaling can't warm ~zero
+        # motion); otherwise let csvr rescale the existing motion. See
+        # cu_deposition.py for the full explanation.
+        current = self.lmp.extract_compute("crystal_temp", 0, 0)
+        if T > current and current < COLD_SEED_TEMP:
+            self._seed = random.randint(1, 900_000_000)
+            self.lmp.command(
+                f"velocity crystal_mobile create {T} {self._seed} "
+                f"mom yes rot yes dist gaussian"
+            )
+        elif current > COLD_SEED_TEMP and T < current - QUENCH_ZERO_DROP_FRAC * current:
+            # Sharp quench: zero the net linear momentum once so a hot,
+            # upward-billowing cloud decelerates in place rather than sailing
+            # off as it solidifies (see cu_deposition.py).
+            self.lmp.command("velocity crystal_mobile zero linear")
         self.lmp.command(
-            f"fix damp_crystal crystal_mobile langevin {setpoint} {setpoint} "
-            f"{LANGEVIN_DAMP} {self._seed} zero yes"
+            f"fix damp_crystal crystal_mobile temp/csvr {T} {T} "
+            f"{THERMOSTAT_DAMP} {self._seed}"
         )
+        self.lmp.command("fix_modify damp_crystal temp crystal_temp")
 
     def set_puller_damping(self, gamma):
         gamma = max(PULLER_DAMPING_MIN, min(PULLER_DAMPING_MAX, gamma))
@@ -235,6 +280,20 @@ class LJArgonSystem(MDSystem):
     def step(self, n=4):
         self.lmp.command(f"run {n}")
         self._interactive_ps += n * TIMESTEP
+        self._damp_drift()
+
+    def _damp_drift(self):
+        # Weak drag on bulk translation only: subtract a small fraction of the
+        # crystal's COM velocity uniformly, leaving thermal motion untouched.
+        # See cu_deposition.py for the rationale.
+        if DRIFT_DAMP_PER_FRAME <= 0.0:
+            return
+        vx = self.lmp.extract_variable("vcmx")
+        vy = self.lmp.extract_variable("vcmy")
+        f = DRIFT_DAMP_PER_FRAME
+        self.lmp.command(
+            f"velocity crystal_mobile set {-f * vx} {-f * vy} 0.0 sum yes units box"
+        )
 
     def get_sim_time(self):
         return self._interactive_ps
@@ -291,7 +350,8 @@ class LJArgonSystem(MDSystem):
         nlocal = self.lmp.get_natoms()
         xs = self.lmp.numpy.extract_atom("x")[:nlocal]
         ids = self.lmp.numpy.extract_atom("id")[:nlocal]
-        return ids.copy(), xs[:, :2].copy(), (ids == self.puller_id)
+        # Single neutral species (Ar): no per-atom charge to distinguish by.
+        return ids.copy(), xs[:, :2].copy(), (ids == self.puller_id), None
 
     def get_box_size(self):
         return self.xhi - self.xlo, self.yhi - self.ylo

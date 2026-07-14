@@ -38,7 +38,7 @@ from lammps import lammps
 from .base import ForceFeedbackProfile, MDSystem, SliderSpec, SystemSpec
 
 LATTICE_SPACING = 2.4605  # Angstrom; empirically-found 2D-hex EAM Cu equilibrium (see module docstring)
-LATTICE_N = 20             # box size, in units of LATTICE_SPACING (real Angstrom, not lattice-command units)
+LATTICE_N = 16             # box size, in units of LATTICE_SPACING (real Angstrom, not lattice-command units)
 # hex atom rows are spaced a*sqrt(3)/2 apart (see module docstring). Cutting
 # the crystal/floor regions at an arbitrary fraction of the box height lands
 # mid-row for hex, leaving a ragged, partially-populated top/bottom row that
@@ -46,12 +46,12 @@ LATTICE_N = 20             # box size, in units of LATTICE_SPACING (real Angstro
 # both cuts in whole rows keeps every row fully populated from frame 0.
 ROW_HEIGHT = LATTICE_SPACING * math.sqrt(3) / 2
 ROW_EPS = 0.1 * ROW_HEIGHT   # margin so a region bound lands cleanly between rows, not exactly on one
-CRYSTAL_ROWS = 12          # bottom rows of the box filled with crystal (~half, row-aligned)
-FLOOR_ROWS = 2              # bottom rows of the crystal frozen as a floor
+CRYSTAL_ROWS = 7          # bottom rows of the box filled with crystal (~half, row-aligned)
+FLOOR_ROWS = 0              # bottom rows of the crystal frozen as a floor
 PULLER_GAP = 3 * LATTICE_SPACING       # real units above the crystal surface where puller starts
 SETTLE_STEPS = 600          # pre-roll steps run silently in __init__ before the render loop starts (see _build)
 CU_MASS = 63.55            # amu
-TIMESTEP = 0.001           # ps
+TIMESTEP = 0.0005           # ps
 
 # Puller's own velocity-proportional drag -- unrelated to the crystal's
 # thermostat below, this is what makes dragging the puller around feel
@@ -63,31 +63,66 @@ PULLER_DAMPING_DEFAULT = 0.01   # eV*ps/Angstrom^2
 PULLER_DAMPING_MIN = 0.0        # frictionless -- fix viscous with gamma=0 is a legal no-op
 PULLER_DAMPING_MAX = 0.05
 
-# The crystal is thermostatted with a Langevin bath (friction + random
-# noise) instead of plain viscous drag, so it can be heated/cooled on demand
-# and so atoms visibly jitter around their lattice sites at T>0 -- both a
-# physically real effect of the Langevin noise term, not a cosmetic add-on.
+# Thermostatting: the crystal is coupled to its target temperature with a
+# canonical-sampling velocity-rescaling thermostat (Bussi-Donadio-Parrinello
+# 2007, LAMMPS "temp/csvr"), NOT a Langevin bath. This is a deliberate
+# pedagogical and visual choice:
+#   - Langevin adds an *independent random force to every atom every step*, so
+#     atoms buzz with uncorrelated white noise even when nothing is pushing on
+#     them -- on screen that reads as static, not as heat.
+#   - csvr instead lets the atoms move under nothing but the real interatomic
+#     forces (plain nve integration) and, once per step, nudges the crystal's
+#     *total* kinetic energy toward the target by multiplying every velocity
+#     by a single common factor. No per-atom randomness is ever imposed, so
+#     the motion on screen is genuine lattice dynamics -- correlated phonon
+#     waves and real collisions -- which is what thermal motion physically is.
+#   - It samples the correct canonical (NVT) ensemble, so the temperature and
+#     RDF plots stay faithful: g(r) broadens from sharp peaks to liquid-like
+#     humps at melting for the right physical reason, not because random noise
+#     was smeared across the lattice.
+# A velocity rescaling can only scale motion that already exists, so it cannot
+# by itself warm a dead-cold (v~=0) lattice; set_target_temp seeds a
+# Maxwell-Boltzmann velocity distribution when heating up from ~0 K (the
+# textbook way to *set* a temperature), after which csvr maintains it.
 #
 # T_MIN/T_MAX/T_MELT are deliberately round, approximate numbers, not a
 # rigorously-derived phase boundary: a melting-point scan run standalone
-# (periodic-bulk RDF heating sweep + Langevin calibration, see repo history)
-# showed 2D crystals don't have a clean melting knee the way 3D ones do
-# (Mermin-Wagner long-wavelength fluctuations smear it out), and a small
-# defect-free periodic crystal superheats well past any realistic transition
-# anyway. T_MELT is kept as a rough, clearly-labeled dial mark -- the live
-# RDF panel heating from sharp peaks to broad humps as you push past it is
-# the actual, trustworthy signal, not this constant.
-T_MIN = 0.0         # K -- a Langevin fix at Tstart=Tstop=0 is just pure friction (no noise term), a legal quench
-T_MAX = 6000.0      # K
+# (periodic-bulk RDF heating sweep, see repo history) showed 2D crystals don't
+# have a clean melting knee the way 3D ones do (Mermin-Wagner long-wavelength
+# fluctuations smear it out), and a small defect-free periodic crystal
+# superheats well past any realistic transition anyway. T_MELT is kept as a
+# rough, clearly-labeled dial mark -- the live RDF panel heating from sharp
+# peaks to broad humps as you push past it is the actual, trustworthy signal,
+# not this constant.
+T_MIN = 1.0         # K -- csvr toward 0 K is a pure, deterministic quench (total KE rescaled to zero)
+T_MAX = 10000.0     # K
 T_MELT = 1000.0     # K -- approximate dial marker, see note above
-# Empirically, this group's measured (compute temp) temperature runs about
-# 1.5x the Langevin fix's Tstart/Tstop setpoint in this geometry (a mobile
-# group temp compute alongside frozen floor/puller groups counts degrees of
-# freedom slightly differently than the fix's own internal accounting) --
-# corrected here so T_MIN..T_MAX above are what actually gets measured and
-# displayed, not what's silently fed to the fix.
-LANGEVIN_TARGET_CALIB = 1.5
-LANGEVIN_DAMP = 0.1  # ps -- thermostat relaxation time, fixed (not user-adjustable)
+# csvr is bound (via fix_modify below) to the very same temperature compute we
+# display, and it drives that measured temperature straight to its setpoint --
+# so, unlike the old Langevin fix (whose internal degrees-of-freedom
+# accounting made the measured temperature run ~1.5x off its nominal
+# setpoint), no setpoint-vs-measured fudge factor is needed.
+THERMOSTAT_DAMP = 0.5  # ps -- relaxation time for total KE toward target (not user-adjustable)
+# Below this measured temperature the lattice is effectively at rest, so
+# heating from here must be bootstrapped with a velocity seed rather than by
+# rescaling near-zero motion (see set_target_temp).
+COLD_SEED_TEMP = 10.0   # K
+# Bulk-drift handling. Because the thermostat is bound to a COM-subtracted
+# temperature (temp/com), it never damps the crystal's overall translation --
+# good (a rising hot gas can fill the box, a quench reads a true 0 K), but it
+# means bulk drift is left to accumulate from impacts/asymmetry, and on a hard
+# quench the frozen crystal keeps whatever drift it had and sails off. Two
+# gentle, momentum-only corrections tame this without ever touching thermal
+# motion or pinning the gas:
+#   - a *very weak* per-frame drag that bleeds off a small fraction of the
+#     crystal's center-of-mass velocity (uniform subtraction -> relative/
+#     thermal motion untouched); slow to act, so a pressure-driven gas still
+#     billows upward, but a free drift decays over ~a second;
+#   - a *one-shot* full removal of net linear momentum when the dial is thrown
+#     sharply downward (a quench), so a hot, upward-moving cloud doesn't keep
+#     its bulk velocity and launch when its internal motion is frozen out.
+DRIFT_DAMP_PER_FRAME = 0.03   # fraction of COM velocity removed each rendered frame
+QUENCH_ZERO_DROP_FRAC = 0.3   # setpoint drop (as a fraction of current T) that triggers the one-shot zero
 
 # RDF: time-averaged (not a single noisy snapshot -- ~250 atoms is too few
 # for that alone) over a short rolling window so it still reads as "live".
@@ -204,18 +239,44 @@ class CopperEAMSystem(MDSystem):
 
         lmp.command("fix freeze floor setforce 0.0 0.0 0.0")
         lmp.command("fix integ_crystal crystal_mobile nve")
-        # Langevin thermostat (friction + noise) instead of plain viscous
-        # drag: lets the crystal be heated/cooled on demand and gives it
-        # real thermal jitter at T>0. Tstart/Tstop don't accept a variable
-        # reference in this fix ("Expected floating point parameter instead
-        # of 'v_Tsetpoint'"), so set_target_temp redefines the fix with a
-        # literal value instead, same pattern as set_puller_damping.
+        # Instantaneous temperature of the thermalized crystal only -- excludes
+        # the frozen floor (permanently at rest, would deflate an "all group"
+        # reading) and the puller (user-driven, not part of the thermostatted
+        # bath). Defined here (before the thermostat) so the thermostat can be
+        # told to rescale toward *this exact* temperature via fix_modify,
+        # keeping the setpoint and the on-screen readout identical.
+        #
+        # temp/com (not plain temp): the *bulk translation* of the crystal is
+        # subtracted before the temperature is computed, so only genuine
+        # thermal (relative) motion counts. This matters in two places:
+        #   - a quench to 0 K actually reads 0 K -- csvr doesn't damp bulk
+        #     drift (it only rescales), so a slow whole-crystal glide from
+        #     impacts/asymmetry would otherwise be miscounted as a few-K
+        #     temperature floor the thermostat could never remove;
+        #   - at high T the crystal is free to boil upward and fill the box --
+        #     its rising center of mass isn't fought or mistaken for heat.
+        # It also means the thermostat rescales only the thermal motion and
+        # leaves the crystal's real recoil momentum (e.g. from a deposition
+        # impact) untouched, which is physically what should happen.
+        lmp.command("compute crystal_temp crystal_mobile temp/com")
+        # Mass-weighted center-of-mass velocity of the crystal, read each frame
+        # by step() to apply the weak drift drag (see DRIFT_DAMP_PER_FRAME).
+        lmp.command("variable vcmx equal vcm(crystal_mobile,x)")
+        lmp.command("variable vcmy equal vcm(crystal_mobile,y)")
+        # csvr (canonical velocity rescaling) thermostat layered on the plain
+        # nve integrator above: atoms move under real forces only, and each
+        # step the crystal's total KE is nudged toward the target by a single
+        # global velocity-scaling factor -- no per-atom random forcing (see the
+        # module-level thermostat note). Tstart/Tstop don't accept a variable
+        # reference, so set_target_temp redefines the fix with a literal value,
+        # same pattern as set_puller_damping.
         self._seed = random.randint(1, 900_000_000)
         self._target_temp = T_MIN
         lmp.command(
-            f"fix damp_crystal crystal_mobile langevin {T_MIN / LANGEVIN_TARGET_CALIB} "
-            f"{T_MIN / LANGEVIN_TARGET_CALIB} {LANGEVIN_DAMP} {self._seed} zero yes"
+            f"fix damp_crystal crystal_mobile temp/csvr {T_MIN} {T_MIN} "
+            f"{THERMOSTAT_DAMP} {self._seed}"
         )
+        lmp.command("fix_modify damp_crystal temp crystal_temp")
         # nve/limit (not plain nve) for the puller: under a sustained user
         # input force with the deliberately-weak, realistic viscous damping
         # below, terminal velocity (F/gamma) can reach ~300 A/ps -- enough
@@ -253,12 +314,6 @@ class CopperEAMSystem(MDSystem):
         lmp.command(f"run {SETTLE_STEPS}")
         lmp.command("velocity mobile set 0.0 0.0 0.0")
 
-        # Instantaneous temperature of the thermalized crystal only --
-        # excludes the frozen floor (permanently at rest, would deflate an
-        # "all group" reading) and the puller (user-driven, not part of the
-        # thermostatted bath).
-        lmp.command("compute crystal_temp crystal_mobile temp")
-
         # Per-atom KE/PE so the puller's own speed/energy can be read off
         # individually -- LAMMPS handles the amu*(Angstrom/ps)^2 -> eV
         # conversion internally, more reliable than reimplementing the
@@ -287,11 +342,34 @@ class CopperEAMSystem(MDSystem):
         if T == self._target_temp:
             return
         self._target_temp = T
-        setpoint = T / LANGEVIN_TARGET_CALIB
+        # A velocity-rescaling thermostat can only scale motion that already
+        # exists; it cannot warm a dead-cold lattice (multiplying ~zero
+        # velocities stays ~zero). So when the user turns the temperature up
+        # from an effectively-frozen crystal, first seed a Maxwell-Boltzmann
+        # velocity distribution at the new target -- the textbook way to *set*
+        # a temperature -- with mom/rot removed so the whole crystal doesn't
+        # launch off as a rigid body. When already warm, csvr rescales the
+        # existing (real) motion up or down on its own, so no reseed is needed
+        # and the live dynamics are left untouched.
+        current = self.lmp.extract_compute("crystal_temp", 0, 0)
+        if T > current and current < COLD_SEED_TEMP:
+            self._seed = random.randint(1, 900_000_000)
+            self.lmp.command(
+                f"velocity crystal_mobile create {T} {self._seed} "
+                f"mom yes rot yes dist gaussian"
+            )
+        elif current > COLD_SEED_TEMP and T < current - QUENCH_ZERO_DROP_FRAC * current:
+            # A sharp downward step (quench). The thermostat is about to freeze
+            # out the internal motion but, being COM-blind, would leave the
+            # crystal's bulk drift intact -- so a hot, upward-billowing cloud
+            # would sail off to the ceiling as it solidifies. Zero the net
+            # linear momentum once, here, so it decelerates in place instead.
+            self.lmp.command("velocity crystal_mobile zero linear")
         self.lmp.command(
-            f"fix damp_crystal crystal_mobile langevin {setpoint} {setpoint} "
-            f"{LANGEVIN_DAMP} {self._seed} zero yes"
+            f"fix damp_crystal crystal_mobile temp/csvr {T} {T} "
+            f"{THERMOSTAT_DAMP} {self._seed}"
         )
+        self.lmp.command("fix_modify damp_crystal temp crystal_temp")
 
     def set_puller_damping(self, gamma):
         gamma = max(PULLER_DAMPING_MIN, min(PULLER_DAMPING_MAX, gamma))
@@ -303,6 +381,23 @@ class CopperEAMSystem(MDSystem):
     def step(self, n=4):
         self.lmp.command(f"run {n}")
         self._interactive_ps += n * TIMESTEP
+        self._damp_drift()
+
+    def _damp_drift(self):
+        # Very weak drag on the crystal's bulk translation only: subtract a
+        # small fraction of its center-of-mass velocity uniformly from every
+        # atom. A uniform shift leaves all relative (thermal) motion exactly
+        # unchanged, so this never warms or cools the crystal -- it just lets a
+        # free drift decay over ~a second while barely slowing a pressure-driven
+        # gas that is actively billowing upward.
+        if DRIFT_DAMP_PER_FRAME <= 0.0:
+            return
+        vx = self.lmp.extract_variable("vcmx")
+        vy = self.lmp.extract_variable("vcmy")
+        f = DRIFT_DAMP_PER_FRAME
+        self.lmp.command(
+            f"velocity crystal_mobile set {-f * vx} {-f * vy} 0.0 sum yes units box"
+        )
 
     def get_sim_time(self):
         return self._interactive_ps
@@ -359,7 +454,8 @@ class CopperEAMSystem(MDSystem):
         nlocal = self.lmp.get_natoms()
         xs = self.lmp.numpy.extract_atom("x")[:nlocal]
         ids = self.lmp.numpy.extract_atom("id")[:nlocal]
-        return ids.copy(), xs[:, :2].copy(), (ids == self.puller_id)
+        # Single neutral species (Cu): no per-atom charge to distinguish by.
+        return ids.copy(), xs[:, :2].copy(), (ids == self.puller_id), None
 
     def get_box_size(self):
         return self.xhi - self.xlo, self.yhi - self.ylo
