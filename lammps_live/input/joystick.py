@@ -1,15 +1,19 @@
-"""Sidewinder FF2 joystick input -- thin wrapper around
-lammps_live.hardware.ff2.FF2Device.
+"""Sidewinder FF2 joystick input -- thin wrapper around sidewinder.ff2.FF2Device.
 
-That driver (vendored, originally from
-https://github.com/stefanhuber1993/sidewinder) is a hardware-validated HID
-PID driver (built on `hid`/hidapi, which talks to the device through the
-OS's native non-exclusive HID path -- IOKit HID Manager on macOS, hidraw on
-Linux, WinAPI on Windows -- rather than exclusive libusb access, so **no
-sudo is needed** once the device node is readable/writable by the user; see
-README.md's Joystick setup section for the one-time Linux/WSL2 udev step)
-that does the proper "Create New Effect" block-allocation handshake and
-correct signed-byte coefficient encoding.
+The driver is the `sidewinder` package, installed straight from
+https://github.com/stefanhuber1993/sidewinder (see pyproject.toml) rather
+than vendored here, so the device protocol has exactly one home. This module
+is only the sim-facing adapter: it maps the device's decoded input onto the
+sim's conventions and shapes the force feedback -- everything about *how* to
+talk to the hardware lives upstream.
+
+That driver is a hardware-validated HID PID driver (built on `hid`/hidapi,
+which talks to the device through the OS's native non-exclusive HID path --
+IOKit HID Manager on macOS, hidraw on Linux, WinAPI on Windows -- rather than
+exclusive libusb access, so **no sudo is needed** once the device node is
+readable/writable by the user; see README.md's Joystick setup section for the
+one-time Linux/WSL2 udev step) that does the proper "Create New Effect"
+block-allocation handshake and correct signed-byte coefficient encoding.
 
 Drives the device's own Spring and Damper *condition* effects rather than
 streaming a hand-computed constant-force value every frame. Both run
@@ -27,7 +31,7 @@ import random
 from .base import InputSource
 
 # Spring/damper coefficients are signed bytes (-128..127) in the real driver
-# (ff2.py's _s8 helper) -- 127 is genuinely max, not 255.
+# (sidewinder.ff2's _s8 helper) -- 127 is genuinely max, not 255.
 #
 # Stiffness (pos/neg_coeff) ramps from SPRING_STIFFNESS_MIN (limp -- barely
 # resists being moved off-center when nothing is pulling) up to
@@ -57,18 +61,24 @@ CP_OFFSET_MAX = 127
 JITTER_PERIOD_MS = 60
 JITTER_MAX_MAGNITUDE = 30   # of 255 -- deliberately short of max so it never overwhelms the spring/damper feel
 
+# Twist below this fraction of full deflection reads as zero yaw, so a hand
+# resting on the stick doesn't slowly spin the molecule.
+TWIST_DEADZONE = 0.15
+
 
 class JoystickInput(InputSource):
     def __init__(self):
         try:
-            from lammps_live.hardware.ff2 import FF2Device
+            from sidewinder.ff2 import FF2Device
         except ImportError as e:
             raise RuntimeError(
-                "Could not load the joystick driver (lammps_live.hardware.ff2). "
-                "The native hidapi library likely isn't installed for this OS "
-                "(macOS: `brew install hidapi`; Debian/Ubuntu/WSL2: `sudo "
-                "apt install libhidapi-hidraw0`; Fedora: `sudo dnf install "
-                "hidapi`). See README.md's Joystick setup section.\n"
+                "Could not load the joystick driver (the `sidewinder` "
+                "package). Either it isn't installed (`pip install -e .` "
+                "pulls it from GitHub), or the native hidapi library it "
+                "needs isn't installed for this OS (macOS: `brew install "
+                "hidapi`; Debian/Ubuntu/WSL2: `sudo apt install "
+                "libhidapi-hidraw0`; Fedora: `sudo dnf install hidapi`). "
+                "See README.md's Joystick setup section.\n"
                 f"Original error: {e}"
             ) from e
 
@@ -90,39 +100,54 @@ class JoystickInput(InputSource):
         self.jitter = self.ff.sine(magnitude=0, period_ms=JITTER_PERIOD_MS)
         self._last_xy = (0.0, 0.0)
         self._last_yaw = 0.0
-        self._twist_center = None  # captured from the first reading (see poll_yaw)
+        self._twist_center = None  # captured from the first reading (see _process_twist)
 
     def poll(self):
-        result = self.ff.read_state()
-        if result is not None:
-            x, y, twist = result
-            self._last_xy = (x, -y)  # device convention -> sim convention (+y up)
-            self._last_yaw = self._process_twist(twist)
+        # read_input() returns the newest InputState (every axis already decoded
+        # and normalized to -1..1), or None until the first report arrives -- the
+        # device only reports on *change*, so a perfectly still stick sends
+        # nothing at first. Keep the last known value in that case.
+        state = self.ff.read_input()
+        if state is not None:
+            self._last_xy = (state.x, -state.y)  # device convention -> sim convention (+y up)
+            self._last_yaw = self._process_twist(state.twist)
         return self._last_xy
 
-    def _process_twist(self, twist_raw):
-        # Auto-center on the first reading so the resting twist maps to 0 (this
-        # also means a mis-read report byte, constant at rest, degrades to "no
-        # yaw" rather than a spurious steady spin), then normalize the 6-bit
-        # axis to -1..1 with a deadzone against jitter around center.
+    def _process_twist(self, twist):
+        # state.twist arrives already normalized to -1..1 (the driver decodes
+        # byte 5's 6-bit signed field and scales it). Auto-center on the first
+        # reading anyway to absorb any small per-unit rest offset (and so a
+        # constant mis-read degrades to "no yaw" rather than a steady spin),
+        # then apply a deadzone against jitter.
         if self._twist_center is None:
-            self._twist_center = twist_raw
-        val = (twist_raw - self._twist_center) / 31.0  # half of the 0..63 range
-        if abs(val) < 0.15:
+            self._twist_center = twist
+        val = twist - self._twist_center
+        if abs(val) < TWIST_DEADZONE:
             return 0.0
-        return max(-1.0, min(1.0, val))
+        # Negate: the raw twist sign is opposite the handedness the molecule
+        # should turn (twisting one way must rotate it the same way on screen).
+        return -max(-1.0, min(1.0, val))
 
     def poll_yaw(self):
         return self._last_yaw
 
     def calibrate(self, n=200):
-        """Print live stick position for a few seconds, for basic sanity checking."""
+        """Print live decoded stick state -- a sanity check that the device is
+        found, permissions are right, and the axes move as expected. Push the
+        stick around and twist it; x/y should reach +-1 at the stops and 'yaw'
+        should swing symmetrically about 0."""
         import time
-        print("Move the stick now; printing position for a few seconds...")
+        print("Move and twist the stick. x/y: -1..+1, yaw: -1..+1 after deadzone.")
+        print("(None means no report yet -- the device only reports on change; nudge the stick.)\n")
         for _ in range(n):
-            result = self.ff.read_position()
-            if result is not None:
-                print(f"x={result[0]:+.3f}  y={result[1]:+.3f}")
+            state = self.ff.read_input()
+            if state is None:
+                print("waiting for first report...")
+            else:
+                yaw = self._process_twist(state.twist)
+                buttons = ",".join(str(b) for b in state.pressed) or "-"
+                print(f"x={state.x:+.3f}  y={state.y:+.3f}  twist={state.twist:+.3f}  "
+                      f"yaw={yaw:+.2f}  hat={state.hat_name:<13s} buttons={buttons}")
             time.sleep(0.05)
 
     def send_force(self, fx, fy, stiffness=None):

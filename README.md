@@ -88,9 +88,14 @@ system resolves at runtime:
 ## Joystick setup (Sidewinder FF2 force feedback)
 
 Optional -- only needed for `--input joystick`. Skip this section entirely
-for `--input mouse`. The driver itself
-(`lammps_live/hardware/ff2.py`) is vendored in this repo -- no separate
-clone or sibling checkout needed.
+for `--input mouse`. The driver itself is the
+[`sidewinder`](https://github.com/stefanhuber1993/sidewinder) package,
+installed automatically from its own repo by `pip install -e .` -- no
+separate clone or sibling checkout needed, and no copy of the driver kept
+in sync here.
+
+Only the native hidapi library below has to be installed by hand: it's a C
+library, so pip can't bring it in.
 
 1. Install the native hidapi library:
    - macOS: `brew install hidapi`
@@ -157,7 +162,7 @@ input force is held at zero instead of also reading that same mouse
 position as a deflection.
 
 No `sudo` is required on macOS, or on Linux/WSL2 once the udev rule above
-is installed: `lammps_live/hardware/ff2.py` talks to the device via `hid`
+is installed: the `sidewinder` driver talks to the device via `hid`
 (hidapi), which goes through the OS's own non-exclusive HID path -- IOKit
 HID Manager on macOS, hidraw on Linux -- rather than `pyusb`/libusb
 claiming exclusive access to the USB interface (which requires detaching
@@ -184,10 +189,11 @@ lammps_live/
   input/
     base.py     InputSource interface
     mouse.py    mouse control
-    joystick.py Sidewinder FF2 wrapper
-  hardware/
-    ff2.py      vendored HID PID driver, originally from
-                https://github.com/stefanhuber1993/sidewinder
+    joystick.py Sidewinder FF2 wrapper -- maps the device onto the sim's
+                conventions and shapes the force feedback. The HID PID
+                driver itself is the external `sidewinder` package
+                (https://github.com/stefanhuber1993/sidewinder), a
+                dependency rather than a vendored copy.
   ui/
     theme.py    colors/sizes
     widgets.py  Slider

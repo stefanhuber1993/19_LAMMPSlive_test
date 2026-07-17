@@ -27,7 +27,7 @@ def build_parser():
     parser.add_argument("--list-systems", action="store_true",
                          help="print available systems and exit")
     parser.add_argument("--calibrate", action="store_true",
-                         help="dump raw joystick position for a few seconds and exit")
+                         help="print live joystick state for a few seconds and exit")
     return parser
 
 

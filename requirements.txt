@@ -1,4 +1,7 @@
 pygame
-hid
 lammps
 numpy
+# Sidewinder FF2 joystick driver -- lives in its own repo, not vendored here.
+# Brings `hid` with it; the native hidapi library comes from your OS package
+# manager (see README.md's Joystick setup section).
+sidewinder @ git+https://github.com/stefanhuber1993/sidewinder.git

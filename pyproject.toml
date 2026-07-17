@@ -10,9 +10,15 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "pygame>=2.1",
-    "hid",
     "lammps",
     "numpy",
+    # Sidewinder FF2 driver, consumed straight from its own repo rather than
+    # vendored here, so the device protocol has a single home. Pulls in `hid`
+    # itself; the native hidapi library still has to come from the OS package
+    # manager (see README.md's Joystick setup section).
+    # Only needed for --input joystick, but kept a hard dependency so a plain
+    # `pip install -e .` gives a working joystick mode with no extra step.
+    "sidewinder @ git+https://github.com/stefanhuber1993/sidewinder.git",
 ]
 
 [project.optional-dependencies]
