@@ -65,10 +65,39 @@ class SystemSpec:
     # (e.g. "+"/"-" for ions; None entries draw no glyph).
     species_colors: tuple = None   # (RGB, RGB, ...) indexed by species, or None
     species_labels: tuple = None   # (str-or-None, ...) indexed by species, or None
+    # Flat draw color for single-species systems (Cu, Ar), so they read as
+    # distinct materials -- warm metallic copper vs. cold noble-gas argon --
+    # instead of sharing one generic crystal color. None falls back to the
+    # theme's CRYSTAL_COLOR. Ignored when species_colors is set.
+    crystal_color: tuple = None
+    # On-screen atom size, given as a PHYSICAL radius in Angstrom (converted to
+    # pixels per-frame at the active box's scale, then clamped) so atoms are
+    # drawn at their real relative sizes: argon's atom genuinely dwarfs copper's,
+    # a Cl- anion genuinely dwarfs a Na+ cation, and the packing you see is the
+    # real packing. atom_radius_A is the single-species value; species_radii_A,
+    # if set, gives a per-species radius (indexed like species_colors). Both
+    # None -> the theme's fixed-pixel CRYSTAL_RADIUS fallback.
+    atom_radius_A: float = None
+    species_radii_A: tuple = None
+    # Real MD time advanced per rendered frame, in ps (overrides the global
+    # config.SIM_TIME_PER_FRAME). Mesoscale systems (the coarse-grained lipid
+    # membrane) evolve on a much slower intrinsic time scale, so at the shared
+    # default a whole frame barely moves them and the membrane looks frozen /
+    # jittery rather than a living, self-healing fluid -- they need a larger
+    # per-frame time slice to come alive. None -> use the global default.
+    sim_time_per_frame: float = None
     # Whether to draw the generic "faint line between atoms near their
     # equilibrium spacing" bond overlay. On for crystals; off for systems that
     # supply their own explicit bonds to draw (see get_bond_pairs), e.g. lipids.
     bond_overlay: bool = True
+    # Whether this system renders as a 3D scene (perspective + depth-cued
+    # spheres and directors) rather than the default top-down 2D box. A 3D
+    # system additionally implements get_positions_3d / get_dipoles_3d /
+    # get_bonds_3d / get_camera_params / get_control_grid, and the app routes
+    # those to the renderer's 3D path. The standard 2D readouts (thermo, puller
+    # energy, force feedback) are unchanged -- they act on the 2D control-plane
+    # projection of the puller the system already returns.
+    render_3d: bool = False
 
 
 class MDSystem(ABC):
@@ -141,8 +170,35 @@ class MDSystem(ABC):
         """Optional: explicit bonds to draw, as an (M, 2) int array of index
         pairs into the CURRENT get_all_positions ordering (so it must be called
         in the same frame, before stepping again). Used to draw molecular
-        backbones, e.g. each lipid's head-tail-tail chain. None (default) means
-        the system has no explicit bonds to draw."""
+        backbones, e.g. each lipid's head-tail-tail chain, or the live covalent
+        network of the carbon sheet (which visibly tears as bonds break). None
+        (default) means the system has no explicit bonds to draw."""
+        return None
+
+    def get_hbond_pairs(self):
+        """Optional: hydrogen-bond-like pairs to draw in a distinct, lighter
+        style than the solid molecular bonds of get_bond_pairs -- as an (M, 2)
+        int array of index pairs into the CURRENT get_all_positions ordering.
+        Used by the water model to show the transient hydrogen-bond network
+        forming and breaking. None (default) means no such overlay."""
+        return None
+
+    def get_hud_lines(self):
+        """Optional: a list of short strings drawn as a small live HUD in the
+        simulation view (beneath the standard force/time readout), for
+        per-system pedagogical state the fixed panel readouts don't cover --
+        e.g. the carbon demo's etched-atom / broken-bond tally, or the water
+        demo's phase and density-anomaly readout. Empty/None -> nothing drawn."""
+        return None
+
+    def get_potential_terms(self):
+        """Optional: a live breakdown of the puller's interaction energy into
+        the separate additive terms of the force field, for pedagogy -- returned
+        as (title, [(label, value), ...], scale) or None. The renderer draws it
+        as a compact signed-bar chart (each term's bar, plus their sum) so the
+        additive structure of the potential is visible and updates live. Values
+        are in the system's own energy units (reduced/LJ for MesoMem); scale is
+        the bar half-range. None (default) -> nothing drawn."""
         return None
 
     def steer_orientation(self, rate, dt):
@@ -151,6 +207,15 @@ class MDSystem(ABC):
         is the frame time in seconds. No-op for systems whose puller has no
         meaningful orientation (a lone atom); lipids integrate it into the
         control lipid's director angle."""
+
+    def puller_bead_count(self):
+        """Number of LAMMPS atoms the puller is made of: 1 for a single-atom
+        puller (Cu, Ar, NaCl, the etch O), or the molecule's bead count for a
+        molecular puller (lipid = 3, water = 4). set_input_force applies its
+        force to each of these atoms, so a caller wanting a specific NET force on
+        the puller (e.g. the app's joystick MD-force cancellation) divides by
+        this count. Default 1."""
+        return 1
 
     @abstractmethod
     def get_box_size(self):

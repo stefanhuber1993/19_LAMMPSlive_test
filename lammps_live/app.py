@@ -16,6 +16,7 @@ from .forcefeedback import (
 from .input import CP_OFFSET_MAX, DAMPER_COEFFICIENT_MAX, JoystickInput, MouseInput, SPRING_STIFFNESS_MAX
 from .systems import get_system_class, list_systems
 from .ui import AtomTrails, Renderer, RollingHistory, Slider
+from .ui.camera import Camera3D
 
 STEPS_PER_FRAME_CAP = 200  # sanity cap if a system's timestep is set absurdly small
 
@@ -74,6 +75,18 @@ class App:
 
         self.renderer.set_box_size(self.system.get_box_size())
 
+        # 3D systems (e.g. the MesoMem membrane patch) render through a
+        # perspective camera instead of the top-down 2D box. Build it here from
+        # the system's requested view and the sim viewport.
+        if spec.render_3d:
+            cam = self.system.get_camera_params()
+            self.camera3d = Camera3D(
+                cam["eye"], cam["target"], cam["up"], cam["fov_deg"],
+                self.renderer.sim_width, config.WINDOW_SIZE[1],
+            )
+        else:
+            self.camera3d = None
+
         if self.temp_slider is None:
             self.temp_slider = Slider.from_spec((0, 0, 100, 4), spec.temperature)
             self.damping_slider = Slider.from_spec((0, 0, 100, 4), spec.damping)
@@ -96,7 +109,8 @@ class App:
         self.ff_smoother.reset()
         self.interaction_smoother.reset()
 
-        self.steps_per_frame = max(1, min(STEPS_PER_FRAME_CAP, round(config.SIM_TIME_PER_FRAME / spec.timestep)))
+        sim_time_per_frame = spec.sim_time_per_frame or config.SIM_TIME_PER_FRAME
+        self.steps_per_frame = max(1, min(STEPS_PER_FRAME_CAP, round(sim_time_per_frame / spec.timestep)))
 
     def _cycle_system(self, step=1):
         keys = [key for key, _ in self.systems]
@@ -163,7 +177,22 @@ class App:
             jx, jy = self.source.poll()
             yaw = self.source.poll_yaw()
         input_fx, input_fy = jx * ff_profile.input_force_scale, jy * ff_profile.input_force_scale
-        self.system.set_input_force(input_fx, input_fy)
+        # Joystick is a force-feedback loop: the puller is driven mainly by the
+        # stick's input force, with the MD interaction force reaching it partly
+        # *indirectly* -- it's rendered on the stick (force feedback, below), the
+        # user's hand yields, and the resulting deflection changes this input
+        # force. Cancel out the fraction (1 - felt) of the measured MD force from
+        # what's applied to the atom, leaving `felt` of it as direct contact
+        # coupling (fully cancelling it felt too detached). Spread across the
+        # puller's atoms via puller_bead_count, since set_input_force applies its
+        # force to each. Mouse mode keeps the full direct force-on-atom feel.
+        if self.input_mode == "joystick":
+            n_beads = max(1, self.system.puller_bead_count())
+            md_fx, md_fy = self.system.get_interaction_force()
+            cancel = (1.0 - config.JOYSTICK_MD_FORCE_FELT_FRACTION) / n_beads
+            self.system.set_input_force(input_fx - cancel * md_fx, input_fy - cancel * md_fy)
+        else:
+            self.system.set_input_force(input_fx, input_fy)
         # Yaw (joystick twist axis, or Q/E in mouse mode) steers the puller's
         # in-plane orientation -- a no-op for systems whose puller is a lone
         # atom, used by the lipid system to rotate the control lipid's director.
@@ -212,9 +241,25 @@ class App:
 
         ids, positions, is_puller, species = self.system.get_all_positions()
         bond_pairs = self.system.get_bond_pairs()
+        hbond_pairs = self.system.get_hbond_pairs()
+        hud_lines = self.system.get_hud_lines()
         self._trail_frame_counter += 1
         if self._trail_frame_counter % config.TRAIL_SAMPLE_EVERY_N_FRAMES == 0:
             self.atom_trails.add(self.sim_wall_time, ids, positions, is_puller)
+
+        scene_3d = None
+        if spec.render_3d:
+            ids3d, pos3d, is_puller3d = self.system.get_positions_3d()
+            scene_3d = {
+                "positions3d": pos3d,
+                "dipoles3d": self.system.get_dipoles_3d(),
+                "is_puller": is_puller3d,
+                "bonds": self.system.get_bonds_3d(),
+                "camera": self.camera3d,
+                "control_grid": self.system.get_control_grid(),
+                "potential_terms": self.system.get_potential_terms(),
+            }
+
         self.renderer.draw(
             positions, is_puller, pos,
             (input_fx, input_fy), interaction_force, self.clock.get_fps(),
@@ -224,6 +269,7 @@ class App:
             self.history, rdf, heat_fraction=heat_fraction,
             sim_time_ps=sim_time_ps, puller_speed_m_s=puller_speed_m_s,
             atom_trails=self.atom_trails, species=species, bond_pairs=bond_pairs,
+            hbond_pairs=hbond_pairs, hud_lines=hud_lines, scene_3d=scene_3d,
         )
 
         new_dt = self.clock.tick(60) / 1000.0

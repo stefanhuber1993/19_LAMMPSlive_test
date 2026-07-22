@@ -4,15 +4,21 @@ below -- nothing else in the codebase needs to change.
 """
 from .base import ForceFeedbackProfile, MDSystem, SliderSpec, SystemSpec
 from .cu_deposition import CopperEAMSystem
+from .diamond_etch import CarbonEtchSystem
 from .lipid_membrane import LipidMembraneSystem
 from .lj_argon import LJArgonSystem
+from .mb_water import MBWaterSystem
+from .mesomem_hex import MesoMemHexSystem
 from .nacl import NaClSystem
 
 REGISTRY = {
     CopperEAMSystem.spec.key: CopperEAMSystem,
     LJArgonSystem.spec.key: LJArgonSystem,
     NaClSystem.spec.key: NaClSystem,
+    CarbonEtchSystem.spec.key: CarbonEtchSystem,
     LipidMembraneSystem.spec.key: LipidMembraneSystem,
+    MBWaterSystem.spec.key: MBWaterSystem,
+    MesoMemHexSystem.spec.key: MesoMemHexSystem,
 }
 
 

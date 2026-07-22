@@ -10,6 +10,15 @@ WINDOW_SIZE = (1300, 900)
 # advance at the same physical rate instead of appearing in slow motion.
 SIM_TIME_PER_FRAME = 0.003  # ps
 
+# Joystick mode drives the puller mainly by the stick's input force, feeding the
+# MD interaction force back INDIRECTLY through force feedback (see app.py). This
+# is the fraction of that MD force also applied DIRECTLY to the puller in the
+# simulation: 0.0 = puller feels only the stick (a pure haptic loop -- felt too
+# detached in practice), 1.0 = puller feels the full MD force directly (like
+# mouse mode). A middle value keeps some direct contact coupling. Mouse mode
+# ignores this and always feels the full force.
+JOYSTICK_MD_FORCE_FELT_FRACTION = 0.5
+
 TEMP_KEY_RATE_FRACTION = 0.05     # fraction of a system's temperature range, per second, while Up/Down is held
 TEMP_WHEEL_STEP_FRACTION = 0.02   # fraction of a system's temperature range, per mouse-wheel notch
 HISTORY_WINDOW_SECONDS = 20.0

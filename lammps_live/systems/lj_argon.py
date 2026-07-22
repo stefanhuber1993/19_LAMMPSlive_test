@@ -120,6 +120,13 @@ SPEC = SystemSpec(
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
     puller_speed_cap=0.05 * LATTICE_SPACING / TIMESTEP,
+    # Cold periwinkle, deliberately unlike copper's warm metal, to signal a
+    # weakly-bound noble-gas solid that melts near liquid-nitrogen cold. Atoms
+    # drawn at ~0.45 sigma (~0.3x the wider hex spacing): argon's atom is
+    # physically far larger than copper's, and at the same box-relative scaling
+    # that size difference is now visible side by side.
+    crystal_color=(168, 172, 230),
+    atom_radius_A=0.45 * SIGMA,
 )
 
 

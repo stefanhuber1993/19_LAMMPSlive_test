@@ -8,3 +8,7 @@ log.cite
 *.egg-info/
 build/
 dist/
+# Compiled MesoMem pair-style plugin (rebuilt on demand from the vendored
+# cpp sources in lammps_live/systems/mesomem_ff/ -- see that package).
+lammps_live/systems/mesomem_ff/*.dylib
+lammps_live/systems/mesomem_ff/*.so

@@ -22,3 +22,25 @@ def format_sim_time(ps):
     if ps < 1000.0:
         return f"{ps:.2f} ps"
     return f"{ps / 1000.0:.3f} ns"
+
+
+def format_energy(ev):
+    """A single per-atom energy (eV), formatted to stay readable across the
+    orders of magnitude it spans between systems: a bound EAM/ionic atom sits
+    at several eV (cohesive energies ~ -3 eV), while a weakly-bound LJ argon
+    atom or a coarse-grained lipid bead can be a thousandth of that. The number
+    of shown decimals shrinks as the magnitude grows so it stays ~3-4
+    significant figures wide, and the sign is always shown -- a negative energy
+    (bound, below the free-atom reference) is the whole point of the readout.
+    Very small/large magnitudes fall back to scientific notation rather than
+    printing a screen-full of zeros or digits."""
+    mag = abs(ev)
+    if mag < 5e-4:
+        return "0 eV"
+    if mag < 0.1:
+        return f"{ev:+.4f} eV"
+    if mag < 10.0:
+        return f"{ev:+.3f} eV"
+    if mag < 1000.0:
+        return f"{ev:+.1f} eV"
+    return f"{ev:+.2e} eV"

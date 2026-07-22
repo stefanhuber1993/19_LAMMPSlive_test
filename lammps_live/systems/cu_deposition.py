@@ -162,6 +162,12 @@ SPEC = SystemSpec(
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
     puller_speed_cap=0.1 * LATTICE_SPACING / TIMESTEP,
+    # Warm metallic copper, so it reads as a dense metal (contrast argon's cold
+    # noble-gas tint). Atoms drawn at ~0.3x the nearest-neighbor spacing: big
+    # enough to show the close-packed hex coordination, small enough to leave a
+    # clear gap for the "near-equilibrium" bond overlay glowing between them.
+    crystal_color=(210, 128, 66),
+    atom_radius_A=0.30 * LATTICE_SPACING,
 )
 
 

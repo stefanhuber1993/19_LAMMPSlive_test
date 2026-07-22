@@ -97,7 +97,12 @@ TIMESTEP = 0.005            # ps -- verified stable through membrane rupture at 
 # near-ballistically to the input force -- a large value makes it feel like
 # it's stuck in molasses; the dial still lets you add that "heavy" feel.
 LANGEVIN_DAMP = 2.0         # ps -- solvent viscous relaxation time
-PULLER_DAMPING_DEFAULT = 0.02   # eV*ps/Angstrom^2
+# Puller drag + input scale set the control lipid's top speed = input_scale/gamma.
+# At the old 2.0 / 0.02 the lipid's terminal speed was ~100 A/ps -- it shot across
+# the whole box in under half a second, uncontrollable. These give ~0.7/0.05 ~=
+# 14 A/ps, a steady few-seconds glide across the box that you can actually aim,
+# while still out-pushing the membrane's soft (~0.1-0.5 eV/A) contact forces.
+PULLER_DAMPING_DEFAULT = 0.05   # eV*ps/Angstrom^2
 PULLER_DAMPING_MIN = 0.0
 PULLER_DAMPING_MAX = 0.2
 
@@ -126,7 +131,7 @@ TAIL_COLOR = (200, 190, 120)
 # profile is argon-like rather than copper's stiff one -- with enough input
 # authority to push a lipid into the membrane.
 FORCE_FEEDBACK = ForceFeedbackProfile(
-    input_force_scale=2.0,
+    input_force_scale=0.7,
     ff_exaggeration=4.0,
     ff_knee=0.3,
     ff_max_mag=120.0,
@@ -149,9 +154,23 @@ SPEC = SystemSpec(
                         PULLER_DAMPING_DEFAULT, fmt="{:.3f}"),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
-    puller_speed_cap=0.1 * SIGMA / TIMESTEP,
+    puller_speed_cap=0.03 * SIGMA / TIMESTEP,   # matches the retuned, calmer top speed
     species_colors=(HEAD_COLOR, TAIL_COLOR),  # 0=head, 1=tail
     species_labels=None,
+    # Beads sized a bit under the WCA contact radius (~0.5 sigma) so each lipid's
+    # head+two tails read as fat amphiphile blobs while still leaving the drawn
+    # backbone sticks visible between them; the head is drawn slightly larger so
+    # the hydrophilic end (and the lipid's orientation) stands out.
+    species_radii_A=(0.34 * SIGMA, 0.30 * SIGMA),   # 0=head (larger), 1=tail
+    # This coarse-grained mesoscale membrane evolves ~20x slower per fs than the
+    # atomistic crystals (heavy beads, long Langevin relaxation), so at the
+    # shared global time-per-frame it barely moved between frames and looked
+    # frozen and jittery rather than a living, self-healing fluid bilayer.
+    # Advancing more real time per frame lets its (genuinely soft) interactions
+    # actually play out on screen -- the membrane ripples, heals, and resists
+    # insertion visibly. Stable: the 0.005 ps timestep is unchanged and was
+    # verified through rupture; only the number of steps per frame goes up.
+    sim_time_per_frame=0.06,   # ps/frame (12 steps at the 0.005 ps timestep)
     bond_overlay=False,   # lipids draw their own explicit backbones (get_bond_pairs)
 )
 
@@ -368,6 +387,9 @@ class LipidMembraneSystem(MDSystem):
 
     def steer_orientation(self, rate, dt):
         self._target_angle += rate * YAW_RATE * dt
+
+    def puller_bead_count(self):
+        return 3   # head + 2 tails
 
     # ---- controls -----------------------------------------------------------
 

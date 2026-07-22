@@ -36,11 +36,43 @@ switchable *while the demo is running* -- press `1`/`2`/... or `Tab`:
 |---|---|---|---|
 | `cu_eam` | Copper deposition (EAM) | real Cu EAM (`Cu_u3.eam`) | strong metallic bonding, high melting range (dial goes to 6000 K) |
 | `lj_argon` | Argon melting (Lennard-Jones) | generic `lj/cut`, real argon parameters | much softer/weaker, melts near 84 K (argon's real melting point) |
-| `nacl` | Salt crystal (ionic, NaCl) | Born-Mayer + damped shifted-force Coulomb (`born/coul/dsf`) | alternating Na(+)/Cl(-) ions (labeled `+`/`-`) on a checkerboard square lattice -- the bipartite, 2D-stable ionic arrangement -- bound by Coulomb (Madelung) attraction |
+| `nacl` | Salt crystal (ionic, NaCl) | Born-Mayer + damped shifted-force Coulomb (`born/coul/dsf`) | alternating Na(+)/Cl(-) ions (labeled `+`/`-`, drawn at their real size ratio) on a checkerboard square lattice -- the bipartite, 2D-stable ionic arrangement -- bound by Coulomb (Madelung) attraction |
+| `carbon_etch` | Covalent carbon etch (O bombardment) | reactive bond-order carbon (`rebo`, CH.rebo) + strong Morse C-O overlay | a 2D covalent carbon sheet (graphene, the honest 2D "diamond"): open 3-fold honeycomb, very high melting mark. Drive a reactive **oxygen** (the puller) in, snap directional covalent bonds (they tear visibly, leaving glowing dangling-bond sites) and etch carbons off as **CO** -- a live CO / broken-bond tally, with etch pits that persist and a fresh O sent in each time |
 | `lipid` | Lipid membrane (coarse-grained) | soft repulsion + cosine-squared tail attraction (`cosine/squared`), harmonic bonds/angles, Langevin implicit solvent | a solvent-free 2D lipid bilayer of 3-bead amphiphiles (head + 2 tails); the puller is a lipid you also **orient** (joystick yaw / Q-E) to insert into the membrane. Inspired by the MesoMem model (Sillano, Marrink & Idema 2026); see the module docstring |
+| `mb_water` | Mercedes-Benz water (ice floats) | rigid 3-arm molecules (`fix rigid/small` + Langevin), directional hydrogen bond via `cosine/squared` arm-tip well | the 2D Mercedes-Benz water model (Ben-Naim 1971): each molecule is an O with three 120-degree hydrogen-bonding arms. Starts as the open hydrogen-bonded honeycomb **ice**; heat it and the network **collapses to denser liquid** -- water's freezing-expansion anomaly (why ice floats), with a live O-O spacing / density readout. The puller is a water molecule you also **orient** (joystick yaw / Q-E) to line its arms up and catch hydrogen bonds |
+| `mesomem` | MesoMem membrane patch (**3D**) | the **real** MesoMem pair-style (`mesomem`, Sillano, Marrink & Idema 2026): 4-2 soft core + cosine-squared attraction + orientation-dependent **tilt** and **splay** terms on oriented (dipole) beads | a 3D, perspective-rendered 7-bead membrane patch (hexagon + center). Each bead is a bilayer patch carrying a director (the yellow spike). Pull the **center bead** out of the sheet along the on-screen **net** (a plane perpendicular to the membrane) and feel tilt/splay resist through force feedback. Unlike `lipid` (which mimics MesoMem with stock styles), this loads the authors' actual C++ pair-style as a runtime LAMMPS plugin -- see below |
 
 Run `lammps-live --list-systems` to print this from the code. See
 "Adding a new system" below to add your own.
+
+### The MesoMem force field (3D `mesomem` system)
+
+The `mesomem` system runs the authors' **actual** custom LAMMPS pair-style
+(`cpp_files/pair_membrane_sillano_v2.{cpp,h}` from
+[gitlab.tudelft.nl/idema-group/mesomem](https://gitlab.tudelft.nl/idema-group/mesomem),
+[arXiv:2602.24123](https://arxiv.org/abs/2602.24123)), rather than approximating
+it. Because the pip-installed LAMMPS ships the `PLUGIN` package, we don't rebuild
+LAMMPS: the vendored sources in `lammps_live/systems/mesomem_ff/` are compiled
+once into a small shared library and pulled in at runtime with `plugin load`.
+The build happens automatically on first use (and only rebuilds when a source
+file changes). It needs, on this machine:
+
+- a C++ compiler (`clang++` on macOS, `g++` on Linux), and
+- the headers of the **same MPI** the LAMMPS wheel links (Homebrew MPICH here,
+  `/opt/homebrew/include`). Override the location with `MESOMEM_MPI_INCLUDE` if
+  auto-detection (via `mpicxx`/Homebrew) misses it.
+
+The three general problems this system solves -- **compiling a custom LAMMPS
+force field into a stock build, rendering 3D smoothly in pygame (perspective +
+depth-cued haze + shaded spheres), and driving a 3D scene with a 2-axis stick**
+-- are all reusable for the richer MesoMem systems to come.
+
+**Controls.** The two joystick (or mouse) axes slide the center bead in the
+world *xz*-plane -- a plane perpendicular to the membrane and facing the camera,
+drawn as the faint net. Axis x -> along the sheet; axis y -> out of the sheet.
+Pulling out tents the patch; the directors tilt and splay to follow, and the red
+arrow / force feedback report the membrane's restoring force. Units are the
+paper's LJ-reduced units (so the temperature dial reads `T*`, not Kelvin).
 
 ## Setup
 
@@ -143,9 +175,10 @@ lammps-live --list-systems                          # print available systems an
 - `1`-`9` -- jump directly to a system; `Tab` -- cycle to the next one
   (rebuilds the simulation; takes a moment)
 - Move the puller with the mouse / joystick, as usual
-- **Orientation** (`lipid` system): the joystick's **yaw (twist) axis** -- or
-  the **`Q`/`E`** keys in mouse mode -- rotate the control lipid's in-plane
-  angle, so you can turn it head-out and insert it into the bilayer
+- **Orientation** (`lipid` and `mb_water` systems): the joystick's **yaw
+  (twist) axis** -- or the **`Q`/`E`** keys in mouse mode -- rotate the control
+  molecule's in-plane angle, so you can turn a lipid head-out to insert it into
+  the bilayer, or line a water molecule's arms up to catch hydrogen bonds
 - Mouse-drag the **Temperature** / **Puller damping** sliders in the
   right-hand panel (works regardless of `--input` mode)
 - `Up`/`Down` arrow keys or the mouse scroll wheel -- nudge Temperature
@@ -185,7 +218,11 @@ lammps_live/
     base.py           MDSystem interface + SystemSpec/SliderSpec/ForceFeedbackProfile
     cu_deposition.py  copper EAM system
     lj_argon.py       argon Lennard-Jones system
-    data/             bundled potential files (Cu_u3.eam)
+    nacl.py           ionic NaCl (Born-Mayer + DSF Coulomb) system
+    diamond_etch.py   covalent carbon (REBO) + reactive-O etch system
+    lipid_membrane.py coarse-grained lipid bilayer system
+    mb_water.py       2D Mercedes-Benz water (rigid 3-arm, hydrogen bonds) system
+    data/             bundled potential files (Cu_u3.eam; CH.rebo ships with LAMMPS)
   input/
     base.py     InputSource interface
     mouse.py    mouse control

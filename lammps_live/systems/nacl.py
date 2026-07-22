@@ -158,6 +158,12 @@ SPEC = SystemSpec(
     puller_speed_cap=0.05 * LATTICE_SPACING / TIMESTEP,
     species_colors=(NACL_CATION_COLOR, NACL_ANION_COLOR),  # 0=Na+, 1=Cl-
     species_labels=("+", "-"),
+    # Real ionic radii (Na+ ~1.02 A, Cl- ~1.81 A), scaled down uniformly to
+    # leave a gap for the bond overlay while preserving the ~1.8x ratio: the big
+    # soft anion and the small dense cation are a core lesson of ionic bonding
+    # (and why the small cation slots between the large anions), so the drawn
+    # sizes teach it directly rather than showing two equal dots.
+    species_radii_A=(0.72, 1.28),   # 0=Na+ (small cation), 1=Cl- (large anion)
 )
 
 
