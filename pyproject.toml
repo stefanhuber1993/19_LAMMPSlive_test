@@ -12,6 +12,10 @@ dependencies = [
     "pygame>=2.1",
     "lammps",
     "numpy",
+    # GPU rendering of the 3D bead systems (sphere impostors + SSAO). Needs an
+    # OpenGL 3.3+ core context; the app auto-falls back to the CPU renderer if
+    # one can't be created. Pulls in `glcontext`.
+    "moderngl>=5.8",
     # Sidewinder FF2 driver, consumed straight from its own repo rather than
     # vendored here, so the device protocol has a single home. Pulls in `hid`
     # itself; the native hidapi library still has to come from the OS package

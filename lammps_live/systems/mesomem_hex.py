@@ -44,6 +44,7 @@ from lammps import lammps
 
 from .base import ForceFeedbackProfile, MDSystem, SliderSpec, SystemSpec
 from .mesomem_ff import ensure_plugin_loaded
+from .rdf2d import InPlaneRDF
 
 # --- MesoMem potential parameters (paper "standard conditions", Sec. II-III) --
 SIGMA = 1.0        # bead diameter / length unit
@@ -54,6 +55,16 @@ RC = 2.5           # isotropic interaction cutoff (>= 2.5 sigma needed for cohes
 WC = 2.0           # orientational (tilt/splay) interaction cutoff, must be <= RC
 ZETA = 5.0         # steepness/width of the cosine-squared attractive branch
 C0 = 0.0           # spontaneous curvature (0 -> flat preferred)
+
+# Live-tunable ranges for the k_tilt / k_splay / eta(zeta) sliders. Centered on
+# the paper's "standard conditions" values above; the spans bracket the regimes
+# the MesoMem preprint explores -- k_tilt from a floppy membrane up through the
+# stiff-planar regime (planar above ~10), k_splay around its soft default, and
+# eta (the zeta exponent of the cosine-squared attraction) from long-range/soft
+# to short-range/steep cohesion.
+K_TILT_MIN, K_TILT_MAX = 0.0, 30.0
+K_SPLAY_MIN, K_SPLAY_MAX = 0.0, 5.0
+ZETA_MIN, ZETA_MAX = 1.0, 12.0
 
 A_LATTICE = 1.0    # in-plane nearest-neighbor spacing (near the isotropic min at r=sigma)
 BEAD_DIAMETER = 2.0  # sphere radius = sigma -> moment of inertia I = (2/5) m sigma^2 (paper)
@@ -76,8 +87,8 @@ LANGEVIN_DAMP = 0.5     # tau_LJ, translational relaxation time (stronger fricti
 # Both are applied as per-frame momentum kicks (F*dt); the Langevin bath damps
 # them so the patch settles flat and centred instead of oscillating. Strong, but
 # still a force -- the ring can dome, tilt and recover realistically.
-K_CENTER = 45.0    # centre-of-mass centering stiffness
-K_ALIGN = 10.0     # normal-up alignment torque strength
+K_CENTER = 7.0    # centre-of-mass centering stiffness
+K_ALIGN = 7.0     # normal-up alignment torque strength
 # A tiny per-bead spring toward the origin, ON TOP of the COM centering above
 # (which only moves the centre of mass, not individual beads). This is a safety
 # net so no single outer bead can be flung out of the box during violent play;
@@ -116,6 +127,11 @@ T_MELT = 0.3
 YAW_TORQUE = 1.0   # angular-momentum kick about y, per unit yaw, per frame
 ROT_DAMP = 0.88    # per-frame rotational-velocity retention (how fast swings settle)
 
+# Reaction-torque magnitude (about the control-plane normal) that maps to a full
+# semicircle of the red torque arc. The membrane's tilt term reaches O(k_tilt/2)
+# at large deflection; this is picked so a firm twist against it fills the arc.
+REACTION_TORQUE_DISPLAY_MAX = 6.0
+
 # MesoMem contact/restoring forces on the pulled bead run O(1-10) in reduced
 # units; profile is scaled to that, with enough stick authority to tent the
 # membrane and pop the bead out against tilt/splay resistance.
@@ -149,6 +165,11 @@ SPEC = SystemSpec(
     sim_time_per_frame=0.05,     # tau_LJ per frame (10 steps at 0.005)
     bond_overlay=False,
     render_3d=True,
+    extra_sliders=(
+        SliderSpec("k_tilt", K_TILT_MIN, K_TILT_MAX, K_TILT, fmt="{:.1f}", key="k_tilt"),
+        SliderSpec("k_splay", K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY, fmt="{:.2f}", key="k_splay"),
+        SliderSpec("eta (interaction range)", ZETA_MIN, ZETA_MAX, ZETA, fmt="{:.1f}", key="eta"),
+    ),
 )
 
 # Camera for the three-quarter view: looking at the patch from below in y and
@@ -173,6 +194,11 @@ class MesoMemHexSystem(MDSystem):
         self._puller_damping = PULLER_DAMPING_DEFAULT
         self._interactive_t = 0.0
         self._seed = random.randint(1, 900_000_000)
+        # Live-tunable MesoMem coefficients (start at the paper's standard values;
+        # the k_tilt / k_splay / eta sliders drive these via set_extra_param).
+        self._ktilt = K_TILT
+        self._ksplay = K_SPLAY
+        self._zeta = ZETA
 
         # id 1 = central puller; ids 2..7 = hexagonal ring.
         self.center_id = 1
@@ -182,6 +208,12 @@ class MesoMemHexSystem(MDSystem):
         # 6 spokes + the 6-segment ring.
         self._bond_index_pairs = [(0, k) for k in range(1, 7)]
         self._bond_index_pairs += [(k, k % 6 + 1) for k in range(1, 7)]
+
+        # In-plane g(r) of the patch (non-periodic, only 7 beads, so it resolves
+        # just the first couple of neighbour shells -- the spoke/ring spacing at
+        # ~a and the second-shell distances) rather than a bulk phase, but it
+        # populates the RDF panel instead of leaving it stuck on "warming up".
+        self._rdf = InPlaneRDF(3.0 * A_LATTICE, nbins=48, box=None, sample_every=1)
 
         self._build()
 
@@ -216,7 +248,7 @@ class MesoMemHexSystem(MDSystem):
 
         c(f"pair_style mesomem {RC}")
         # sigma eps ktilt ksplay cut weight_rcut zeta c0
-        c(f"pair_coeff 1 1 {SIGMA} {EPS} {K_TILT} {K_SPLAY} {RC} {WC} {ZETA} {C0}")
+        self._apply_pair_coeff()
 
         c("neighbor 1.0 bin")
         c("neigh_modify every 1 delay 0 check yes")
@@ -281,8 +313,14 @@ class MesoMemHexSystem(MDSystem):
         if T == self._target_temp:
             return
         self._target_temp = T
+        # Thermostat the RING only, never `all` -- redefining this fix on `all`
+        # (an earlier bug) folds the central puller bead into the Langevin bath,
+        # so once the temperature slider was touched the bead's director picked up
+        # thermal rotational noise that never went away (the torque arrow then
+        # jiggled wildly even back at T=0.001, and get_interaction_force's
+        # force-recovery silently broke). The bead must stay noise-free.
         self.lmp.command(
-            f"fix bath all langevin {T} {T} {LANGEVIN_DAMP} {self._seed} omega yes"
+            f"fix bath ring langevin {T} {T} {LANGEVIN_DAMP} {self._seed} omega yes"
         )
 
     def steer_orientation(self, rate, dt):
@@ -297,6 +335,24 @@ class MesoMemHexSystem(MDSystem):
             return
         self._puller_damping = gamma
         self.lmp.command(f"fix damp center viscous {gamma}")
+
+    def _apply_pair_coeff(self):
+        """(Re)issue the mesomem pair_coeff from the current live coefficients.
+        LAMMPS overwrites the stored per-type coefficients in place and re-inits
+        the pair style on the next run, so this is safe to call between steps."""
+        self.lmp.command(
+            f"pair_coeff 1 1 {SIGMA} {EPS} {self._ktilt} {self._ksplay} "
+            f"{RC} {WC} {self._zeta} {C0}"
+        )
+
+    def set_extra_param(self, key, value):
+        """Live k_tilt / k_splay / eta(zeta) dials. Re-issues pair_coeff only when
+        a value actually changes so it's a cheap no-op most frames."""
+        attr = {"k_tilt": "_ktilt", "k_splay": "_ksplay", "eta": "_zeta"}.get(key)
+        if attr is None or getattr(self, attr) == value:
+            return
+        setattr(self, attr, value)
+        self._apply_pair_coeff()
 
     # Keep the puller on the control plane, inside the visible net, and below a
     # runaway speed. Without this a sustained max pull would accelerate the
@@ -466,7 +522,7 @@ class MesoMemHexSystem(MDSystem):
                 u_iso += EPS * (t2 * t2 - 2.0 * t2)
             else:
                 g = math.pi * 0.5 * (r - SIGMA) / (RC - SIGMA)
-                u_iso += -EPS * math.cos(g) ** (2.0 * ZETA)
+                u_iso += -EPS * math.cos(g) ** (2.0 * self._zeta)
             # Orientational weight w(r), nonzero only within wc.
             w = 0.0
             if r < WC:
@@ -480,8 +536,8 @@ class MesoMemHexSystem(MDSystem):
                 nir = float(ni @ rhat)
                 njr = float(nj @ rhat)
                 ninj = float(ni @ nj)
-                u_tilt += 0.5 * K_TILT * (nir * nir + njr * njr) * w
-                u_splay += 0.5 * K_SPLAY * (ninj - 1.0) ** 2 * w
+                u_tilt += 0.5 * self._ktilt * (nir * nir + njr * njr) * w
+                u_splay += 0.5 * self._ksplay * (ninj - 1.0) ** 2 * w
         terms = [
             ("isotropic  (repel + attract)", u_iso),
             ("tilt  (directors normal to bonds)", u_tilt),
@@ -506,6 +562,29 @@ class MesoMemHexSystem(MDSystem):
         pair_fz = f[ic][2] - self._input_fz + g * v[ic][2]
         return np.array([pair_fx, pair_fz])
 
+    def get_torque_signals(self):
+        """(applied, reaction) torques about the control-plane normal (world y),
+        normalized to [-1, 1] for the circular torque arrows.
+
+          - applied  : the user's yaw steering torque. `self._yaw` is already the
+            per-frame angular kick about y in [-1, 1], so it IS the fraction.
+          - reaction : the membrane's restoring torque on the pulled bead about y,
+            read straight from the pair-style's per-atom torque (the y component
+            is the part that rotates the director within the control plane -- the
+            projection onto the net we draw), scaled to the display max.
+
+        Positive = the +y sense, which tips the director toward +x (screen-right)
+        -- the same handedness a positive yaw command produces."""
+        ic, n = self._center_local()
+        if ic is None:
+            return None
+        applied = max(-1.0, min(1.0, self._yaw))
+        tau = self.lmp.numpy.extract_atom("torque")
+        reaction = 0.0
+        if tau is not None:
+            reaction = max(-1.0, min(1.0, float(tau[:n][ic][1]) / REACTION_TORQUE_DISPLAY_MAX))
+        return applied, reaction
+
     def get_thermo_state(self):
         temp = self.lmp.extract_compute("ring_temp", 0, 0)
         press = self.lmp.get_thermo("press")
@@ -518,7 +597,10 @@ class MesoMemHexSystem(MDSystem):
         return self._interactive_t
 
     def get_rdf(self):
-        return None   # 7 beads: no meaningful radial distribution
+        idx, _ = self._id_index()
+        x = self.lmp.numpy.extract_atom("x")
+        self._rdf.add(np.array([[x[idx[i]][0], x[idx[i]][1]] for i in self.all_ids]))
+        return self._rdf.get()
 
     def get_all_positions(self):
         """2D (membrane-plane) fallback required by the interface. The 3D
@@ -570,6 +652,22 @@ class MesoMemHexSystem(MDSystem):
             v_range=(-2.0, 2.0),
             step=0.5,
         )
+
+    def get_scene_fit_points(self):
+        """Corners of the control-plane net (plus a little vertical headroom for
+        the puller/director spikes) as the world extent the camera should frame,
+        so the patch fills the sim viewport at any window size / aspect ratio."""
+        g = self.get_control_grid()
+        origin = np.asarray(g["origin"], dtype=float)
+        u = np.asarray(g["u_axis"], dtype=float)
+        v = np.asarray(g["v_axis"], dtype=float)
+        (u0, u1), (v0, v1) = g["u_range"], g["v_range"]
+        pts = [origin + uu * u + vv * v for uu in (u0, u1) for vv in (v0, v1)]
+        # Headroom above/below for the puller bead and its director spike, which
+        # can rise a little past the net's top edge.
+        pts.append(origin + (v1 + 0.6) * v)
+        pts.append(origin + (v0 - 0.2) * v)
+        return np.array(pts)
 
     def get_box_size(self):
         return BOX, BOX

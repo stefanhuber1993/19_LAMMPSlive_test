@@ -5,6 +5,9 @@ and rebuilds the UI state (renderer scale, sliders, history, smoothers) for
 the new one, in place.
 """
 import math
+import os
+import sys
+from time import perf_counter
 
 import pygame
 
@@ -13,7 +16,10 @@ from .forcefeedback import (
     ExponentialSmoother2D, shape_damper_coefficient, shape_interaction_force,
     shape_stiffness, shape_velocity_damping,
 )
-from .input import CP_OFFSET_MAX, DAMPER_COEFFICIENT_MAX, JoystickInput, MouseInput, SPRING_STIFFNESS_MAX
+from .input import (
+    CP_OFFSET_MAX, DAMPER_COEFFICIENT_MAX, JoystickInput, KeyboardInput,
+    MouseInput, SPRING_STIFFNESS_MAX,
+)
 from .systems import get_system_class, list_systems
 from .ui import AtomTrails, Renderer, RollingHistory, Slider
 from .ui.camera import Camera3D
@@ -22,8 +28,15 @@ STEPS_PER_FRAME_CAP = 200  # sanity cap if a system's timestep is set absurdly s
 
 
 class App:
-    def __init__(self, input_mode, initial_system_key):
+    def __init__(self, input_mode, initial_system_key, fullscreen=False, debug=False):
         self.input_mode = input_mode
+        self.debug = debug
+        # Exponential moving averages (ms) of the per-frame timing breakdown, and
+        # the header line built from them -- shown only under --debug. The line is
+        # built from the PREVIOUS frame (a frame's own render time isn't known
+        # until after it's drawn), which is fine for a running average.
+        self._prof_ms = {"sim": 0.0, "render": 0.0, "other": 0.0}
+        self._debug_line = None
         self.systems = list_systems()  # [(key, SystemSpec), ...], stable order for the picker/number keys
 
         # Not pygame.init() -- that also brings up SDL's joystick subsystem,
@@ -33,33 +46,92 @@ class App:
         # pygame's event-translation state (observed as `KeyError: 0` inside
         # pygame.event.get()). We drive the joystick ourselves via raw HID
         # reports, so SDL's joystick subsystem is never needed.
+
+        # macOS: keep the green (zoom) button OUT of a native fullscreen "Space".
+        # A Space is animated and, with our OpenGL context, not cleanly
+        # reversible -- returning from it either leaves the GL drawable stale (a
+        # black window) or, if we re-set_mode mid-transition, traps the window in
+        # the Space. Disabling Spaces (before the first video init, when SDL reads
+        # the hint) makes the green button a plain, reversible window zoom; F11
+        # still gives a real fullscreen we control. Must precede display.init().
+        if sys.platform == "darwin":
+            os.environ.setdefault("SDL_VIDEO_MAC_FULLSCREEN_SPACES", "0")
         pygame.display.init()
         pygame.font.init()
 
-        self.renderer = Renderer(config.WINDOW_SIZE)
+        self.renderer = Renderer(config.WINDOW_SIZE, fullscreen=fullscreen)
         self.clock = pygame.time.Clock()
 
-        if input_mode == "mouse":
-            max_radius_px = min(self.renderer.sim_width, config.WINDOW_SIZE[1]) * 0.35
-            self.source = MouseInput(self.renderer.sim_center_px(), max_radius_px)
-        else:
-            self.source = JoystickInput()
+        self.source = self._make_source()
 
         self.ff_smoother = ExponentialSmoother2D(config.FF_SMOOTHING_TAU)
         self.interaction_smoother = ExponentialSmoother2D(config.FF_SMOOTHING_TAU)
 
         self.temp_slider = None
         self.damping_slider = None
+        self.extra_sliders = []
+        self.extra_slider_keys = []
         self.history = None
         self.atom_trails = None
         self._trail_frame_counter = 0
         self.energy_baseline = None
         self.sim_wall_time = 0.0
         self.steps_per_frame = 1
+        self.total_steps = 0
 
         self.system_key = None
         self.system = None
         self._build_system(initial_system_key)
+
+    def _make_source(self):
+        """Build the input source for the current mode and window geometry. Only
+        MouseInput depends on the window geometry, so it's the only one rebuilt on
+        a fullscreen toggle; the keyboard is geometry-free and the joystick is
+        screen-independent (its hardware handle is kept)."""
+        if self.input_mode == "mouse":
+            h = self.renderer.window_size[1]
+            max_radius_px = min(self.renderer.sim_width, h) * 0.35
+            sim_rect = (0, 0, self.renderer.sim_width, h)
+            return MouseInput(self.renderer.sim_center_px(), max_radius_px, sim_rect)
+        if self.input_mode == "keyboard":
+            return KeyboardInput()
+        return JoystickInput()
+
+    def _setup_viewport(self):
+        """(Re)establish everything tied to the sim viewport size: the box<->
+        screen mapping and, for 3D systems, the perspective camera. Called when
+        the system changes and after a fullscreen toggle."""
+        spec = self.system.spec
+        self.renderer.set_box_size(self.system.get_box_size())
+        if spec.render_3d:
+            cam = self.system.get_camera_params()
+            self.camera3d = Camera3D(
+                cam["eye"], cam["target"], cam["up"], cam["fov_deg"],
+                self.renderer.sim_width, self.renderer.window_size[1],
+            )
+            # Zoom to fit the scene to the (possibly fullscreen, any-aspect) sim
+            # viewport instead of the fixed vertical FOV, so the beads fill the
+            # available width/height rather than leaving big side margins.
+            fit_pts = self.system.get_scene_fit_points()
+            if fit_pts is not None:
+                self.camera3d.fit_to_points(fit_pts)
+        else:
+            self.camera3d = None
+
+    def _toggle_fullscreen(self):
+        self.renderer.toggle_fullscreen()
+        self._after_resize()
+
+    def _exit_fullscreen(self):
+        self.renderer.set_windowed()
+        self._after_resize()
+
+    def _after_resize(self):
+        """Re-establish everything tied to the window size after the display
+        surface changed (fullscreen toggle or an OS window resize)."""
+        self._setup_viewport()
+        if self.input_mode == "mouse":
+            self.source = self._make_source()
 
     def _build_system(self, key):
         """(Re)build the active system and everything downstream of its
@@ -73,19 +145,8 @@ class App:
         self.system_key = key
         spec = self.system.spec
 
-        self.renderer.set_box_size(self.system.get_box_size())
-
-        # 3D systems (e.g. the MesoMem membrane patch) render through a
-        # perspective camera instead of the top-down 2D box. Build it here from
-        # the system's requested view and the sim viewport.
-        if spec.render_3d:
-            cam = self.system.get_camera_params()
-            self.camera3d = Camera3D(
-                cam["eye"], cam["target"], cam["up"], cam["fov_deg"],
-                self.renderer.sim_width, config.WINDOW_SIZE[1],
-            )
-        else:
-            self.camera3d = None
+        # Box<->screen mapping and (for 3D systems) the perspective camera.
+        self._setup_viewport()
 
         if self.temp_slider is None:
             self.temp_slider = Slider.from_spec((0, 0, 100, 4), spec.temperature)
@@ -93,6 +154,14 @@ class App:
         else:
             self.temp_slider.reset(spec.temperature)
             self.damping_slider.reset(spec.damping)
+
+        # Extra live-tunable parameters (per-system, variable count -- e.g. the
+        # MesoMem k_tilt / k_splay / eta dials), rebuilt from scratch since the
+        # count and identities differ between systems. Each remembers the
+        # SliderSpec key so set_extra_param knows which parameter it drives.
+        self.extra_sliders = [Slider.from_spec((0, 0, 100, 4), ss)
+                              for ss in spec.extra_sliders]
+        self.extra_slider_keys = [ss.key for ss in spec.extra_sliders]
 
         if self.history is None:
             self.history = RollingHistory(config.HISTORY_WINDOW_SECONDS, ["temp", "press", "ke", "pe", "etotal"])
@@ -105,6 +174,7 @@ class App:
         self._trail_frame_counter = 0
         self.energy_baseline = None
         self.sim_wall_time = 0.0
+        self.total_steps = 0
 
         self.ff_smoother.reset()
         self.interaction_smoother.reset()
@@ -135,19 +205,33 @@ class App:
                 return False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    return False
+                    # Escape leaves fullscreen (ours or a macOS-native space)
+                    # first; only quits when already windowed.
+                    if self.renderer.is_fullscreen():
+                        self._exit_fullscreen()
+                    else:
+                        return False
+                elif event.key == pygame.K_F11:
+                    self._toggle_fullscreen()
                 elif event.key == pygame.K_TAB:
                     self._cycle_system(1)
                 elif pygame.K_1 <= event.key <= pygame.K_9:
                     idx = event.key - pygame.K_1
                     if idx < len(self.systems):
                         self._build_system(self.systems[idx][0])
+            elif event.type == pygame.VIDEORESIZE:
+                # Window dragged to a new size, or the macOS green button sending
+                # it into / out of a native fullscreen space -- relayout to fit.
+                self.renderer.handle_resize(event.size)
+                self._after_resize()
             elif event.type == pygame.MOUSEWHEEL:
                 step = self.temp_slider.vmax - self.temp_slider.vmin
                 self.temp_slider.nudge(event.y * config.TEMP_WHEEL_STEP_FRACTION * step)
             else:
                 self.temp_slider.handle_event(event)
                 self.damping_slider.handle_event(event)
+                for s in self.extra_sliders:
+                    s.handle_event(event)
 
         keys = pygame.key.get_pressed()
         temp_range = self.temp_slider.vmax - self.temp_slider.vmin
@@ -159,17 +243,21 @@ class App:
         return True
 
     def _tick(self, dt):
+        t_frame_start = perf_counter()
         spec = self.system.spec
         ff_profile = spec.force_feedback
 
         self.system.set_target_temp(self.temp_slider.value)
         self.system.set_puller_damping(self.damping_slider.value)
+        for key, s in zip(self.extra_slider_keys, self.extra_sliders):
+            self.system.set_extra_param(key, s.value)
 
         # While actively dragging a slider (which lives in the right-hand
         # panel, off to the side of the sim box), don't also feed that mouse
         # position to the puller as a deflection -- zero the input force
         # instead of letting a slider drag yank the atom.
-        ui_capturing_mouse = self.temp_slider.dragging or self.damping_slider.dragging
+        ui_capturing_mouse = (self.temp_slider.dragging or self.damping_slider.dragging
+                              or any(s.dragging for s in self.extra_sliders))
         if self.input_mode == "mouse" and ui_capturing_mouse:
             jx, jy = 0.0, 0.0
             yaw = 0.0
@@ -198,7 +286,10 @@ class App:
         # atom, used by the lipid system to rotate the control lipid's director.
         self.system.steer_orientation(yaw, dt)
 
+        t_sim_start = perf_counter()
         self.system.step(self.steps_per_frame)
+        sim_seconds = perf_counter() - t_sim_start
+        self.total_steps += self.steps_per_frame
 
         pos, vel = self.system.get_puller_state()
         interaction_force = self.system.get_interaction_force()
@@ -258,20 +349,47 @@ class App:
                 "camera": self.camera3d,
                 "control_grid": self.system.get_control_grid(),
                 "potential_terms": self.system.get_potential_terms(),
+                "torque_signals": self.system.get_torque_signals(),
+                "brightness": self.system.get_bead_brightness(),
             }
 
+        t_render_start = perf_counter()
         self.renderer.draw(
             positions, is_puller, pos,
             (input_fx, input_fy), interaction_force, self.clock.get_fps(),
             spec, self.systems, self.system_key,
-            (self.temp_slider, self.damping_slider),
+            (self.temp_slider, self.damping_slider, *self.extra_sliders),
             (temp, press, ke, pe, etotal), (puller_ke, puller_pe),
             self.history, rdf, heat_fraction=heat_fraction,
             sim_time_ps=sim_time_ps, puller_speed_m_s=puller_speed_m_s,
             atom_trails=self.atom_trails, species=species, bond_pairs=bond_pairs,
             hbond_pairs=hbond_pairs, hud_lines=hud_lines, scene_3d=scene_3d,
+            total_steps=self.total_steps, steps_per_frame=self.steps_per_frame,
+            debug_line=self._debug_line,
         )
+        if self.debug:
+            render_seconds = perf_counter() - t_render_start
+            self._update_debug(perf_counter() - t_frame_start, sim_seconds, render_seconds)
 
         new_dt = self.clock.tick(60) / 1000.0
         self.sim_wall_time += new_dt
         return new_dt
+
+    def _update_debug(self, work_seconds, sim_seconds, render_seconds):
+        """Fold this frame's timings into the smoothed breakdown and rebuild the
+        header line for the next frame. 'work' is everything the app does per
+        frame except the fps-cap sleep; 'other' is the remainder after sim and
+        render -- input polling, force shaping, and the per-frame readouts
+        (positions, RDF, potential terms)."""
+        other_seconds = max(0.0, work_seconds - sim_seconds - render_seconds)
+        alpha = 0.1   # EMA weight -- steady enough to read, quick enough to track
+        for name, secs in (("sim", sim_seconds), ("render", render_seconds), ("other", other_seconds)):
+            self._prof_ms[name] += alpha * (secs * 1000.0 - self._prof_ms[name])
+        total = sum(self._prof_ms.values()) or 1e-9
+        def part(name):
+            ms = self._prof_ms[name]
+            return f"{name} {100.0 * ms / total:2.0f}% ({ms:4.1f}ms)"
+        self._debug_line = (
+            f"DEBUG  {part('sim')}   {part('render')}   {part('other')}   "
+            f"frame {total:4.1f}ms"
+        )

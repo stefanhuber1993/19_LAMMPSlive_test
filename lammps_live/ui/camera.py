@@ -34,9 +34,35 @@ class Camera3D:
         self.right = _normalize(np.cross(self.forward, np.asarray(up, dtype=float)))
         self.true_up = np.cross(self.right, self.forward)
 
-        # Focal length in pixels from the vertical field of view: a point one
-        # focal length ahead spans the half-viewport at the frame edge.
+        # Focal length in pixels. Default from the vertical field of view (a
+        # point one focal length ahead spans the half-viewport at the frame
+        # edge); fit_to_points overrides it to frame a given content extent.
         self.focal = (viewport_h / 2.0) / np.tan(np.radians(fov_deg) / 2.0)
+
+    def fit_to_points(self, pts, fill_w=0.92, fill_h=0.92):
+        """Set the focal length so the given world points just fit the viewport,
+        filling `fill_*` of each half-axis and choosing the tighter (fully-
+        visible) fit. Unlike the fixed vertical-FOV default -- which frames only
+        by height and so wastes horizontal space on a wide (fullscreen) viewport
+        -- this fills whichever dimension binds, so the scene uses the available
+        area at any aspect ratio. The view direction is unchanged; only zoom
+        adapts. Points are framed about the principal point (the target should be
+        roughly centered, as it is for the symmetric control plane)."""
+        pts = np.atleast_2d(np.asarray(pts, dtype=float))
+        rel = pts - self.eye
+        cz = rel @ self.forward
+        valid = cz > 1e-6
+        if not np.any(valid):
+            return
+        # tan of the horizontal / vertical angle of each point off the view axis.
+        ax = np.abs((rel @ self.right)[valid] / cz[valid])
+        ay = np.abs((rel @ self.true_up)[valid] / cz[valid])
+        ax_max, ay_max = float(ax.max()), float(ay.max())
+        focal_w = (self.viewport_w / 2.0 * fill_w) / ax_max if ax_max > 1e-9 else np.inf
+        focal_h = (self.viewport_h / 2.0 * fill_h) / ay_max if ay_max > 1e-9 else np.inf
+        focal = min(focal_w, focal_h)
+        if np.isfinite(focal) and focal > 0:
+            self.focal = focal
 
     def project(self, pts):
         """Project world points (N,3) -> (screen (N,2) float, depth (N,),

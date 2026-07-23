@@ -5,7 +5,8 @@ crystal or fluid. Multiple systems (materials/potentials) are registered in
 lammps_live.systems and can be switched between at runtime (1-9 or Tab) or
 picked up front with --system.
 
-    lammps-live --input mouse            # no hardware needed
+    lammps-live --input mouse            # pointer: position moves, L/R buttons rotate
+    lammps-live --input keyboard         # WASD moves, Q/E rotate
     lammps-live --input joystick         # Sidewinder FF2 (via hidapi -- no sudo needed)
     lammps-live --list-systems
 
@@ -20,10 +21,17 @@ from .systems import list_systems
 def build_parser():
     parser = argparse.ArgumentParser(prog="lammps-live", description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input", choices=["mouse", "joystick"], default="mouse",
-                         help="control source for the puller atom (default: mouse)")
+    parser.add_argument("--input", choices=["mouse", "keyboard", "joystick"], default="mouse",
+                         help="control source for the puller atom: mouse (pointer "
+                              "position + L/R buttons), keyboard (WASD + Q/E), or "
+                              "joystick (default: mouse)")
     parser.add_argument("--system", default=None,
                          help="system to start with (default: first registered; see --list-systems)")
+    parser.add_argument("--fullscreen", action="store_true",
+                         help="start in fullscreen (toggle any time with F11)")
+    parser.add_argument("--debug", action="store_true",
+                         help="show a per-frame timing breakdown (simulation vs. "
+                              "rendering vs. other) in the GUI header")
     parser.add_argument("--list-systems", action="store_true",
                          help="print available systems and exit")
     parser.add_argument("--calibrate", action="store_true",
@@ -56,7 +64,8 @@ def main(argv=None):
         parser.error(f"unknown --system {initial_key!r}. Available: {available}")
 
     from .app import App
-    app = App(input_mode=args.input, initial_system_key=initial_key)
+    app = App(input_mode=args.input, initial_system_key=initial_key,
+              fullscreen=args.fullscreen, debug=args.debug)
     app.run()
     return 0
 

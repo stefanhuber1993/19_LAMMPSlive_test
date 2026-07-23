@@ -9,6 +9,7 @@ from .lipid_membrane import LipidMembraneSystem
 from .lj_argon import LJArgonSystem
 from .mb_water import MBWaterSystem
 from .mesomem_hex import MesoMemHexSystem
+from .mesomem_sheet import MesoMemSheetSystem
 from .nacl import NaClSystem
 
 REGISTRY = {
@@ -19,6 +20,7 @@ REGISTRY = {
     LipidMembraneSystem.spec.key: LipidMembraneSystem,
     MBWaterSystem.spec.key: MBWaterSystem,
     MesoMemHexSystem.spec.key: MesoMemHexSystem,
+    MesoMemSheetSystem.spec.key: MesoMemSheetSystem,
 }
 
 

@@ -40,7 +40,8 @@ switchable *while the demo is running* -- press `1`/`2`/... or `Tab`:
 | `carbon_etch` | Covalent carbon etch (O bombardment) | reactive bond-order carbon (`rebo`, CH.rebo) + strong Morse C-O overlay | a 2D covalent carbon sheet (graphene, the honest 2D "diamond"): open 3-fold honeycomb, very high melting mark. Drive a reactive **oxygen** (the puller) in, snap directional covalent bonds (they tear visibly, leaving glowing dangling-bond sites) and etch carbons off as **CO** -- a live CO / broken-bond tally, with etch pits that persist and a fresh O sent in each time |
 | `lipid` | Lipid membrane (coarse-grained) | soft repulsion + cosine-squared tail attraction (`cosine/squared`), harmonic bonds/angles, Langevin implicit solvent | a solvent-free 2D lipid bilayer of 3-bead amphiphiles (head + 2 tails); the puller is a lipid you also **orient** (joystick yaw / Q-E) to insert into the membrane. Inspired by the MesoMem model (Sillano, Marrink & Idema 2026); see the module docstring |
 | `mb_water` | Mercedes-Benz water (ice floats) | rigid 3-arm molecules (`fix rigid/small` + Langevin), directional hydrogen bond via `cosine/squared` arm-tip well | the 2D Mercedes-Benz water model (Ben-Naim 1971): each molecule is an O with three 120-degree hydrogen-bonding arms. Starts as the open hydrogen-bonded honeycomb **ice**; heat it and the network **collapses to denser liquid** -- water's freezing-expansion anomaly (why ice floats), with a live O-O spacing / density readout. The puller is a water molecule you also **orient** (joystick yaw / Q-E) to line its arms up and catch hydrogen bonds |
-| `mesomem` | MesoMem membrane patch (**3D**) | the **real** MesoMem pair-style (`mesomem`, Sillano, Marrink & Idema 2026): 4-2 soft core + cosine-squared attraction + orientation-dependent **tilt** and **splay** terms on oriented (dipole) beads | a 3D, perspective-rendered 7-bead membrane patch (hexagon + center). Each bead is a bilayer patch carrying a director (the yellow spike). Pull the **center bead** out of the sheet along the on-screen **net** (a plane perpendicular to the membrane) and feel tilt/splay resist through force feedback. Unlike `lipid` (which mimics MesoMem with stock styles), this loads the authors' actual C++ pair-style as a runtime LAMMPS plugin -- see below |
+| `mesomem` | MesoMem membrane patch (**3D**) | the **real** MesoMem pair-style (`mesomem`, Sillano, Marrink & Idema 2026): 4-2 soft core + cosine-squared attraction + orientation-dependent **tilt** and **splay** terms on oriented (dipole) beads | a 3D, perspective-rendered 7-bead membrane patch (hexagon + center). Each bead is a bilayer patch carrying a director (the yellow spike + the white-capped pole). Pull the **center bead** out of the sheet along the on-screen **net** (a plane perpendicular to the membrane) and feel tilt/splay resist through force feedback. Unlike `lipid` (which mimics MesoMem with stock styles), this loads the authors' actual C++ pair-style as a runtime LAMMPS plugin -- see below |
+| `membrane` | MesoMem membrane sheet (**3D**) | same **real** MesoMem pair-style as `mesomem` | the paper's planar-stability test at scale: a ~900-bead hexagonal sheet, periodic in-plane and barostat-relaxed to a tension-free spacing, then frozen for interactive pulling. Pull one bead out and watch tilt/splay propagate across the membrane. A brightened front-left bead + its six neighbours tag a cluster you can follow as it diffuses; beads crossfade smoothly across the periodic seam |
 
 Run `lammps-live --list-systems` to print this from the code. See
 "Adding a new system" below to add your own.
@@ -63,16 +64,35 @@ file changes). It needs, on this machine:
   auto-detection (via `mpicxx`/Homebrew) misses it.
 
 The three general problems this system solves -- **compiling a custom LAMMPS
-force field into a stock build, rendering 3D smoothly in pygame (perspective +
-depth-cued haze + shaded spheres), and driving a 3D scene with a 2-axis stick**
--- are all reusable for the richer MesoMem systems to come.
+force field into a stock build, rendering 3D fast (GPU sphere impostors with
+per-pixel intersections, Blinn-Phong + ambient occlusion, depth-cued haze), and
+driving a 3D scene with a 2-axis stick** -- are all reusable for the richer
+MesoMem systems to come.
+
+**3D rendering (OpenGL).** The 3D bead systems (`mesomem`, `membrane`) are drawn
+on the GPU via `moderngl`: each bead is an instanced sphere impostor ray-cast in
+the fragment shader (so overlapping beads intersect exactly, per-pixel, with no
+sorting artifacts), lit with Blinn-Phong, darkened in the crevices by SSAO, and
+the control-plane net is occluded by the real depth buffer. This needs an OpenGL
+**3.3+ core** context (macOS 4.1 core, or Linux via EGL/GLX); the window is a GL
+context and the pygame instrumentation panel is composited over the scene as a
+texture. If no GL context can be created, the app automatically falls back to the
+original CPU (numpy sphere-sprite) renderer for the whole session.
+
+Each bead is colored the MesoMem way -- a yellow hydrophobic equator between blue
+hydrophilic poles, tilting with the director -- with the `+`director pole capped
+**white** so its sense reads at a glance. Depth is cued by fading the far half of
+the scene toward the background.
 
 **Controls.** The two joystick (or mouse) axes slide the center bead in the
 world *xz*-plane -- a plane perpendicular to the membrane and facing the camera,
 drawn as the faint net. Axis x -> along the sheet; axis y -> out of the sheet.
 Pulling out tents the patch; the directors tilt and splay to follow, and the red
-arrow / force feedback report the membrane's restoring force. Units are the
-paper's LJ-reduced units (so the temperature dial reads `T*`, not Kelvin).
+arrow / force feedback report the membrane's restoring force. Both MesoMem
+systems add three live sliders -- **k_tilt**, **k_splay**, and **eta**
+(interaction range) -- to the panel, so you can retune the force field and watch
+the membrane stiffen, soften, or change cohesion range in real time. Units are
+the paper's LJ-reduced units (so the temperature dial reads `T*`, not Kelvin).
 
 ## Setup
 
@@ -165,7 +185,8 @@ before trying `--input joystick`.
 ## Run
 
 ```bash
-lammps-live --input mouse                        # no hardware needed - puller follows mouse
+lammps-live --input mouse                        # pointer: position moves, L/R buttons rotate
+lammps-live --input keyboard                       # WASD moves, Q/E rotate (no pointer)
 lammps-live --input joystick                      # Sidewinder FF2
 lammps-live --input mouse --system lj_argon        # start on a specific system
 lammps-live --list-systems                          # print available systems and exit
@@ -174,13 +195,18 @@ lammps-live --list-systems                          # print available systems an
 **Controls:**
 - `1`-`9` -- jump directly to a system; `Tab` -- cycle to the next one
   (rebuilds the simulation; takes a moment)
-- Move the puller with the mouse / joystick, as usual
-- **Orientation** (`lipid` and `mb_water` systems): the joystick's **yaw
-  (twist) axis** -- or the **`Q`/`E`** keys in mouse mode -- rotate the control
-  molecule's in-plane angle, so you can turn a lipid head-out to insert it into
-  the bilayer, or line a water molecule's arms up to catch hydrogen bonds
+- Move the puller: **mouse position** (`--input mouse`), **WASD** (`--input
+  keyboard`), or the **joystick** (`--input joystick`). The three input modes are
+  separate -- mouse mode does not read WASD, keyboard mode does not read the
+  pointer
+- **Orientation** (`lipid` and `mb_water` systems): rotate the control molecule's
+  in-plane angle with the joystick's **yaw (twist) axis**, the **`Q`/`E`** keys
+  (keyboard mode), or the **left/right mouse buttons** (mouse mode) -- so you can
+  turn a lipid head-out to insert it into the bilayer, or line a water molecule's
+  arms up to catch hydrogen bonds
 - Mouse-drag the **Temperature** / **Puller damping** sliders in the
-  right-hand panel (works regardless of `--input` mode)
+  right-hand panel (works regardless of `--input` mode); the 3D MesoMem systems
+  add **k_tilt** / **k_splay** / **eta** force-field sliders below them
 - `Up`/`Down` arrow keys or the mouse scroll wheel -- nudge Temperature
 - `Esc` or closing the window -- quit
 
@@ -222,21 +248,29 @@ lammps_live/
     diamond_etch.py   covalent carbon (REBO) + reactive-O etch system
     lipid_membrane.py coarse-grained lipid bilayer system
     mb_water.py       2D Mercedes-Benz water (rigid 3-arm, hydrogen bonds) system
+    mesomem_hex.py    3D MesoMem 7-bead membrane patch (real pair-style)
+    mesomem_sheet.py  3D MesoMem ~900-bead periodic membrane sheet
+    rdf2d.py          in-plane radial distribution function (shared by the 3D systems)
+    mesomem_ff/       vendored MesoMem C++ pair-style + the runtime plugin builder
     data/             bundled potential files (Cu_u3.eam; CH.rebo ships with LAMMPS)
   input/
     base.py     InputSource interface
     mouse.py    mouse control
+    keyboard.py WASD/QE keyboard control
     joystick.py Sidewinder FF2 wrapper -- maps the device onto the sim's
                 conventions and shapes the force feedback. The HID PID
                 driver itself is the external `sidewinder` package
                 (https://github.com/stefanhuber1993/sidewinder), a
                 dependency rather than a vendored copy.
   ui/
-    theme.py    colors/sizes
-    widgets.py  Slider
-    plotting.py RollingHistory + generic line-plot drawer
-    trail.py    rolling per-atom position snapshots behind every atom's fading motion trail
-    renderer.py the sim box + instrumentation panel
+    theme.py        colors/sizes
+    widgets.py      Slider
+    plotting.py     RollingHistory + generic line-plot drawer
+    trail.py        rolling per-atom position snapshots behind every atom's fading motion trail
+    camera.py       perspective camera for the 3D scenes
+    gl3d.py         GPU bead pipeline (sphere impostors + SSAO + fog)
+    glcompositor.py composites the 2D panel over the GL scene
+    renderer.py     the sim box + instrumentation panel (2D and 3D paths)
 ```
 
 ## Adding a new system
@@ -281,8 +315,10 @@ existing systems.
   1 ps = 1e-12 s) -- both units are shown side by side. Typical values land
   in the hundreds of m/s, the same range as real atomic thermal speeds at
   room temperature; that's not a coincidence, it's the same physics.
-- Both bundled systems are 2D (a one-atom-thick cross-section), which
-  changes some physics from the 3D case you might expect:
+- The non-membrane systems are 2D (a one-atom-thick cross-section); the two
+  MesoMem membrane systems (`mesomem`, `membrane`) are genuinely 3D and run in
+  the paper's reduced LJ units rather than metal units. The 2D systems change
+  some physics from the 3D case you might expect:
   - The equilibrium lattice is a 2D close-packed **hexagonal/triangular**
     lattice (6 in-plane neighbors), not a square cross-section of a 3D FCC
     lattice -- there's no out-of-plane bonding to brace a square

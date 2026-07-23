@@ -1,6 +1,9 @@
 pygame
 lammps
 numpy
+# GPU rendering of the 3D bead systems (needs OpenGL 3.3+; auto-falls back to the
+# CPU renderer if unavailable).
+moderngl>=5.8
 # Sidewinder FF2 joystick driver -- lives in its own repo, not vendored here.
 # Brings `hid` with it; the native hidapi library comes from your OS package
 # manager (see README.md's Joystick setup section).

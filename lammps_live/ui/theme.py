@@ -85,13 +85,27 @@ VECTOR_MAX_PX = 130.0
 ARROWHEAD_LEN = 8
 ARROWHEAD_ANGLE = math.radians(25)
 
+# Circular "torque" arrows drawn around the puller bead: an arc starting at the
+# top of a ring and sweeping up to a semicircle left/right in proportion to the
+# applied (green) / reaction (red) torque about the control-plane normal. Radius
+# is a fraction of the puller's on-screen radius; the two arcs use slightly
+# different radii so they don't overdraw each other.
+TORQUE_ARC_APPLIED_RADIUS = 0.62  # x puller radius (green, user's steering torque)
+TORQUE_ARC_REACTION_RADIUS = 0.82  # x puller radius (red, membrane's restoring torque)
+TORQUE_ARC_WIDTH = 3
+TORQUE_ARC_HEAD_LEN = 9
+
 # --- 3D scene (MesoMem membrane patch and future 3D systems) ---------------
 # Depth cueing ("haze"): distant beads are blended toward this color so the
 # scene recedes into the background instead of reading as a flat cluster. Kept
 # equal to BG so far atoms melt into the void; STRENGTH caps how much of the
 # original color is washed out at the far plane (1.0 = fully background).
+# The fog is now anchored to the scene's own depth extent: nothing hazes until
+# DEPTH_FADE_START of the farthest bead's distance, then it ramps LINEARLY to a
+# full wash-out at the farthest bead -- a strong, distance-proportional cue.
 HAZE_COLOR = BG
-HAZE_STRENGTH = 0.85
+HAZE_STRENGTH = 1.0
+DEPTH_FADE_START = 0.5   # fraction of the max bead distance at which haze begins
 # Light direction for the shaded-sphere sprite (points FROM the light, in
 # screen space: up-left and toward the viewer). Sphere shading is baked once
 # from this and reused for every bead.
@@ -134,6 +148,15 @@ BEAD_POLE_COLOR = (122, 165, 217)      # blue, hydrophilic poles
 BEAD_EQUATOR_COLOR = (247, 225, 122)   # yellow, hydrophobic equator
 BEAD_BAND_HALFWIDTH = 0.30
 BEAD_BAND_SOFT = 0.07
+# One pole (the +director pole) is over-painted WHITE, so which way a bead's
+# director points is unambiguous (the two normals +n / -n no longer look
+# identical). The cap covers the director hemisphere from the pole down to
+# roughly 80% latitude: white where the SIGNED cos-latitude s = N.n exceeds
+# BEAD_WHITE_POLE_MIN, with a BEAD_WHITE_POLE_SOFT transition. Only s > 0 (the
+# +n hemisphere) is affected, so the opposite pole keeps the blue/yellow banding.
+BEAD_WHITE_POLE_COLOR = (245, 246, 250)
+BEAD_WHITE_POLE_MIN = 0.80
+BEAD_WHITE_POLE_SOFT = 0.06
 
 PANEL_WIDTH = 480
 PANEL_PAD = 14

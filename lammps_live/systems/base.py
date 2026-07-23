@@ -21,6 +21,11 @@ class SliderSpec:
     default: float
     fmt: str = "{:.3f}"
     unit: str = ""
+    # Stable id for extra_sliders (see SystemSpec): the app passes this back to
+    # MDSystem.set_extra_param so a system knows which live parameter changed.
+    # Empty for the built-in temperature/damping sliders, which have dedicated
+    # setters (set_target_temp / set_puller_damping).
+    key: str = ""
 
 
 @dataclass(frozen=True)
@@ -98,6 +103,22 @@ class SystemSpec:
     # energy, force feedback) are unchanged -- they act on the 2D control-plane
     # projection of the puller the system already returns.
     render_3d: bool = False
+    # 3D only: draw the little per-bead director spike. On for small scenes
+    # (7-bead patch) where it shows the flip; off for large sheets (hundreds of
+    # beads) where hundreds of spikes are clutter and a per-bead draw cost -- the
+    # banded pole/equator coloring already shows tilt there.
+    director_arrows: bool = True
+    # 3D only: extra live-tunable parameters beyond temperature/damping, drawn as
+    # additional sliders in the panel. Each SliderSpec's `key` is handed back to
+    # set_extra_param(key, value) when the user moves it. Empty -> no extra
+    # sliders (every non-MesoMem system).
+    extra_sliders: tuple = ()
+    # 3D only: for a periodic scene, the crossfade band width as a fraction of
+    # the box side. A bead within this fraction of an x/y seam dissolves toward
+    # the background while a wrapped ghost fades in at the opposite edge, so it
+    # slides across the periodic boundary instead of popping. 0 -> no wrap fade
+    # (non-periodic scenes: the 7-bead patch).
+    wrap_fade_fraction: float = 0.0
 
 
 class MDSystem(ABC):
@@ -201,12 +222,43 @@ class MDSystem(ABC):
         the bar half-range. None (default) -> nothing drawn."""
         return None
 
+    def set_extra_param(self, key, value):
+        """Optional: update a live-tunable parameter beyond temperature/damping,
+        identified by the `key` of one of spec.extra_sliders (e.g. the MesoMem
+        systems' k_tilt / k_splay / eta). No-op for systems with no extra
+        sliders. Called every frame with the slider's current value, so
+        implementations should cheaply no-op when the value is unchanged."""
+
+    def get_bead_brightness(self):
+        """Optional (3D): a per-bead albedo brightness multiplier aligned with
+        get_positions_3d's ordering (1.0 = normal). Used to spotlight a tagged
+        cluster -- e.g. the sheet's diffusion-tracer bead and its neighbours.
+        None (default) -> every bead drawn at normal brightness."""
+        return None
+
     def steer_orientation(self, rate, dt):
         """Optional: steer the puller's in-plane orientation. rate is a control
         signal in [-1, 1] (joystick yaw / twist axis, or Q/E in mouse mode); dt
         is the frame time in seconds. No-op for systems whose puller has no
         meaningful orientation (a lone atom); lipids integrate it into the
         control lipid's director angle."""
+
+    def get_scene_fit_points(self):
+        """Optional: an (N, 3) array of world-space points the 3D camera should
+        frame (zoom to just fit). Used to fill the viewport at any aspect ratio
+        instead of a fixed field of view. None (default) -> keep the camera's
+        fixed FOV (non-3D systems, or 3D systems that don't want auto-fit)."""
+        return None
+
+    def get_torque_signals(self):
+        """Optional: (applied, reaction) torques about the control-plane normal
+        for the circular torque arrows, each already normalized to [-1, 1]
+        (fraction of the display maximum, positive = same screen handedness as a
+        positive yaw command). `applied` is the user's steering torque, `reaction`
+        is the force field's restoring torque on the puller. Both are the
+        component projected onto the 2D plane the scene depicts. None (default)
+        -> no torque arrows (systems whose puller has no meaningful orientation)."""
+        return None
 
     def puller_bead_count(self):
         """Number of LAMMPS atoms the puller is made of: 1 for a single-atom
