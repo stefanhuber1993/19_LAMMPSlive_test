@@ -46,22 +46,20 @@ switchable *while the demo is running* -- press `1`/`2`/... or `Tab`:
 Run `lammps-live --list-systems` to print this from the code. See
 "Adding a new system" below to add your own.
 
-### The MesoMem force field (3D `mesomem` system)
+### The MesoMem force field (3D systems)
 
-The `mesomem` system runs the authors' **actual** custom LAMMPS pair-style
-(`cpp_files/pair_membrane_sillano_v2.{cpp,h}` from
+The 3D `mesomem` and `membrane` systems run the authors' **actual** custom
+LAMMPS pair-style (`pair_membrane_sillano_v2.{cpp,h}` from
 [gitlab.tudelft.nl/idema-group/mesomem](https://gitlab.tudelft.nl/idema-group/mesomem),
 [arXiv:2602.24123](https://arxiv.org/abs/2602.24123)), rather than approximating
 it. Because the pip-installed LAMMPS ships the `PLUGIN` package, we don't rebuild
-LAMMPS: the vendored sources in `lammps_live/systems/mesomem_ff/` are compiled
-once into a small shared library and pulled in at runtime with `plugin load`.
-The build happens automatically on first use (and only rebuilds when a source
-file changes). It needs, on this machine:
-
-- a C++ compiler (`clang++` on macOS, `g++` on Linux), and
-- the headers of the **same MPI** the LAMMPS wheel links (Homebrew MPICH here,
-  `/opt/homebrew/include`). Override the location with `MESOMEM_MPI_INCLUDE` if
-  auto-detection (via `mpicxx`/Homebrew) misses it.
+LAMMPS: the sources are **vendored** in `lammps_live/systems/mesomem_ff/` and
+compiled once into a small shared library that is pulled in at runtime with
+`plugin load`. The build runs automatically the first time you open one of these
+systems (and rebuilds only when a source file changes); it uses the C++ compiler
+and MPICH headers from the [prerequisites](#1-system-prerequisites) above, so
+there is no separate download or manual build step -- set `MESOMEM_MPI_INCLUDE`
+only if the `mpi.h` auto-detection ever misses.
 
 The three general problems this system solves -- **compiling a custom LAMMPS
 force field into a stock build, rendering 3D fast (GPU sphere impostors with
@@ -100,6 +98,50 @@ Runs on macOS and Linux (including WSL2 on Windows). Mouse control (`--input
 mouse`) needs nothing beyond this section; the joystick needs one extra,
 OS-specific step -- see "Joystick setup" below.
 
+### 1. System prerequisites
+
+Beyond Python 3.9+, a full install needs a few things from your OS package
+manager:
+
+- **MPICH** -- the `lammps` wheel dynamically links it, so it's required for
+  *every* system (without it `import lammps` fails);
+- a **C++ compiler** and **MPICH's development headers** (`mpi.h`) -- these
+  additionally build the real MesoMem force field into a LAMMPS plugin the first
+  time you open a 3D system (see
+  ["The MesoMem force field"](#the-mesomem-force-field-3d-systems) below);
+- **git** -- pip fetches the joystick driver straight from GitHub.
+
+An OpenGL 3.3+ driver is used for the fast GPU renderer when present and the app
+silently falls back to a CPU renderer when not, so it is *not* required.
+
+- **macOS** (Homebrew):
+  ```bash
+  xcode-select --install     # C++ compiler (clang++), if not already installed
+  brew uninstall open-mpi     # only if present -- ABI-incompatible with the lammps wheel
+  brew install mpich git      # mpich provides libmpi + mpi.h; git for the pip dependency
+  ```
+- **Linux / WSL2 (Debian/Ubuntu):**
+  ```bash
+  sudo apt install build-essential mpich libmpich-dev git
+  ```
+  `libmpich-dev` supplies the `mpi.h` the plugin compiles against. If Open MPI is
+  also installed (e.g. `libopenmpi-dev`), remove it or make sure MPICH takes
+  precedence -- the two are ABI-incompatible.
+- **Linux (Fedora):**
+  ```bash
+  sudo dnf install gcc-c++ mpich mpich-devel git
+  module load mpi/mpich-x86_64   # Fedora keeps MPICH behind environment-modules
+  ```
+
+Why MPICH specifically: the `lammps` PyPI wheel dynamically links MPICH's
+`libmpi`/`libpmpi` on every platform it ships (Linux, macOS, Windows) and is
+ABI-incompatible with Open MPI, so MPICH -- not Open MPI -- must be what your
+system resolves at runtime *and* what the plugin build compiles against. (The
+plugin build auto-detects `mpi.h` via `mpicxx`/the usual install paths; override
+with `MESOMEM_MPI_INCLUDE` if it ever misses.)
+
+### 2. Install
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -110,32 +152,13 @@ This installs a `lammps-live` command (see [pyproject.toml](pyproject.toml)).
 If you'd rather not install the package, `pip install -r requirements.txt`
 and run `python3 -m lammps_live` instead -- both work identically.
 
-`Cu_u3.eam` (the copper EAM potential file, used by the `cu_eam` system) is
-bundled at `lammps_live/systems/data/Cu_u3.eam`, copied from the `lammps`
-wheel's bundled benchmark data.
-
-The `lammps` PyPI wheel dynamically links against **MPICH**'s `libmpi`/
-`libpmpi` on every platform it ships (Linux, macOS, Windows), and is ABI-
-incompatible with Open MPI -- make sure MPICH, not Open MPI, is what your
-system resolves at runtime:
-
-- **macOS**:
-  ```bash
-  brew uninstall open-mpi   # only if you have it - ABI-incompatible with the lammps wheel
-  brew install mpich        # provides libmpi.12/libpmpi.12, which the wheel needs
-  ```
-- **Linux / WSL2 (Debian/Ubuntu)**:
-  ```bash
-  sudo apt install mpich
-  ```
-  If Open MPI is also installed system-wide (e.g. via `libopenmpi3`),
-  remove it or make sure MPICH's lib directory takes precedence on the
-  loader path.
-- **Linux (Fedora)**:
-  ```bash
-  sudo dnf install mpich
-  module load mpi/mpich-x86_64   # Fedora keeps MPICH behind environment-modules
-  ```
+Nothing else has to be downloaded by hand. The copper EAM potential
+(`Cu_u3.eam`) is bundled in this repo (`lammps_live/systems/data/`), `CH.rebo`
+comes from the `lammps` wheel, and the MesoMem C++ force field is vendored here
+and **compiled automatically the first time you open a 3D system** (`mesomem` /
+`membrane`) -- a one-time ~10 s build, cached next to its sources and rebuilt
+only when they change. The Sidewinder joystick driver is the one thing fetched
+over the network: pip pulls it from GitHub during install.
 
 ## Joystick setup (Sidewinder FF2 force feedback)
 

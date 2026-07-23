@@ -15,6 +15,7 @@ MesoMem-based system in this demo.
 sources, rebuilt only when a source file is newer than the artifact) and loads
 it into the given LAMMPS instance, making `pair_style mesomem` available.
 """
+import glob
 import os
 import shutil
 import subprocess
@@ -41,7 +42,7 @@ def _mpi_include_dir():
     The pair style transitively includes <mpi.h> (via LAMMPS' pointers.h), so
     we must compile against the SAME MPI's headers as the loaded liblammps
     (MPICH here). Try, in order: an explicit override, the MPI compiler
-    wrapper's reported include dir, then Homebrew's include prefix."""
+    wrapper's reported include dir, then the usual per-OS install locations."""
     env = os.environ.get("MESOMEM_MPI_INCLUDE")
     if env and os.path.isfile(os.path.join(env, "mpi.h")):
         return env
@@ -58,12 +59,24 @@ def _mpi_include_dir():
                 cand = tok[2:] if tok.startswith("-I") else tok
                 if os.path.isfile(os.path.join(cand, "mpi.h")):
                     return cand
-    for cand in ("/opt/homebrew/include", "/usr/local/include"):
+    # Fallbacks when no MPI wrapper is on PATH: Homebrew (macOS) and the common
+    # Linux MPICH header locations. Debian/Ubuntu put mpi.h under a multiarch
+    # subdir (/usr/include/<arch>/mpich); Fedora uses /usr/include/mpich-<arch>
+    # or /usr/lib64/mpich/include, so those are globbed rather than hardcoded.
+    candidates = [
+        "/opt/homebrew/include", "/usr/local/include", "/usr/include/mpich",
+    ]
+    candidates += glob.glob("/usr/include/*/mpich")      # Debian/Ubuntu multiarch
+    candidates += glob.glob("/usr/include/mpich-*")       # Fedora
+    candidates += glob.glob("/usr/lib*/mpich/include")    # Fedora modules
+    for cand in candidates:
         if os.path.isfile(os.path.join(cand, "mpi.h")):
             return cand
     raise RuntimeError(
-        "Could not locate mpi.h. Install the MPI whose runtime LAMMPS uses "
-        "(Homebrew: `brew install mpich`) or set MESOMEM_MPI_INCLUDE."
+        "Could not locate mpi.h. Install the MPI whose runtime LAMMPS uses, with "
+        "its development headers -- macOS: `brew install mpich`; Debian/Ubuntu: "
+        "`sudo apt install mpich libmpich-dev`; Fedora: `sudo dnf install mpich "
+        "mpich-devel` -- or set MESOMEM_MPI_INCLUDE to the dir containing mpi.h."
     )
 
 
