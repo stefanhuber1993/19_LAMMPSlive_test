@@ -96,7 +96,6 @@ RDF_AVE_FREQ = RDF_AVE_EVERY * RDF_AVE_REPEAT
 # (~0.01-0.5 eV/A vs. ~0.1-6 eV/A), so every force-feedback knob is scaled
 # down to match -- reusing copper's would read as permanently "numb".
 FORCE_FEEDBACK = ForceFeedbackProfile(
-    input_force_scale=0.3,
     ff_exaggeration=4.0,
     ff_knee=0.08,
     ff_max_mag=120.0,
@@ -119,6 +118,7 @@ SPEC = SystemSpec(
                         PULLER_DAMPING_DEFAULT, fmt="{:.5f}"),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
+    max_input_force=0.3,   # eV/A at full deflection, shared by joystick/WASD/mouse
     puller_speed_cap=0.05 * LATTICE_SPACING / TIMESTEP,
     # Cold periwinkle, deliberately unlike copper's warm metal, to signal a
     # weakly-bound noble-gas solid that melts near liquid-nitrogen cold. Atoms

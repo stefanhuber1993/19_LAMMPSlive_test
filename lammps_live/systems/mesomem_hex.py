@@ -56,20 +56,32 @@ WC = 2.0           # orientational (tilt/splay) interaction cutoff, must be <= R
 ZETA = 5.0         # steepness/width of the cosine-squared attractive branch
 C0 = 0.0           # spontaneous curvature (0 -> flat preferred)
 
-# Live-tunable ranges for the k_tilt / k_splay / eta(zeta) sliders. Centered on
-# the paper's "standard conditions" values above; the spans bracket the regimes
-# the MesoMem preprint explores -- k_tilt from a floppy membrane up through the
-# stiff-planar regime (planar above ~10), k_splay around its soft default, and
-# eta (the zeta exponent of the cosine-squared attraction) from long-range/soft
-# to short-range/steep cohesion.
-K_TILT_MIN, K_TILT_MAX = 0.0, 30.0
-K_SPLAY_MIN, K_SPLAY_MAX = 0.0, 5.0
-ZETA_MIN, ZETA_MAX = 1.0, 12.0
+# Live-tunable ranges for the MesoMem coefficient sliders, each with the paper's
+# recommended value marked as the slider "optimum". The spans bracket the regimes
+# the MesoMem preprint explores:
+#   - k_tilt: floppy membrane up through the stiff-planar regime (planar above
+#     ~10); optimum 12.
+#   - k_splay: around its soft default; optimum 1.0.
+#   - zeta: steepness of the cosine-squared attractive branch; optimum 5.
+#   - rc: isotropic interaction cutoff. The paper needs rc >= 2.5 sigma to sustain
+#     aggregation; beyond that, stability is largely insensitive -> optimum 2.5.
+#   - wc: orientational (tilt/splay) cutoff, effectively upper-bounded by rc.
+#     Below that bound it barely affects structure but strongly tunes stiffness
+#     (paper Sec. III D 4) -> optimum 2.0.
+K_TILT_MIN, K_TILT_MAX, K_TILT_OPT = 0.0, 50.0, 12.0
+K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY_OPT = 0.5, 2.0, 1.0
+ZETA_MIN, ZETA_MAX, ZETA_OPT = 0.0, 12.0, 5.0
+RC_MIN, RC_MAX, RC_OPT = 2.5, 3.0, 2.5
+WC_MIN, WC_MAX, WC_OPT = 1.8, 3.0, 2.0
 
 A_LATTICE = 1.0    # in-plane nearest-neighbor spacing (near the isotropic min at r=sigma)
 BEAD_DIAMETER = 2.0  # sphere radius = sigma -> moment of inertia I = (2/5) m sigma^2 (paper)
 
-BOX = 16.0         # cubic box half-extent is BOX/2; non-periodic, just a container
+# Cubic box half-extent is BOX/2; non-periodic, just a container (with reflecting
+# z walls). Sized snugly around the patch and its pull reach (leash +/-2.3 in x,
+# +/-1.7 in z, bead radius 0.5) rather than large and arbitrary, so the white box
+# outline drawn in the scene frames the interactive cell without dwarfing it.
+BOX = 6.0
 
 TIMESTEP = 0.005   # tau_LJ (paper uses 0.01; halved for stability while pulling)
 SETTLE_STEPS = 300
@@ -136,7 +148,6 @@ REACTION_TORQUE_DISPLAY_MAX = 6.0
 # units; profile is scaled to that, with enough stick authority to tent the
 # membrane and pop the bead out against tilt/splay resistance.
 FORCE_FEEDBACK = ForceFeedbackProfile(
-    input_force_scale=9.0,
     ff_exaggeration=1.3,
     ff_knee=4.0,
     ff_max_mag=120.0,
@@ -159,16 +170,25 @@ SPEC = SystemSpec(
                        PULLER_DAMPING_DEFAULT, fmt="{:.2f}"),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
+    max_input_force=9.0,   # reduced units at full deflection, shared by joystick/WASD/mouse
     puller_speed_cap=0.06 * SIGMA / TIMESTEP,
     crystal_color=None,   # 3D path uses theme.MEMBRANE_BEAD_COLOR
     atom_radius_A=0.5 * SIGMA,   # physical bead radius used for perspective sphere sizing
     sim_time_per_frame=0.05,     # tau_LJ per frame (10 steps at 0.005)
     bond_overlay=False,
     render_3d=True,
+    reduced_units=True,
     extra_sliders=(
-        SliderSpec("k_tilt", K_TILT_MIN, K_TILT_MAX, K_TILT, fmt="{:.1f}", key="k_tilt"),
-        SliderSpec("k_splay", K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY, fmt="{:.2f}", key="k_splay"),
-        SliderSpec("eta (interaction range)", ZETA_MIN, ZETA_MAX, ZETA, fmt="{:.1f}", key="eta"),
+        SliderSpec("k_tilt", K_TILT_MIN, K_TILT_MAX, K_TILT, fmt="{:.1f}",
+                   key="k_tilt", optimum=K_TILT_OPT),
+        SliderSpec("k_splay", K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY, fmt="{:.2f}",
+                   key="k_splay", optimum=K_SPLAY_OPT),
+        SliderSpec("zeta (attraction steepness)", ZETA_MIN, ZETA_MAX, ZETA,
+                   fmt="{:.1f}", key="eta", optimum=ZETA_OPT),
+        SliderSpec("rc (interaction cutoff)", RC_MIN, RC_MAX, RC, fmt="{:.2f}",
+                   key="rc", optimum=RC_OPT),
+        SliderSpec("wc (orientation cutoff)", WC_MIN, WC_MAX, WC, fmt="{:.2f}",
+                   key="wc", optimum=WC_OPT),
     ),
 )
 
@@ -195,10 +215,13 @@ class MesoMemHexSystem(MDSystem):
         self._interactive_t = 0.0
         self._seed = random.randint(1, 900_000_000)
         # Live-tunable MesoMem coefficients (start at the paper's standard values;
-        # the k_tilt / k_splay / eta sliders drive these via set_extra_param).
+        # the k_tilt / k_splay / zeta / rc / wc sliders drive these via
+        # set_extra_param).
         self._ktilt = K_TILT
         self._ksplay = K_SPLAY
         self._zeta = ZETA
+        self._rc = RC
+        self._wc = WC
 
         # id 1 = central puller; ids 2..7 = hexagonal ring.
         self.center_id = 1
@@ -246,7 +269,7 @@ class MesoMemHexSystem(MDSystem):
         c(f"set group all diameter {BEAD_DIAMETER}")
         c("set group all dipole 0.0 0.0 1.0")   # directors along +z (membrane normal)
 
-        c(f"pair_style mesomem {RC}")
+        c(f"pair_style mesomem {self._rc}")
         # sigma eps ktilt ksplay cut weight_rcut zeta c0
         self._apply_pair_coeff()
 
@@ -336,22 +359,34 @@ class MesoMemHexSystem(MDSystem):
         self._puller_damping = gamma
         self.lmp.command(f"fix damp center viscous {gamma}")
 
+    def _effective_wc(self):
+        """Orientational cutoff actually used: the paper caps wc at rc (it is
+        'effectively upper-bounded by rc'), so a wc slider dragged past the
+        current rc is clamped rather than fed an ill-posed wc > rc to the pair
+        style."""
+        return min(self._wc, self._rc)
+
     def _apply_pair_coeff(self):
         """(Re)issue the mesomem pair_coeff from the current live coefficients.
         LAMMPS overwrites the stored per-type coefficients in place and re-inits
         the pair style on the next run, so this is safe to call between steps."""
         self.lmp.command(
             f"pair_coeff 1 1 {SIGMA} {EPS} {self._ktilt} {self._ksplay} "
-            f"{RC} {WC} {self._zeta} {C0}"
+            f"{self._rc} {self._effective_wc()} {self._zeta} {C0}"
         )
 
     def set_extra_param(self, key, value):
-        """Live k_tilt / k_splay / eta(zeta) dials. Re-issues pair_coeff only when
-        a value actually changes so it's a cheap no-op most frames."""
-        attr = {"k_tilt": "_ktilt", "k_splay": "_ksplay", "eta": "_zeta"}.get(key)
+        """Live k_tilt / k_splay / zeta / rc / wc dials. Re-issues pair_coeff only
+        when a value actually changes so it's a cheap no-op most frames. Changing
+        rc also resizes the pair_style's global cutoff (and thus the neighbour
+        list), so the pair_style is re-declared before the coeffs in that case."""
+        attr = {"k_tilt": "_ktilt", "k_splay": "_ksplay", "eta": "_zeta",
+                "rc": "_rc", "wc": "_wc"}.get(key)
         if attr is None or getattr(self, attr) == value:
             return
         setattr(self, attr, value)
+        if key == "rc":
+            self.lmp.command(f"pair_style mesomem {self._rc}")
         self._apply_pair_coeff()
 
     # Keep the puller on the control plane, inside the visible net, and below a
@@ -505,6 +540,7 @@ class MesoMemHexSystem(MDSystem):
         ni = np.array([mu[ic][0], mu[ic][1], mu[ic][2]])
         ni = ni / (np.linalg.norm(ni) or 1.0)
 
+        rc, wc = self._rc, self._effective_wc()
         u_iso = u_tilt = u_splay = 0.0
         for jid in self.ring_ids:
             jl = idx.get(jid)
@@ -513,7 +549,7 @@ class MesoMemHexSystem(MDSystem):
             rj = np.array([x[jl][0], x[jl][1], x[jl][2]])
             d = ri - rj
             r = float(np.linalg.norm(d))
-            if r >= RC or r < 1e-9:
+            if r >= rc or r < 1e-9:
                 continue
             rhat = d / r
             # Isotropic branch: 4-2 core below rmin=sigma, cosine^2 attraction above.
@@ -521,13 +557,13 @@ class MesoMemHexSystem(MDSystem):
                 t2 = (SIGMA / r) ** 2
                 u_iso += EPS * (t2 * t2 - 2.0 * t2)
             else:
-                g = math.pi * 0.5 * (r - SIGMA) / (RC - SIGMA)
+                g = math.pi * 0.5 * (r - SIGMA) / (rc - SIGMA)
                 u_iso += -EPS * math.cos(g) ** (2.0 * self._zeta)
             # Orientational weight w(r), nonzero only within wc.
             w = 0.0
-            if r < WC:
-                rga = 0.5 * WC
-                denom = (r / WC) ** 4 - 1.0
+            if r < wc:
+                rga = 0.5 * wc
+                denom = (r / wc) ** 4 - 1.0
                 if denom < -1e-14:
                     w = math.exp((r * r) / (rga * rga * denom))
             if w > 0.0:
@@ -544,6 +580,64 @@ class MesoMemHexSystem(MDSystem):
             ("splay  (neighbour directors align)", u_splay),
         ]
         return ("Pulled bead energy -- additive (reduced units)", terms, 6.0)
+
+    def _pair_terms(self, d, ni, nj):
+        """The three additive MesoMem energies for one ordered pair separated by
+        d = r_i - r_j, with unit directors ni, nj -- the same formulas as
+        get_potential_terms, factored out so the whole-system total can reuse
+        them. Returns (u_iso, u_tilt, u_splay); all zero past the cutoff."""
+        rc, wc = self._rc, self._effective_wc()
+        r = float(np.linalg.norm(d))
+        if r >= rc or r < 1e-9:
+            return 0.0, 0.0, 0.0
+        rhat = d / r
+        if r < SIGMA:
+            t2 = (SIGMA / r) ** 2
+            u_iso = EPS * (t2 * t2 - 2.0 * t2)
+        else:
+            g = math.pi * 0.5 * (r - SIGMA) / (rc - SIGMA)
+            u_iso = -EPS * math.cos(g) ** (2.0 * self._zeta)
+        u_tilt = u_splay = 0.0
+        if r < wc:
+            rga = 0.5 * wc
+            denom = (r / wc) ** 4 - 1.0
+            if denom < -1e-14:
+                w = math.exp((r * r) / (rga * rga * denom))
+                nir = float(ni @ rhat)
+                njr = float(nj @ rhat)
+                ninj = float(ni @ nj)
+                u_tilt = 0.5 * self._ktilt * (nir * nir + njr * njr) * w
+                u_splay = 0.5 * self._ksplay * (ninj - 1.0) ** 2 * w
+        return u_iso, u_tilt, u_splay
+
+    def get_total_potential_terms(self):
+        """Whole-patch additive energy: the same three MesoMem terms summed over
+        every unique bead pair (each counted once), so the panel shows the total
+        attraction / tilt / splay stored in the membrane, not just the puller's
+        share. Only 7 beads here, so the full O(N^2) pair loop is trivial."""
+        idx, n = self._id_index()
+        order = [idx.get(i) for i in self.all_ids]
+        if any(k is None for k in order):
+            return None
+        x = np.array(self.lmp.numpy.extract_atom("x")[:n], dtype=float)
+        mu = np.array(self.lmp.numpy.extract_atom("mu")[:n], dtype=float)[:, :3]
+        P = x[order]
+        D = mu[order]
+        D /= np.clip(np.linalg.norm(D, axis=1, keepdims=True), 1e-9, None)
+        u_iso = u_tilt = u_splay = 0.0
+        m = len(order)
+        for a in range(m):
+            for b in range(a + 1, m):
+                ui, ut, us = self._pair_terms(P[a] - P[b], D[a], D[b])
+                u_iso += ui
+                u_tilt += ut
+                u_splay += us
+        terms = [
+            ("isotropic  (repel + attract)", u_iso),
+            ("tilt  (directors normal to bonds)", u_tilt),
+            ("splay  (neighbour directors align)", u_splay),
+        ]
+        return ("Whole-patch energy -- additive (reduced units)", terms, 18.0)
 
     def get_interaction_force(self):
         """Membrane's (pair) reaction force on the central bead, projected onto
@@ -642,21 +736,28 @@ class MesoMemHexSystem(MDSystem):
         return dict(CAMERA_PARAMS)
 
     def get_control_grid(self):
-        """The joystick's control plane (world xz through the patch center),
-        as basis + extents, for the renderer to draw as a net."""
+        """The joystick's control plane (world xz through the patch center), as
+        basis + extents. Its extents are exactly the puller's movement limits
+        (_CTRL_X / _CTRL_Z), so the drawn net marks precisely where the bead can
+        be dragged."""
         return dict(
             origin=(0.0, 0.0, 0.0),
             u_axis=(1.0, 0.0, 0.0),   # world x  (joystick axis x, screen-horizontal)
             v_axis=(0.0, 0.0, 1.0),   # world z  (joystick axis y, screen-vertical)
-            u_range=(-2.6, 2.6),
-            v_range=(-2.0, 2.0),
+            u_range=self._CTRL_X,
+            v_range=self._CTRL_Z,
             step=0.5,
         )
 
+    def get_box_bounds_3d(self):
+        """The container cube, for the renderer to outline in white."""
+        h = BOX / 2.0
+        return (-h, h, -h, h, -h, h)
+
     def get_scene_fit_points(self):
-        """Corners of the control-plane net (plus a little vertical headroom for
-        the puller/director spikes) as the world extent the camera should frame,
-        so the patch fills the sim viewport at any window size / aspect ratio."""
+        """World extent the camera should frame: the container box corners (so the
+        white box outline stays in view) plus the control-plane net corners and a
+        little vertical headroom for the puller/director spikes."""
         g = self.get_control_grid()
         origin = np.asarray(g["origin"], dtype=float)
         u = np.asarray(g["u_axis"], dtype=float)
@@ -667,6 +768,9 @@ class MesoMemHexSystem(MDSystem):
         # can rise a little past the net's top edge.
         pts.append(origin + (v1 + 0.6) * v)
         pts.append(origin + (v0 - 0.2) * v)
+        h = BOX / 2.0
+        pts += [(sx * h, sy * h, sz * h)
+                for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
         return np.array(pts)
 
     def get_box_size(self):

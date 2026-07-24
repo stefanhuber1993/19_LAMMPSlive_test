@@ -138,7 +138,6 @@ POTENTIAL_FILE = os.path.join(os.path.dirname(__file__), "data", "Cu_u3.eam")
 # deliberately small so a light touch already reads as "pulled toward the
 # crystal", not just a hard push (see main app's force-shaping module).
 FORCE_FEEDBACK = ForceFeedbackProfile(
-    input_force_scale=2.0,
     ff_exaggeration=4.0,
     ff_knee=1.5,
     ff_max_mag=120.0,
@@ -161,6 +160,7 @@ SPEC = SystemSpec(
                         PULLER_DAMPING_DEFAULT, fmt="{:.4f}"),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
+    max_input_force=2.0,   # eV/A at full deflection, shared by joystick/WASD/mouse
     puller_speed_cap=0.1 * LATTICE_SPACING / TIMESTEP,
     # Warm metallic copper, so it reads as a dense metal (contrast argon's cold
     # noble-gas tint). Atoms drawn at ~0.3x the nearest-neighbor spacing: big

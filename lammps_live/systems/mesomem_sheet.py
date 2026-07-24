@@ -27,6 +27,7 @@ import random
 
 import numpy as np
 from lammps import lammps
+from scipy.spatial import cKDTree
 
 from .base import ForceFeedbackProfile, MDSystem, SliderSpec, SystemSpec
 from .mesomem_ff import ensure_plugin_loaded
@@ -42,11 +43,14 @@ WC = 2.0
 ZETA = 5.0
 C0 = 0.0
 
-# Live-tunable ranges for the k_tilt / k_splay / eta(zeta) sliders (see the
-# 7-bead patch for the rationale; same standard-condition centers and spans).
-K_TILT_MIN, K_TILT_MAX = 0.0, 30.0
-K_SPLAY_MIN, K_SPLAY_MAX = 0.0, 5.0
-ZETA_MIN, ZETA_MAX = 1.0, 12.0
+# Live-tunable ranges for the MesoMem coefficient sliders, each with the paper's
+# recommended value marked as the slider "optimum" (see the 7-bead patch for the
+# per-parameter rationale; same standard-condition centers and spans).
+K_TILT_MIN, K_TILT_MAX, K_TILT_OPT = 0.0, 50.0, 12.0
+K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY_OPT = 0.5, 2.0, 1.0
+ZETA_MIN, ZETA_MAX, ZETA_OPT = 0.0, 12.0, 5.0
+RC_MIN, RC_MAX, RC_OPT = 2.5, 3.0, 2.5
+WC_MIN, WC_MAX, WC_OPT = 1.8, 3.0, 2.0
 
 # --- Sheet "cleanup" forces (housekeeping, not MesoMem physics) --------------
 # Two soft per-frame corrections keep the free periodic monolayer well-posed for
@@ -107,7 +111,6 @@ ROT_DAMP = 0.88
 REACTION_TORQUE_DISPLAY_MAX = 6.0
 
 FORCE_FEEDBACK = ForceFeedbackProfile(
-    input_force_scale=12.0,
     ff_exaggeration=1.3,
     ff_knee=4.0,
     ff_max_mag=120.0,
@@ -130,6 +133,7 @@ SPEC = SystemSpec(
                        PULLER_DAMPING_DEFAULT, fmt="{:.2f}"),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
+    max_input_force=12.0,   # reduced units at full deflection, shared by joystick/WASD/mouse
     puller_speed_cap=0.06 * SIGMA / TIMESTEP,
     crystal_color=None,
     atom_radius_A=0.5 * SIGMA,
@@ -140,6 +144,7 @@ SPEC = SystemSpec(
     sim_time_per_frame=0.1,
     bond_overlay=False,
     render_3d=True,
+    reduced_units=True,
     # No per-bead director spikes on the sheet: hundreds of arrows are clutter,
     # and the white-pole bead coloring already shows each director's sense/tilt.
     director_arrows=False,
@@ -147,9 +152,16 @@ SPEC = SystemSpec(
     # they slide across instead of popping.
     wrap_fade_fraction=0.03,
     extra_sliders=(
-        SliderSpec("k_tilt", K_TILT_MIN, K_TILT_MAX, K_TILT, fmt="{:.1f}", key="k_tilt"),
-        SliderSpec("k_splay", K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY, fmt="{:.2f}", key="k_splay"),
-        SliderSpec("eta (interaction range)", ZETA_MIN, ZETA_MAX, ZETA, fmt="{:.1f}", key="eta"),
+        SliderSpec("k_tilt", K_TILT_MIN, K_TILT_MAX, K_TILT, fmt="{:.1f}",
+                   key="k_tilt", optimum=K_TILT_OPT),
+        SliderSpec("k_splay", K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY, fmt="{:.2f}",
+                   key="k_splay", optimum=K_SPLAY_OPT),
+        SliderSpec("zeta (attraction steepness)", ZETA_MIN, ZETA_MAX, ZETA,
+                   fmt="{:.1f}", key="eta", optimum=ZETA_OPT),
+        SliderSpec("rc (interaction cutoff)", RC_MIN, RC_MAX, RC, fmt="{:.2f}",
+                   key="rc", optimum=RC_OPT),
+        SliderSpec("wc (orientation cutoff)", WC_MIN, WC_MAX, WC, fmt="{:.2f}",
+                   key="wc", optimum=WC_OPT),
     ),
 )
 
@@ -170,6 +182,12 @@ class MesoMemSheetSystem(MDSystem):
         self._ktilt = K_TILT
         self._ksplay = K_SPLAY
         self._zeta = ZETA
+        self._rc = RC
+        self._wc = WC
+        # Throttled cache for the whole-sheet potential total (O(pairs) each time,
+        # so it's recomputed every few frames rather than every frame).
+        self._total_terms_cache = None
+        self._total_terms_ctr = 0
 
         self._lattice_xy = self._hex_lattice()      # (N,2) intended lattice sites
         self._n = len(self._lattice_xy)
@@ -177,25 +195,32 @@ class MesoMemSheetSystem(MDSystem):
         self.center_id = int(np.argmin(np.hypot(*self._lattice_xy.T))) + 1
         self.all_ids = np.arange(1, self._n + 1)
 
-        # Diffusion tracer: a bead toward the front-left of the rendered sheet
-        # (small x = left, small y = toward the camera) plus its six nearest
-        # neighbours, drawn brighter so the cluster can be followed as it diffuses
-        # through the membrane. Chosen once from the initial lattice; the ids are
-        # stable, so the highlight tracks the same beads as they wander.
+        # Diffusion tracer: a bead ~30% in from the front-left corner of the
+        # rendered sheet (small x = left, small y = toward the camera) plus its
+        # six nearest neighbours, drawn brighter so the cluster can be followed as
+        # it diffuses through the membrane. Chosen once from the initial lattice;
+        # the ids are stable, so the highlight tracks the same beads as they wander.
         self._tracer_ids, self._tracer_brightness = self._pick_tracer_cluster()
 
         self._build()
 
+    # Tracer cluster placement, as a fraction of the sheet's span measured from
+    # the front-left corner (0 = corner, 1 = far/right edge). Kept off the corner
+    # so the highlighted beads sit inside the membrane, not crammed into the edge.
+    _TRACER_FRAC = 0.3
+
     def _pick_tracer_cluster(self):
-        """(ids, per-bead brightness) for the front-left diffusion tracer: the
-        lattice bead nearest the front-left corner and its six nearest neighbours,
-        brightened 1.5x (the centre bead 2.1x). Returns the brightness aligned to
-        all_ids (1.0 everywhere else)."""
+        """(ids, per-bead brightness) for the diffusion tracer: the lattice bead
+        nearest a point _TRACER_FRAC of the way in from the front-left corner and
+        its six nearest neighbours, brightened 1.5x (the centre bead 2.1x).
+        Returns the brightness aligned to all_ids (1.0 everywhere else)."""
         xy = self._lattice_xy
-        hx = 0.5 * (xy[:, 0].max() - xy[:, 0].min())
-        hy = 0.5 * (xy[:, 1].max() - xy[:, 1].min())
-        corner = np.array([-hx, -hy])           # front-left in the camera's view
-        center = int(np.argmin(np.hypot(*(xy - corner).T)))
+        f = self._TRACER_FRAC
+        target = np.array([
+            xy[:, 0].min() + f * (xy[:, 0].max() - xy[:, 0].min()),
+            xy[:, 1].min() + f * (xy[:, 1].max() - xy[:, 1].min()),
+        ])                                      # 30% in from the front-left corner
+        center = int(np.argmin(np.hypot(*(xy - target).T)))
         d = np.hypot(*(xy - xy[center]).T)
         neighbours = np.argsort(d)[1:7]         # six nearest (exclude self)
         bright = np.ones(self._n)
@@ -245,7 +270,7 @@ class MesoMemSheetSystem(MDSystem):
         c(f"set group all diameter {BEAD_DIAMETER}")
         c("set group all dipole 0.0 0.0 1.0")
 
-        c(f"pair_style mesomem {RC}")
+        c(f"pair_style mesomem {self._rc}")
         self._apply_pair_coeff()
 
         c("neighbor 1.0 bin")
@@ -345,19 +370,29 @@ class MesoMemSheetSystem(MDSystem):
         self._puller_damping = gamma
         self.lmp.command(f"fix damp center viscous {gamma}")
 
+    def _effective_wc(self):
+        """Orientational cutoff actually used: capped at rc (the paper's upper
+        bound), so a wc slider dragged past rc is clamped rather than fed an
+        ill-posed wc > rc."""
+        return min(self._wc, self._rc)
+
     def _apply_pair_coeff(self):
         """(Re)issue the mesomem pair_coeff from the current live coefficients."""
         self.lmp.command(
             f"pair_coeff 1 1 {SIGMA} {EPS} {self._ktilt} {self._ksplay} "
-            f"{RC} {WC} {self._zeta} {C0}"
+            f"{self._rc} {self._effective_wc()} {self._zeta} {C0}"
         )
 
     def set_extra_param(self, key, value):
-        """Live k_tilt / k_splay / eta(zeta) dials; re-issue pair_coeff on change."""
-        attr = {"k_tilt": "_ktilt", "k_splay": "_ksplay", "eta": "_zeta"}.get(key)
+        """Live k_tilt / k_splay / zeta / rc / wc dials; re-issue pair_coeff on
+        change (and the pair_style global cutoff too when rc moves)."""
+        attr = {"k_tilt": "_ktilt", "k_splay": "_ksplay", "eta": "_zeta",
+                "rc": "_rc", "wc": "_wc"}.get(key)
         if attr is None or getattr(self, attr) == value:
             return
         setattr(self, attr, value)
+        if key == "rc":
+            self.lmp.command(f"pair_style mesomem {self._rc}")
         self._apply_pair_coeff()
 
     def get_bead_brightness(self):
@@ -494,11 +529,12 @@ class MesoMemSheetSystem(MDSystem):
         mu = np.array(self.lmp.numpy.extract_atom("mu")[:n], dtype=float)[:, :3]
         ni = mu[ic] / (np.linalg.norm(mu[ic]) or 1.0)
 
+        rc, wc = self._rc, self._effective_wc()
         d = x - x[ic]
         d[:, 0] -= self.box_lx * np.round(d[:, 0] / self.box_lx)
         d[:, 1] -= self.box_ly * np.round(d[:, 1] / self.box_ly)
         r = np.linalg.norm(d, axis=1)
-        sel = (r < RC) & (r > 1e-9)
+        sel = (r < rc) & (r > 1e-9)
         sel[ic] = False
 
         u_iso = u_tilt = u_splay = 0.0
@@ -509,12 +545,12 @@ class MesoMemSheetSystem(MDSystem):
                 t2 = (SIGMA / rk) ** 2
                 u_iso += EPS * (t2 * t2 - 2.0 * t2)
             else:
-                g = math.pi * 0.5 * (rk - SIGMA) / (RC - SIGMA)
+                g = math.pi * 0.5 * (rk - SIGMA) / (rc - SIGMA)
                 u_iso += -EPS * math.cos(g) ** (2.0 * self._zeta)
             w = 0.0
-            if rk < WC:
-                rga = 0.5 * WC
-                denom = (rk / WC) ** 4 - 1.0
+            if rk < wc:
+                rga = 0.5 * wc
+                denom = (rk / wc) ** 4 - 1.0
                 if denom < -1e-14:
                     w = math.exp((rk * rk) / (rga * rga * denom))
             if w > 0.0:
@@ -530,6 +566,85 @@ class MesoMemSheetSystem(MDSystem):
             ("splay  (neighbour directors align)", u_splay),
         ]
         return ("Pulled bead energy -- additive (reduced units)", terms, 6.0)
+
+    # Recompute the whole-sheet total only every few frames -- it is an O(pairs)
+    # pass over the entire membrane, far heavier than the single puller bead, and
+    # the aggregate barely changes frame to frame.
+    _TOTAL_EVERY = 4
+
+    def get_total_potential_terms(self):
+        """Whole-sheet additive energy: the three MesoMem terms summed over every
+        unique bead pair within rc across the entire membrane (minimum-image in
+        the periodic x,y), so the panel shows the total attraction / tilt / splay
+        the sheet is storing -- not just the puller's local share.
+
+        Candidate pairs come from a periodic 2D KD-tree on the in-plane (x,y):
+        the in-plane separation never exceeds the 3D separation, so query_pairs(rc)
+        is a superset of the true within-rc pairs, which are then filtered on the
+        exact minimum-image 3D distance. Vectorized over the ~1e4 candidate pairs
+        and throttled to every _TOTAL_EVERY frames."""
+        self._total_terms_ctr += 1
+        if self._total_terms_cache is not None and self._total_terms_ctr % self._TOTAL_EVERY:
+            return self._total_terms_cache
+
+        idx, n = self._id_index()
+        x = np.array(self.lmp.numpy.extract_atom("x")[:n], dtype=float)
+        mu = np.array(self.lmp.numpy.extract_atom("mu")[:n], dtype=float)[:, :3]
+        order = np.array([idx[int(i)] for i in self.all_ids])
+        P = x[order]
+        D = mu[order]
+        D /= np.clip(np.linalg.norm(D, axis=1, keepdims=True), 1e-9, None)
+
+        rc, wc = self._rc, self._effective_wc()
+        Lx, Ly = self.box_lx, self.box_ly
+        xy = np.column_stack([(P[:, 0] + Lx / 2.0) % Lx, (P[:, 1] + Ly / 2.0) % Ly])
+        tree = cKDTree(xy, boxsize=[Lx, Ly])
+        pairs = tree.query_pairs(rc, output_type="ndarray")
+
+        u_iso = u_tilt = u_splay = 0.0
+        if len(pairs):
+            a, b = pairs[:, 0], pairs[:, 1]
+            d = P[a] - P[b]
+            d[:, 0] -= Lx * np.round(d[:, 0] / Lx)
+            d[:, 1] -= Ly * np.round(d[:, 1] / Ly)
+            r = np.linalg.norm(d, axis=1)
+            m = (r < rc) & (r > 1e-9)
+            a, b, d, r = a[m], b[m], d[m], r[m]
+            rhat = d / r[:, None]
+            core = r < SIGMA
+            iso = np.empty_like(r)
+            t2 = (SIGMA / r[core]) ** 2
+            iso[core] = EPS * (t2 * t2 - 2.0 * t2)
+            att = ~core
+            g = math.pi * 0.5 * (r[att] - SIGMA) / (rc - SIGMA)
+            iso[att] = -EPS * np.cos(g) ** (2.0 * self._zeta)
+            u_iso = float(iso.sum())
+
+            w = np.zeros_like(r)
+            inw = r < wc
+            rga = 0.5 * wc
+            denom = (r / wc) ** 4 - 1.0
+            valid = inw & (denom < -1e-14)
+            w[valid] = np.exp((r[valid] * r[valid]) / (rga * rga * denom[valid]))
+            ni, nj = D[a], D[b]
+            nir = np.einsum("ij,ij->i", ni, rhat)
+            njr = np.einsum("ij,ij->i", nj, rhat)
+            ninj = np.einsum("ij,ij->i", ni, nj)
+            u_tilt = float((0.5 * self._ktilt * (nir * nir + njr * njr) * w).sum())
+            u_splay = float((0.5 * self._ksplay * (ninj - 1.0) ** 2 * w).sum())
+
+        terms = [
+            ("isotropic  (repel + attract)", u_iso),
+            ("tilt  (directors normal to bonds)", u_tilt),
+            ("splay  (neighbour directors align)", u_splay),
+        ]
+        # Bar half-range scaled to the sheet's dominant (attraction) term, which
+        # runs to a few thousand across the ~900 beads -- so its bar reads without
+        # pegging. As in the single-bead panel the far smaller tilt/splay totals
+        # then show mainly through their printed values, not bar length.
+        self._total_terms_cache = (
+            "Whole-sheet energy -- additive (reduced units)", terms, 4000.0)
+        return self._total_terms_cache
 
     def get_torque_signals(self):
         ic, n = self._center_local()
@@ -617,22 +732,33 @@ class MesoMemSheetSystem(MDSystem):
         )
 
     def get_control_grid(self):
-        # Local control plane (world xz) around the puller: a small net marking
-        # where you can drag, not the whole sheet.
+        # Local control plane (world xz) around the puller: a net marking exactly
+        # where the puller can be dragged -- its extents are the movement limits
+        # (_CTRL_X / _CTRL_Z), not an arbitrary smaller patch.
         return dict(
             origin=(0.0, float(self._puller_y), 0.0),
             u_axis=(1.0, 0.0, 0.0),
             v_axis=(0.0, 0.0, 1.0),
-            u_range=(-3.2, 3.2),
-            v_range=(-2.6, 2.6),
+            u_range=self._CTRL_X,
+            v_range=self._CTRL_Z,
             step=0.8,
         )
+
+    def get_box_bounds_3d(self):
+        """The periodic simulation cell (frozen after settle), for the renderer to
+        outline in white: full x,y extent and the shallow +/-Z_HALF z container."""
+        return (-self.box_lx / 2.0, self.box_lx / 2.0,
+                -self.box_ly / 2.0, self.box_ly / 2.0,
+                -Z_HALF, Z_HALF)
 
     def get_scene_fit_points(self):
         """Frame the whole sheet: its in-plane bounding box (at z=0) plus a bit
         of out-of-plane headroom for a pulled bead / directors."""
         hx, hy = self.box_lx / 2.0, self.box_ly / 2.0
-        pts = [(sx * hx, sy * hy, 0.0) for sx in (-1, 1) for sy in (-1, 1)]
+        # Full box corners (including the +/-Z_HALF container height) so the white
+        # box outline stays framed, plus a bit of headroom for a pulled bead.
+        pts = [(sx * hx, sy * hy, sz * Z_HALF)
+               for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
         pts.append((0.0, 0.0, 2.6))
         pts.append((0.0, 0.0, -2.2))
         return np.array(pts)

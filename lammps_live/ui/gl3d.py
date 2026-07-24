@@ -81,20 +81,17 @@ in vec2 in_corner;      // quad corner in [-1,1]
 in vec3 in_center;      // per-instance world center
 in float in_radius;     // per-instance world radius
 in vec3 in_dir;         // per-instance unit director (world)
-in float in_fade;       // per-instance fade-to-background (0 opaque .. 1 gone)
 in float in_bright;     // per-instance albedo brightness multiplier (1 = normal)
 out vec3 v_centerView;
 out float v_radius;
 out vec3 v_dirView;
 out vec3 v_rayView;
-out float v_fade;
 out float v_bright;
 void main() {
     vec4 cv = view * vec4(in_center, 1.0);
     v_centerView = cv.xyz;
     v_radius = in_radius;
     v_dirView = mat3(view) * in_dir;
-    v_fade = in_fade;
     v_bright = in_bright;
     // Camera-facing billboard, enlarged a touch so the perspective silhouette
     // (slightly bigger than the radius) is fully covered.
@@ -107,6 +104,7 @@ void main() {
 _GEOM_FS = """
 #version 330 core
 uniform mat4 proj;
+uniform mat4 viewInv;     // view->world, to clip/vignette against the periodic box
 uniform float band_half;
 uniform float band_soft;
 uniform vec3 equator_col;
@@ -114,11 +112,13 @@ uniform vec3 pole_col;
 uniform vec3 white_col;
 uniform float white_min;
 uniform float white_soft;
+uniform vec2 boxHalf;     // periodic-box half-extents in world x,y (centered at origin)
+uniform float clipEnable; // 1 for periodic scenes (clip + edge vignette), 0 otherwise
+uniform float edgeBand;   // world width of the soft edge fade inside each box face
 in vec3 v_centerView;
 in float v_radius;
 in vec3 v_dirView;
 in vec3 v_rayView;
-in float v_fade;
 in float v_bright;
 layout(location=0) out vec4 o_albedo;
 layout(location=1) out vec3 o_normal;
@@ -132,6 +132,21 @@ void main() {
     float t = b - sqrt(disc);                 // near intersection
     if (t < 0.0) discard;
     vec3 hit = dir * t;
+    // Periodic-box handling (opaque, no transparency): clip every bead to the
+    // box faces so a bead crossing a seam has its sliced area move continuously
+    // to the wrapped ghost on the opposite face -- and beyond-box fragments are
+    // discarded (no depth/color written), so they never falsely occlude what is
+    // behind. dEdge = distance to the nearest x/y face (>=0 inside).
+    float edgeFade = 0.0;
+    if (clipEnable > 0.5) {
+        vec3 wp = (viewInv * vec4(hit, 1.0)).xyz;
+        float dEdge = min(boxHalf.x - abs(wp.x), boxHalf.y - abs(wp.y));
+        if (dEdge < 0.0) discard;             // outside the periodic cell -> gone
+        // Soft opaque vignette: fade the bead color toward the background over
+        // the last edgeBand before the face, so the geometric cut reads as a
+        // gentle edge rather than a hard line (see the composite's bg mix).
+        edgeFade = 1.0 - smoothstep(0.0, edgeBand, dEdge);
+    }
     vec3 N = normalize(hit - c);
     // Correct per-pixel depth so overlapping beads intersect via the depth test.
     vec4 clip = proj * vec4(hit, 1.0);
@@ -145,7 +160,9 @@ void main() {
     // Over-paint the +n pole white (down to ~80% latitude) so director sense reads.
     float w = smoothstep(white_min - white_soft, white_min + white_soft, s);
     albedo = mix(albedo, white_col, w);
-    o_albedo = vec4(albedo * v_bright, v_fade);   // alpha carries the fade-to-bg
+    // Alpha carries the opaque edge-vignette factor for the composite to blend
+    // toward the background (it is NOT transparency -- the fragment is opaque).
+    o_albedo = vec4(albedo * v_bright, edgeFade);
     o_normal = N;
     o_viewpos = hit;
 }
@@ -246,7 +263,7 @@ void main() {
     if (texture(depthTex, uv).r >= 1.0) { frag = vec4(bgColor, 1.0); return; }
     vec4 albedoSample = texture(albedoTex, uv);
     vec3 alb = albedoSample.rgb;
-    float boundaryFade = albedoSample.a;       // per-bead fade toward the background
+    float edgeFade = albedoSample.a;           // opaque edge vignette (see _GEOM_FS)
     vec3 N = normalize(texture(normalTex, uv).xyz);
     vec3 P = texture(posTex, uv).xyz;
     float ao = texture(aoTex, uv).r;
@@ -266,10 +283,10 @@ void main() {
     float depth = -P.z;                        // distance along the view axis
     float fog = fogStrength * clamp((depth - fogNear) / max(fogFar - fogNear, 1e-4), 0.0, 1.0);
     col = mix(col, hazeColor, fog);
-    // Periodic-seam crossfade: a bead leaving one edge dissolves toward the
-    // background while its wrapped ghost fades in at the opposite edge, so it
-    // slides across the boundary instead of popping.
-    col = mix(col, bgColor, clamp(boundaryFade, 0.0, 1.0));
+    // Soft opaque edge: fade toward the background near the periodic box faces
+    // (fragment stays opaque; this only tints the color), so the clipped cell
+    // boundary reads as a gentle vignette rather than a hard cut.
+    col = mix(col, bgColor, clamp(edgeFade, 0.0, 1.0));
     frag = vec4(col, 1.0);
 }
 """
@@ -364,11 +381,24 @@ class GLScene:
         self.geom_prog["white_col"].value = tuple(c_ / 255.0 for c_ in BEAD_WHITE_POLE_COLOR)
         self.geom_prog["white_min"].value = BEAD_WHITE_POLE_MIN
         self.geom_prog["white_soft"].value = BEAD_WHITE_POLE_SOFT
+        # Periodic clipping / edge-vignette default to OFF; render() sets them per
+        # frame for periodic scenes (see render()).
+        self.geom_prog["clipEnable"].value = 0.0
+        self.geom_prog["boxHalf"].value = (1e9, 1e9)
+        self.geom_prog["edgeBand"].value = 1.0
 
         kernel = _ssao_kernel(SSAO_KERNEL_SIZE)
         self.ssao_prog["samples"].write(kernel.tobytes())
         self.ssao_prog["radius"].value = 0.9   # ~ bead diameter: reaches neighbours
-        self.ssao_prog["bias"].value = 0.015
+        # Depth-comparison bias, in view-space units. Raised from a hairline
+        # 0.015: on a smooth CONVEX impostor sphere the near-origin AO samples sit
+        # just above the curving surface and, read back against that same surface,
+        # were counted as self-occlusion -- darkening each bead's body while its
+        # silhouette rim (AO ~ 1) stayed bright, which read as a bright halo around
+        # every bead's outline. A bias of ~one-tenth the sample radius clears the
+        # curvature so a lone sphere reads unoccluded, while genuine crevices where
+        # neighbouring beads pack together (depth gap >> bias) still darken.
+        self.ssao_prog["bias"].value = 0.06
 
         self.comp_prog["lightDir"].value = tuple(_normalize(np.array(SPHERE_LIGHT_DIR)))
         self.comp_prog["ambient"].value = SPHERE_AMBIENT
@@ -416,8 +446,8 @@ class GLScene:
         self._release_fbos()
 
         # Albedo is f2 (not f1) so a per-bead brightness boost (>1) survives into
-        # the composite before the final clamp, and the alpha channel can carry
-        # the periodic-seam fade fraction.
+        # the composite before the final clamp; the alpha channel carries the
+        # opaque periodic-edge vignette factor (see _GEOM_FS / _COMPOSITE_FS).
         self.albedo_tex = c.texture((width, height), 4, dtype="f2")
         self.normal_tex = c.texture((width, height), 3, dtype="f2")
         self.pos_tex = c.texture((width, height), 3, dtype="f2")
@@ -455,27 +485,30 @@ class GLScene:
 
     # ---- per-frame instance / line uploads ----------------------------------
 
-    def _upload_instances(self, centers, radii, directors, fades, brights):
+    def _upload_instances(self, centers, radii, directors, brights):
+        """Upload all beads (opaque) into the geometry VAO. Layout is 8 floats
+        per instance: center(3), radius(1), director(3), brightness(1)."""
         n = len(centers)
-        data = np.empty((n, 9), dtype="f4")
+        if n == 0:
+            return 0
+        data = np.empty((n, 8), dtype="f4")
         data[:, 0:3] = centers
         data[:, 3] = radii
         data[:, 4:7] = directors
-        data[:, 7] = fades
-        data[:, 8] = brights
+        data[:, 7] = brights
         raw = data.tobytes()
         if n > self._inst_capacity:
             if self._inst_vbo is not None:
                 self._inst_vbo.release()
             if self._geom_vao is not None:
                 self._geom_vao.release()
-            self._inst_vbo = self.ctx.buffer(reserve=max(1, n) * 9 * 4, dynamic=True)
+            self._inst_vbo = self.ctx.buffer(reserve=max(1, n) * 8 * 4, dynamic=True)
             self._inst_capacity = n
             self._geom_vao = self.ctx.vertex_array(
                 self.geom_prog,
                 [(self._quad_vbo, "2f", "in_corner"),
-                 (self._inst_vbo, "3f 1f 3f 1f 1f /i", "in_center", "in_radius",
-                  "in_dir", "in_fade", "in_bright")],
+                 (self._inst_vbo, "3f 1f 3f 1f /i", "in_center", "in_radius",
+                  "in_dir", "in_bright")],
             )
         self._inst_vbo.write(raw)
         return n
@@ -504,23 +537,36 @@ class GLScene:
     # ---- render -------------------------------------------------------------
 
     def render(self, view, proj, centers, radii, directors, near, far,
-               line_verts=None, line_colors=None, fades=None, brights=None):
+               line_verts=None, line_colors=None, brights=None,
+               box_half=None, edge_band=1.0):
         """Render the beads (+ optional depth-occluded lines) into self.final_fbo.
         view/proj are row-major 4x4 numpy matrices (see view_matrix/proj_matrix).
-        `fades` (0 opaque .. 1 gone) and `brights` (albedo multiplier) are optional
-        per-bead arrays; default to fully-opaque, unit-brightness."""
+        `brights` (albedo multiplier) is an optional per-bead array. For a
+        periodic scene, pass `box_half=(hx, hy)` (world half-extents, box centered
+        at the origin): beads are then clipped to the box faces and softly faded
+        toward the background over `edge_band` inside each face -- all opaque, so
+        wrapped beads compose correctly with no transparency artifacts."""
         c = self.ctx
         vb, pb = _gl(view), _gl(proj)
         n = len(centers)
-        fades = np.zeros(n, "f4") if fades is None else np.asarray(fades, "f4")
+        centers = np.asarray(centers, "f4")
+        radii = np.asarray(radii, "f4")
+        directors = np.asarray(directors, "f4")
         brights = np.ones(n, "f4") if brights is None else np.asarray(brights, "f4")
-        n = self._upload_instances(np.asarray(centers, "f4"),
-                                   np.asarray(radii, "f4"),
-                                   np.asarray(directors, "f4"), fades, brights)
 
-        # --- geometry pass -> G-buffer ---
+        n_op = self._upload_instances(centers, radii, directors, brights)
+
+        # --- geometry pass -> G-buffer (all beads, opaque) ---
         self.geom_prog["view"].write(vb)
         self.geom_prog["proj"].write(pb)
+        # Periodic clipping + soft edge vignette (opaque). Off for non-periodic.
+        if box_half is not None:
+            self.geom_prog["viewInv"].write(_gl(np.linalg.inv(view)))
+            self.geom_prog["boxHalf"].value = (float(box_half[0]), float(box_half[1]))
+            self.geom_prog["edgeBand"].value = float(edge_band)
+            self.geom_prog["clipEnable"].value = 1.0
+        else:
+            self.geom_prog["clipEnable"].value = 0.0
         self.gbuffer.use()
         c.viewport = (0, 0, self.width, self.height)
         # Clear albedo/normal to 0 and pos.z to 0 (background), depth to 1.
@@ -528,7 +574,8 @@ class GLScene:
         c.enable(c.DEPTH_TEST)
         c.depth_func = "<"
         c.disable(c.BLEND)
-        self._geom_vao.render(mode=c.TRIANGLE_STRIP, instances=n)
+        if n_op:
+            self._geom_vao.render(mode=c.TRIANGLE_STRIP, instances=n_op)
 
         # --- SSAO -> ao_fbo ---
         self.ssao_prog["proj"].write(pb)

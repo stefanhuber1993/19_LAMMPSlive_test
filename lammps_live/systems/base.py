@@ -21,6 +21,10 @@ class SliderSpec:
     default: float
     fmt: str = "{:.3f}"
     unit: str = ""
+    # Optional "sweet spot" value to mark on the track (a distinct tick + "opt"
+    # label), so a user who has dragged a parameter around can find the paper's
+    # recommended setting again. None -> no optimum marker drawn.
+    optimum: float = None
     # Stable id for extra_sliders (see SystemSpec): the app passes this back to
     # MDSystem.set_extra_param so a system knows which live parameter changed.
     # Empty for the built-in temperature/damping sliders, which have dedicated
@@ -37,7 +41,6 @@ class ForceFeedbackProfile:
     gas is far weaker, and a single global knee/threshold would make one of
     them feel numb or pegged at max.
     """
-    input_force_scale: float   # eV/Angstrom at full joystick/mouse deflection
     ff_exaggeration: float     # amplifies small/medium contact forces before tanh soft-saturation
     ff_knee: float             # raw*exaggeration magnitude at the soft-saturation knee
     ff_max_mag: float = 120.0  # device-unit cap, comfortably inside the SDK's +-127 spring-offset range
@@ -63,6 +66,14 @@ class SystemSpec:
     melt_temp: float          # K -- approximate dial marker (see each system's docstring)
     force_feedback: ForceFeedbackProfile
     puller_speed_cap: float   # Angstrom/ps -- nve/limit-derived velocity ceiling, for velocity-damping scale
+    # The single maximum interactive force (eV/Angstrom in metal units, reduced
+    # units for the MesoMem systems) applied to the puller at full deflection of
+    # ANY input device -- joystick, WASD keyboard, or mouse all map their unit
+    # deflection through this same scale, so the three controls share one ceiling.
+    # This is the honest "how hard can I push" knob; it lives here on the system
+    # (not buried in the force-feedback profile) because it's a property of the
+    # interaction, independent of how forces are rendered back to the device.
+    max_input_force: float
     # Per-species rendering, for systems whose atoms aren't a single
     # indistinguishable species (see get_all_positions' `species`). None ->
     # every crystal atom drawn the same flat color (Cu, Ar). Otherwise an RGB
@@ -119,6 +130,12 @@ class SystemSpec:
     # slides across the periodic boundary instead of popping. 0 -> no wrap fade
     # (non-periodic scenes: the 7-bead patch).
     wrap_fade_fraction: float = 0.0
+    # Whether this system runs in the paper's reduced (LJ) units (sigma = eps =
+    # m = 1) rather than the default LAMMPS "metal" units. When True the panel
+    # readouts and plot axes drop the Kelvin/bar/eV/m-s labels (which would be
+    # physically meaningless here) and show the dimensionless reduced-unit
+    # quantities instead. Only the two MesoMem 3D systems set this.
+    reduced_units: bool = False
 
 
 class MDSystem(ABC):
@@ -191,9 +208,8 @@ class MDSystem(ABC):
         """Optional: explicit bonds to draw, as an (M, 2) int array of index
         pairs into the CURRENT get_all_positions ordering (so it must be called
         in the same frame, before stepping again). Used to draw molecular
-        backbones, e.g. each lipid's head-tail-tail chain, or the live covalent
-        network of the carbon sheet (which visibly tears as bonds break). None
-        (default) means the system has no explicit bonds to draw."""
+        backbones, e.g. each lipid's head-tail-tail chain. None (default) means
+        the system has no explicit bonds to draw."""
         return None
 
     def get_hbond_pairs(self):
@@ -208,8 +224,8 @@ class MDSystem(ABC):
         """Optional: a list of short strings drawn as a small live HUD in the
         simulation view (beneath the standard force/time readout), for
         per-system pedagogical state the fixed panel readouts don't cover --
-        e.g. the carbon demo's etched-atom / broken-bond tally, or the water
-        demo's phase and density-anomaly readout. Empty/None -> nothing drawn."""
+        e.g. the water demo's phase and density-anomaly readout. Empty/None ->
+        nothing drawn."""
         return None
 
     def get_potential_terms(self):
@@ -220,6 +236,24 @@ class MDSystem(ABC):
         additive structure of the potential is visible and updates live. Values
         are in the system's own energy units (reduced/LJ for MesoMem); scale is
         the bar half-range. None (default) -> nothing drawn."""
+        return None
+
+    def get_total_potential_terms(self):
+        """Optional: like get_potential_terms, but summed over the WHOLE system
+        rather than just the puller bead -- the total interaction energy in each
+        additive term of the force field (e.g. the MesoMem tilt / splay /
+        attraction terms across every bead pair). Returned in the same
+        (title, [(label, value), ...], scale) form so the renderer can draw it as
+        a second signed-bar panel beside the puller-bead breakdown. None (default)
+        -> nothing drawn."""
+        return None
+
+    def get_box_bounds_3d(self):
+        """Optional (3D): the simulation box to outline in the scene, as
+        (xlo, xhi, ylo, yhi, zlo, zhi) in world units, or None to draw no box.
+        The renderer draws its twelve edges as depth-cued white lines (occluded by
+        the beads) and hides the single edge nearest the camera so it doesn't
+        streak across the front of the scene."""
         return None
 
     def set_extra_param(self, key, value):
@@ -262,7 +296,7 @@ class MDSystem(ABC):
 
     def puller_bead_count(self):
         """Number of LAMMPS atoms the puller is made of: 1 for a single-atom
-        puller (Cu, Ar, NaCl, the etch O), or the molecule's bead count for a
+        puller (Cu, Ar, NaCl), or the molecule's bead count for a
         molecular puller (lipid = 3, water = 4). set_input_force applies its
         force to each of these atoms, so a caller wanting a specific NET force on
         the puller (e.g. the app's joystick MD-force cancellation) divides by

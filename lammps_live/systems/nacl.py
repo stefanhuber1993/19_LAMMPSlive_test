@@ -132,7 +132,6 @@ RDF_AVE_FREQ = RDF_AVE_EVERY * RDF_AVE_REPEAT
 # much softer profile -- with a touch more input authority to work against the
 # strong electrostatic pull.
 FORCE_FEEDBACK = ForceFeedbackProfile(
-    input_force_scale=3.0,
     ff_exaggeration=4.0,
     ff_knee=1.5,
     ff_max_mag=120.0,
@@ -155,6 +154,7 @@ SPEC = SystemSpec(
                         PULLER_DAMPING_DEFAULT, fmt="{:.4f}"),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
+    max_input_force=3.0,   # eV/A at full deflection, shared by joystick/WASD/mouse
     puller_speed_cap=0.05 * LATTICE_SPACING / TIMESTEP,
     species_colors=(NACL_CATION_COLOR, NACL_ANION_COLOR),  # 0=Na+, 1=Cl-
     species_labels=("+", "-"),

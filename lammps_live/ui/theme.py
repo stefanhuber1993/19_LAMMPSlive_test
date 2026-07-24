@@ -16,6 +16,10 @@ SLIDER_TRACK = (70, 70, 80)
 SLIDER_HANDLE = (230, 230, 235)
 SLIDER_HANDLE_ACTIVE = (255, 210, 90)
 MELT_MARK_COLOR = (255, 110, 90)
+# Marker for a slider's recommended "optimum" value (the paper's sweet spot),
+# drawn as a distinct tick + "opt" label so it reads differently from the red
+# melt marker on the temperature slider.
+OPTIMUM_MARK_COLOR = (120, 230, 170)
 
 # Faint "bond" lines between atom pairs, with opacity encoding how close their
 # separation is to the system's equilibrium nearest-neighbor spacing
@@ -138,6 +142,10 @@ POTENTIAL_TRACK_COLOR = (58, 62, 76)
 # Membrane bead fill and the bright stick backbone linking neighbors in 3D.
 MEMBRANE_BEAD_COLOR = (232, 104, 98)
 BOND_3D_COLOR = (150, 96, 92)
+# The simulation-box outline drawn around the 3D scenes: white, faded by depth
+# cueing like everything else so far edges recede into the background.
+BOX_3D_COLOR = (240, 240, 245)
+BOX_3D_ALPHA = 150   # out of 255; the box is a subtle frame, not a hard cage
 # Paper (MesoMem) bead coloring: each bead is a little sphere whose POLES (along
 # its director n_i) are hydrophilic -> blue, and whose EQUATOR (perpendicular to
 # n_i) is hydrophobic -> yellow. The yellow band therefore tilts with the
@@ -150,13 +158,15 @@ BEAD_BAND_HALFWIDTH = 0.30
 BEAD_BAND_SOFT = 0.07
 # One pole (the +director pole) is over-painted WHITE, so which way a bead's
 # director points is unambiguous (the two normals +n / -n no longer look
-# identical). The cap covers the director hemisphere from the pole down to
-# roughly 80% latitude: white where the SIGNED cos-latitude s = N.n exceeds
-# BEAD_WHITE_POLE_MIN, with a BEAD_WHITE_POLE_SOFT transition. Only s > 0 (the
-# +n hemisphere) is affected, so the opposite pole keeps the blue/yellow banding.
+# identical). The cap is a small dot right at the pole: white where the SIGNED
+# cos-latitude s = N.n exceeds BEAD_WHITE_POLE_MIN, with a BEAD_WHITE_POLE_SOFT
+# transition. The projected on-screen diameter of the cap scales as sqrt(1 -
+# MIN^2), so MIN = 0.954 (sin = 0.30) makes it half the diameter of the older
+# MIN = 0.80 (sin = 0.60) dot. Only s > 0 (the +n hemisphere) is affected, so
+# the opposite pole keeps the blue/yellow banding.
 BEAD_WHITE_POLE_COLOR = (245, 246, 250)
-BEAD_WHITE_POLE_MIN = 0.80
-BEAD_WHITE_POLE_SOFT = 0.06
+BEAD_WHITE_POLE_MIN = 0.954
+BEAD_WHITE_POLE_SOFT = 0.03
 
 PANEL_WIDTH = 480
 PANEL_PAD = 14

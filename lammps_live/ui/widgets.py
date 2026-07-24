@@ -3,26 +3,32 @@ import math
 
 import pygame
 
-from .theme import MELT_MARK_COLOR, SLIDER_HANDLE, SLIDER_HANDLE_ACTIVE, SLIDER_TRACK, TEXT_COLOR
+from .theme import (
+    MELT_MARK_COLOR, OPTIMUM_MARK_COLOR, SLIDER_HANDLE, SLIDER_HANDLE_ACTIVE,
+    SLIDER_TRACK, TEXT_COLOR,
+)
 
 
 class Slider:
     """Horizontal, mouse-draggable value slider. Geometry-only + drag state
     -- callers own the semantics of what the value drives."""
 
-    def __init__(self, rect, vmin, vmax, value, label, fmt="{:.3f}", unit=""):
+    def __init__(self, rect, vmin, vmax, value, label, fmt="{:.3f}", unit="",
+                 optimum=None):
         self.rect = pygame.Rect(rect)
         self.vmin, self.vmax = vmin, vmax
         self.value = max(vmin, min(vmax, value))
         self.label = label
         self.fmt = fmt
         self.unit = unit
+        self.optimum = optimum
         self.dragging = False
 
     @classmethod
     def from_spec(cls, rect, spec):
         """Build from a systems.base.SliderSpec."""
-        return cls(rect, spec.vmin, spec.vmax, spec.default, spec.label, fmt=spec.fmt, unit=spec.unit)
+        return cls(rect, spec.vmin, spec.vmax, spec.default, spec.label,
+                   fmt=spec.fmt, unit=spec.unit, optimum=spec.optimum)
 
     def reset(self, spec):
         """Re-apply a (possibly different, on system switch) SliderSpec's
@@ -33,6 +39,7 @@ class Slider:
         self.label = spec.label
         self.fmt = spec.fmt
         self.unit = spec.unit
+        self.optimum = spec.optimum
         self.dragging = False
 
     def _frac(self):
@@ -67,9 +74,20 @@ class Slider:
     def nudge(self, delta):
         self.value = max(self.vmin, min(self.vmax, self.value + delta))
 
+    def _mark_x(self, value):
+        return self.rect.x + (value - self.vmin) / (self.vmax - self.vmin) * self.rect.width
+
     def draw(self, screen, font, mark_value=None, mark_label=None):
         pygame.draw.line(screen, SLIDER_TRACK, (self.rect.x, self.rect.centery),
                           (self.rect.right, self.rect.centery), 4)
+        # Recommended-value ("optimum") marker: a distinct-colored tick with an
+        # "opt" caption below, so the paper's sweet spot is easy to find again.
+        if self.optimum is not None and self.vmax > self.vmin:
+            ox = self._mark_x(self.optimum)
+            pygame.draw.line(screen, OPTIMUM_MARK_COLOR, (ox, self.rect.top - 3),
+                             (ox, self.rect.bottom + 3), 2)
+            cap = font.render("opt", True, OPTIMUM_MARK_COLOR)
+            screen.blit(cap, (ox - cap.get_width() / 2, self.rect.bottom + 4))
         if mark_value is not None:
             mx = self.rect.x + (mark_value - self.vmin) / (self.vmax - self.vmin) * self.rect.width
             pygame.draw.line(screen, MELT_MARK_COLOR, (mx, self.rect.top - 3), (mx, self.rect.bottom + 3), 2)

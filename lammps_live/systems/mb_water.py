@@ -109,7 +109,6 @@ SP_CORE, SP_TIP = 0, 1
 # Hydrogen-bond forces are soft (like the lipid membrane's), so an argon-like
 # gentle force-feedback profile with enough authority to push a molecule in.
 FORCE_FEEDBACK = ForceFeedbackProfile(
-    input_force_scale=2.0,
     ff_exaggeration=4.0,
     ff_knee=0.3,
     ff_max_mag=120.0,
@@ -132,6 +131,7 @@ SPEC = SystemSpec(
                         PULLER_DAMPING_DEFAULT, fmt="{:.3f}"),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
+    max_input_force=2.0,   # eV/A at full deflection, shared by joystick/WASD/mouse
     puller_speed_cap=0.1 * ICE_BOND / TIMESTEP,
     species_colors=(CORE_COLOR, ARM_COLOR),
     species_radii_A=(1.05, 0.5),

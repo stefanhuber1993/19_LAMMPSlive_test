@@ -131,7 +131,6 @@ TAIL_COLOR = (200, 190, 120)
 # profile is argon-like rather than copper's stiff one -- with enough input
 # authority to push a lipid into the membrane.
 FORCE_FEEDBACK = ForceFeedbackProfile(
-    input_force_scale=0.7,
     ff_exaggeration=4.0,
     ff_knee=0.3,
     ff_max_mag=120.0,
@@ -154,6 +153,7 @@ SPEC = SystemSpec(
                         PULLER_DAMPING_DEFAULT, fmt="{:.3f}"),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
+    max_input_force=0.7,   # eV/A at full deflection, shared by joystick/WASD/mouse
     puller_speed_cap=0.03 * SIGMA / TIMESTEP,   # matches the retuned, calmer top speed
     species_colors=(HEAD_COLOR, TAIL_COLOR),  # 0=head, 1=tail
     species_labels=None,

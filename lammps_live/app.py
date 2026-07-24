@@ -264,7 +264,7 @@ class App:
         else:
             jx, jy = self.source.poll()
             yaw = self.source.poll_yaw()
-        input_fx, input_fy = jx * ff_profile.input_force_scale, jy * ff_profile.input_force_scale
+        input_fx, input_fy = jx * spec.max_input_force, jy * spec.max_input_force
         # Joystick is a force-feedback loop: the puller is driven mainly by the
         # stick's input force, with the MD interaction force reaching it partly
         # *indirectly* -- it's rendered on the stick (force feedback, below), the
@@ -349,8 +349,10 @@ class App:
                 "camera": self.camera3d,
                 "control_grid": self.system.get_control_grid(),
                 "potential_terms": self.system.get_potential_terms(),
+                "total_potential_terms": self.system.get_total_potential_terms(),
                 "torque_signals": self.system.get_torque_signals(),
                 "brightness": self.system.get_bead_brightness(),
+                "box_bounds": self.system.get_box_bounds_3d(),
             }
 
         t_render_start = perf_counter()

@@ -37,7 +37,6 @@ switchable *while the demo is running* -- press `1`/`2`/... or `Tab`:
 | `cu_eam` | Copper deposition (EAM) | real Cu EAM (`Cu_u3.eam`) | strong metallic bonding, high melting range (dial goes to 6000 K) |
 | `lj_argon` | Argon melting (Lennard-Jones) | generic `lj/cut`, real argon parameters | much softer/weaker, melts near 84 K (argon's real melting point) |
 | `nacl` | Salt crystal (ionic, NaCl) | Born-Mayer + damped shifted-force Coulomb (`born/coul/dsf`) | alternating Na(+)/Cl(-) ions (labeled `+`/`-`, drawn at their real size ratio) on a checkerboard square lattice -- the bipartite, 2D-stable ionic arrangement -- bound by Coulomb (Madelung) attraction |
-| `carbon_etch` | Covalent carbon etch (O bombardment) | reactive bond-order carbon (`rebo`, CH.rebo) + strong Morse C-O overlay | a 2D covalent carbon sheet (graphene, the honest 2D "diamond"): open 3-fold honeycomb, very high melting mark. Drive a reactive **oxygen** (the puller) in, snap directional covalent bonds (they tear visibly, leaving glowing dangling-bond sites) and etch carbons off as **CO** -- a live CO / broken-bond tally, with etch pits that persist and a fresh O sent in each time |
 | `lipid` | Lipid membrane (coarse-grained) | soft repulsion + cosine-squared tail attraction (`cosine/squared`), harmonic bonds/angles, Langevin implicit solvent | a solvent-free 2D lipid bilayer of 3-bead amphiphiles (head + 2 tails); the puller is a lipid you also **orient** (joystick yaw / Q-E) to insert into the membrane. Inspired by the MesoMem model (Sillano, Marrink & Idema 2026); see the module docstring |
 | `mb_water` | Mercedes-Benz water (ice floats) | rigid 3-arm molecules (`fix rigid/small` + Langevin), directional hydrogen bond via `cosine/squared` arm-tip well | the 2D Mercedes-Benz water model (Ben-Naim 1971): each molecule is an O with three 120-degree hydrogen-bonding arms. Starts as the open hydrogen-bonded honeycomb **ice**; heat it and the network **collapses to denser liquid** -- water's freezing-expansion anomaly (why ice floats), with a live O-O spacing / density readout. The puller is a water molecule you also **orient** (joystick yaw / Q-E) to line its arms up and catch hydrogen bonds |
 | `mesomem` | MesoMem membrane patch (**3D**) | the **real** MesoMem pair-style (`mesomem`, Sillano, Marrink & Idema 2026): 4-2 soft core + cosine-squared attraction + orientation-dependent **tilt** and **splay** terms on oriented (dipole) beads | a 3D, perspective-rendered 7-bead membrane patch (hexagon + center). Each bead is a bilayer patch carrying a director (the yellow spike + the white-capped pole). Pull the **center bead** out of the sheet along the on-screen **net** (a plane perpendicular to the membrane) and feel tilt/splay resist through force feedback. Unlike `lipid` (which mimics MesoMem with stock styles), this loads the authors' actual C++ pair-style as a runtime LAMMPS plugin -- see below |
@@ -153,8 +152,8 @@ If you'd rather not install the package, `pip install -r requirements.txt`
 and run `python3 -m lammps_live` instead -- both work identically.
 
 Nothing else has to be downloaded by hand. The copper EAM potential
-(`Cu_u3.eam`) is bundled in this repo (`lammps_live/systems/data/`), `CH.rebo`
-comes from the `lammps` wheel, and the MesoMem C++ force field is vendored here
+(`Cu_u3.eam`) is bundled in this repo (`lammps_live/systems/data/`), and the
+MesoMem C++ force field is vendored here
 and **compiled automatically the first time you open a 3D system** (`mesomem` /
 `membrane`) -- a one-time ~10 s build, cached next to its sources and rebuilt
 only when they change. The Sidewinder joystick driver is the one thing fetched
@@ -268,14 +267,13 @@ lammps_live/
     cu_deposition.py  copper EAM system
     lj_argon.py       argon Lennard-Jones system
     nacl.py           ionic NaCl (Born-Mayer + DSF Coulomb) system
-    diamond_etch.py   covalent carbon (REBO) + reactive-O etch system
     lipid_membrane.py coarse-grained lipid bilayer system
     mb_water.py       2D Mercedes-Benz water (rigid 3-arm, hydrogen bonds) system
     mesomem_hex.py    3D MesoMem 7-bead membrane patch (real pair-style)
     mesomem_sheet.py  3D MesoMem ~900-bead periodic membrane sheet
     rdf2d.py          in-plane radial distribution function (shared by the 3D systems)
     mesomem_ff/       vendored MesoMem C++ pair-style + the runtime plugin builder
-    data/             bundled potential files (Cu_u3.eam; CH.rebo ships with LAMMPS)
+    data/             bundled potential files (Cu_u3.eam)
   input/
     base.py     InputSource interface
     mouse.py    mouse control
@@ -309,10 +307,11 @@ minimum:
    csvr velocity-rescaling thermostat + RDF), just with different pair
    styles/constants.
 2. Define a module-level `SystemSpec` (temperature/damping slider ranges,
-   melt-temp dial mark, and a `ForceFeedbackProfile` scaled to your
+   melt-temp dial mark, a `max_input_force` -- the single force ceiling every
+   input device shares -- and a `ForceFeedbackProfile` scaled to your
    potential's characteristic force magnitude -- see the comments on
-   `ForceFeedbackProfile` in `base.py` for why this needs tuning per
-   system) and set it as the class's `spec` attribute.
+   `max_input_force` and `ForceFeedbackProfile` in `base.py` for why these need
+   tuning per system) and set it as the class's `spec` attribute.
 3. Register it in `lammps_live/systems/__init__.py`'s `REGISTRY` dict.
 
 Nothing in `app.py`, `forcefeedback.py`, or `ui/` needs to change -- they
