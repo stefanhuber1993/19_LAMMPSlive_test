@@ -35,7 +35,7 @@ class App:
         # the header line built from them -- shown only under --debug. The line is
         # built from the PREVIOUS frame (a frame's own render time isn't known
         # until after it's drawn), which is fine for a running average.
-        self._prof_ms = {"sim": 0.0, "render": 0.0, "other": 0.0}
+        self._prof_ms = {"sim": 0.0, "read": 0.0, "ff": 0.0, "render": 0.0, "other": 0.0}
         self._debug_line = None
         self.systems = list_systems()  # [(key, SystemSpec), ...], stable order for the picker/number keys
 
@@ -71,6 +71,10 @@ class App:
         self.damping_slider = None
         self.extra_sliders = []
         self.extra_slider_keys = []
+        # Whether the collapsible "Advanced" slider group is expanded. Toggled by
+        # clicking its header (see _handle_events); pushed to the renderer each
+        # frame so draw_panel knows whether to draw the advanced sliders.
+        self.show_advanced = False
         self.history = None
         self.atom_trails = None
         self._trail_frame_counter = 0
@@ -78,6 +82,11 @@ class App:
         self.sim_wall_time = 0.0
         self.steps_per_frame = 1
         self.total_steps = 0
+        # Playback state for systems driven by Play/Pause/Reset buttons (the
+        # self-assembly system): only stepped while playing. Ignored by the
+        # interactive puller systems, which always step. Set per-system in
+        # _build_system (playback systems start paused on their fresh state).
+        self.sim_playing = False
 
         self.system_key = None
         self.system = None
@@ -175,6 +184,9 @@ class App:
         self.energy_baseline = None
         self.sim_wall_time = 0.0
         self.total_steps = 0
+        # Playback systems start paused, showing their fresh initial state until
+        # the user presses Play; puller systems ignore this flag and always step.
+        self.sim_playing = False
 
         self.ff_smoother.reset()
         self.interaction_smoother.reset()
@@ -186,6 +198,28 @@ class App:
         keys = [key for key, _ in self.systems]
         idx = keys.index(self.system_key)
         self._build_system(keys[(idx + step) % len(keys)])
+
+    def _reset_simulation(self):
+        """Restart a playback system from a fresh initial state (e.g. re-randomize
+        the self-assembly box), keeping the current slider values, and clear the
+        derived per-run state (plots, trails, energy baseline, step count). Leaves
+        the run paused so the fresh state is visible before Play is pressed."""
+        self.system.reset()
+        self.history.reset()
+        self.atom_trails.reset()
+        self._trail_frame_counter = 0
+        self.energy_baseline = None
+        self.total_steps = 0
+        self.sim_playing = False
+
+    def _playback_action(self, name):
+        """Apply a Play/Pause/Reset button (or its keyboard shortcut)."""
+        if name == "play":
+            self.sim_playing = True
+        elif name == "pause":
+            self.sim_playing = False
+        elif name == "reset":
+            self._reset_simulation()
 
     def run(self):
         dt = 1.0 / 60  # seconds; seed value, replaced by the real measured frame time below
@@ -215,6 +249,10 @@ class App:
                     self._toggle_fullscreen()
                 elif event.key == pygame.K_TAB:
                     self._cycle_system(1)
+                elif event.key == pygame.K_SPACE and self.system.spec.playback_controls:
+                    self.sim_playing = not self.sim_playing
+                elif event.key == pygame.K_r and self.system.spec.playback_controls:
+                    self._reset_simulation()
                 elif pygame.K_1 <= event.key <= pygame.K_9:
                     idx = event.key - pygame.K_1
                     if idx < len(self.systems):
@@ -228,9 +266,37 @@ class App:
                 step = self.temp_slider.vmax - self.temp_slider.vmin
                 self.temp_slider.nudge(event.y * config.TEMP_WHEEL_STEP_FRACTION * step)
             else:
+                # A click on a Play/Pause/Reset button (playback systems) is
+                # routed to the playback action and consumes the event, so it
+                # never falls through to slider/puller handling below.
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    name = self.renderer.playback_hit(event.pos)
+                    if name is not None:
+                        self._playback_action(name)
+                        continue
+                # A click on the "Advanced" header flips the group open/closed.
+                # When collapsing, cancel any in-progress drag on a now-hidden
+                # slider so it can't stay stuck "dragging" (which would keep the
+                # puller input suppressed).
+                toggle = self.renderer.advanced_toggle_rect
+                if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                        and toggle is not None and toggle.collidepoint(event.pos)):
+                    self.show_advanced = not self.show_advanced
+                    if not self.show_advanced:
+                        for s in self.extra_sliders:
+                            if s.advanced:
+                                s.dragging = False
+                        if self.damping_slider.advanced:
+                            self.damping_slider.dragging = False
+                    continue
                 self.temp_slider.handle_event(event)
-                self.damping_slider.handle_event(event)
+                # Hidden advanced sliders don't receive events (their rects are
+                # parked off-screen while collapsed anyway).
+                if not (self.damping_slider.advanced and not self.show_advanced):
+                    self.damping_slider.handle_event(event)
                 for s in self.extra_sliders:
+                    if s.advanced and not self.show_advanced:
+                        continue
                     s.handle_event(event)
 
         keys = pygame.key.get_pressed()
@@ -258,12 +324,19 @@ class App:
         # instead of letting a slider drag yank the atom.
         ui_capturing_mouse = (self.temp_slider.dragging or self.damping_slider.dragging
                               or any(s.dragging for s in self.extra_sliders))
+        # Device I/O is split into two debug fields, since on the joystick both are
+        # blocking HID traffic that belongs in neither sim nor "other": "read" is
+        # the stick poll here, "ff" is the force-feedback writes further down.
+        read_seconds = 0.0
+        ff_seconds = 0.0
+        t_in = perf_counter()
         if self.input_mode == "mouse" and ui_capturing_mouse:
             jx, jy = 0.0, 0.0
             yaw = 0.0
         else:
             jx, jy = self.source.poll()
             yaw = self.source.poll_yaw()
+        read_seconds += perf_counter() - t_in
         input_fx, input_fy = jx * spec.max_input_force, jy * spec.max_input_force
         # Joystick is a force-feedback loop: the puller is driven mainly by the
         # stick's input force, with the MD interaction force reaching it partly
@@ -287,9 +360,13 @@ class App:
         self.system.steer_orientation(yaw, dt)
 
         t_sim_start = perf_counter()
-        self.system.step(self.steps_per_frame)
+        # Playback systems (Play/Pause/Reset) step only while playing; every
+        # interactive puller system always steps.
+        should_step = self.sim_playing if spec.playback_controls else True
+        if should_step:
+            self.system.step(self.steps_per_frame)
+            self.total_steps += self.steps_per_frame
         sim_seconds = perf_counter() - t_sim_start
-        self.total_steps += self.steps_per_frame
 
         pos, vel = self.system.get_puller_state()
         interaction_force = self.system.get_interaction_force()
@@ -309,10 +386,12 @@ class App:
             interaction_force[0], interaction_force[1], dt
         )
         stiffness = shape_stiffness(smooth_ifx, smooth_ify, ff_profile, SPRING_STIFFNESS_MAX)
+        t_in = perf_counter()
         self.source.send_force(smooth_fx, smooth_fy, stiffness)
         self.source.set_damper_coefficient(
             shape_damper_coefficient(smooth_ifx, smooth_ify, ff_profile, DAMPER_COEFFICIENT_MAX)
         )
+        ff_seconds += perf_counter() - t_in
 
         temp, press, ke, pe, etotal = self.system.get_thermo_state()
         puller_ke, puller_pe = self.system.get_puller_energy()
@@ -324,7 +403,9 @@ class App:
         t_min = spec.temperature.vmin
         t_max = spec.temperature.vmax
         heat_fraction = max(0.0, min(1.0, (temp - t_min) / (t_max - t_min)))
+        t_in = perf_counter()
         self.source.update_jitter(heat_fraction)
+        ff_seconds += perf_counter() - t_in
         rdf = self.system.get_rdf()
 
         sim_time_ps = self.system.get_sim_time()
@@ -356,6 +437,7 @@ class App:
             }
 
         t_render_start = perf_counter()
+        self.renderer.show_advanced = self.show_advanced
         self.renderer.draw(
             positions, is_puller, pos,
             (input_fx, input_fy), interaction_force, self.clock.get_fps(),
@@ -368,30 +450,38 @@ class App:
             hbond_pairs=hbond_pairs, hud_lines=hud_lines, scene_3d=scene_3d,
             total_steps=self.total_steps, steps_per_frame=self.steps_per_frame,
             debug_line=self._debug_line,
+            playback_playing=(self.sim_playing if spec.playback_controls else None),
         )
         if self.debug:
             render_seconds = perf_counter() - t_render_start
-            self._update_debug(perf_counter() - t_frame_start, sim_seconds, render_seconds)
+            self._update_debug(perf_counter() - t_frame_start, sim_seconds,
+                               render_seconds, read_seconds, ff_seconds)
 
         new_dt = self.clock.tick(60) / 1000.0
         self.sim_wall_time += new_dt
         return new_dt
 
-    def _update_debug(self, work_seconds, sim_seconds, render_seconds):
+    def _update_debug(self, work_seconds, sim_seconds, render_seconds,
+                      read_seconds, ff_seconds):
         """Fold this frame's timings into the smoothed breakdown and rebuild the
         header line for the next frame. 'work' is everything the app does per
-        frame except the fps-cap sleep; 'other' is the remainder after sim and
-        render -- input polling, force shaping, and the per-frame readouts
+        frame except the fps-cap sleep. The device I/O is split into 'read' (the
+        stick poll) and 'ff' (the force-feedback writes), both broken out because
+        on the joystick they are blocking HID traffic; 'other' is the remainder
+        after sim, render, read and ff -- force shaping and the per-frame readouts
         (positions, RDF, potential terms)."""
-        other_seconds = max(0.0, work_seconds - sim_seconds - render_seconds)
+        other_seconds = max(0.0, work_seconds - sim_seconds - render_seconds
+                            - read_seconds - ff_seconds)
         alpha = 0.1   # EMA weight -- steady enough to read, quick enough to track
-        for name, secs in (("sim", sim_seconds), ("render", render_seconds), ("other", other_seconds)):
+        for name, secs in (("sim", sim_seconds), ("read", read_seconds),
+                           ("ff", ff_seconds), ("render", render_seconds),
+                           ("other", other_seconds)):
             self._prof_ms[name] += alpha * (secs * 1000.0 - self._prof_ms[name])
         total = sum(self._prof_ms.values()) or 1e-9
         def part(name):
             ms = self._prof_ms[name]
             return f"{name} {100.0 * ms / total:2.0f}% ({ms:4.1f}ms)"
         self._debug_line = (
-            f"DEBUG  {part('sim')}   {part('render')}   {part('other')}   "
-            f"frame {total:4.1f}ms"
+            f"DEBUG  {part('sim')}   {part('read')}   {part('ff')}   "
+            f"{part('render')}   {part('other')}   frame {total:4.1f}ms"
         )

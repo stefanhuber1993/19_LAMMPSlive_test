@@ -72,6 +72,7 @@ PairMesoMem::~PairMesoMem()
     memory->destroy(weight_rcut);
     memory->destroy(zeta);
     memory->destroy(c0);
+    memory->destroy(splay_symmetry);
 
   }
 }
@@ -96,6 +97,7 @@ void PairMesoMem::allocate()
   memory->create(weight_rcut, np1, np1, "pair:weight_rcut");
   memory->create(zeta, np1, np1, "pair:zeta");
   memory->create(c0, np1, np1, "pair:c0"); // Allocate c0 array
+  memory->create(splay_symmetry, np1, np1, "pair:splay_symmetry");
 
 }
 
@@ -123,12 +125,16 @@ void PairMesoMem::settings(int narg, char **arg)
 
 /* ----------------------------------------------------------------------
    Set coefficients for one or more type pairs
-   Args: sigma, eps, ktilt, ksplay, cut, weight_rcut, zeta
+   Args: sigma, eps, ktilt, ksplay, cut, weight_rcut, zeta, c0, [splay_symmetry]
+
+   The trailing splay_symmetry argument is optional (0..1, default 0.0) so that
+   existing 10-argument callers keep the original signed-splay behaviour; see
+   compute() for what the parameter does.
 ------------------------------------------------------------------------- */
 
 void PairMesoMem::coeff(int narg, char **arg)
 {
-  if (narg != 10) error->all(FLERR, "Incorrect args for pair coefficients");
+  if (narg != 10 && narg != 11) error->all(FLERR, "Incorrect args for pair coefficients");
   if (!allocated) allocate();
 
   int ilo, ihi, jlo, jhi;
@@ -142,7 +148,10 @@ void PairMesoMem::coeff(int narg, char **arg)
   double cut_one = utils::numeric(FLERR, arg[6], false, lmp);
   double weight_rcut_one = utils::numeric(FLERR, arg[7], false, lmp);
   double zeta_one = utils::numeric(FLERR, arg[8], false, lmp);
-  double c0_one = utils::numeric(FLERR, arg[9], false, lmp); // New arg
+  double c0_one = utils::numeric(FLERR, arg[9], false, lmp); // spontaneous curvature
+  // Optional 11th arg: splay symmetry weight (0 -> signed dot product, the
+  // original form; 1 -> |dot product|). Defaults to 0 for 10-arg callers.
+  double splay_sym_one = (narg == 11) ? utils::numeric(FLERR, arg[10], false, lmp) : 0.0;
 
 
   if (weight_rcut_one > cut_one || weight_rcut_one > cut_global) {
@@ -160,6 +169,7 @@ void PairMesoMem::coeff(int narg, char **arg)
       weight_rcut[i][j] = weight_rcut_one;
       zeta[i][j] = zeta_one;
       c0[i][j] = c0_one; // Store c0
+      splay_symmetry[i][j] = splay_sym_one;
 
 
       setflag[i][j] = 1;
@@ -201,6 +211,7 @@ double PairMesoMem::init_one(int i, int j)
   zeta[j][i] = zeta[i][j];
   cut[j][i] = cut[i][j];
   c0[j][i] = c0[i][j]; // Copy c0
+  splay_symmetry[j][i] = splay_symmetry[i][j];
 
   return cut[i][j];
 }
@@ -403,14 +414,45 @@ void PairMesoMem::compute(int eflag, int vflag)
 
 
             // --- E. Splay Calculation ---
+            //
+            // Splay penalises neighbouring directors that are not aligned. In the
+            // original form the penalty is built on the SIGNED dot product
+            //   ninj = ni . nj,
+            // driving (ninj - 1) -> 0, i.e. it rewards ni == nj (parallel) and
+            // maximally penalises ni == -nj (antiparallel). A membrane where the
+            // two leaflets' normals point opposite ways is therefore punished.
+            //
+            // splay_symmetry s in [0,1] smoothly makes the term blind to that
+            // sign by blending toward the ABSOLUTE (normed) dot product:
+            //   ninj_eff = (1 - s) * ninj + s * |ninj|.
+            // At s = 0 this is exactly the original ninj (nothing changes). At
+            // s = 1 the penalty is built on |ninj|, so parallel AND antiparallel
+            // directors both sit at the energy minimum -- the system no longer
+            // cares which way a director points, only that it lies along the same
+            // axis as its neighbours. Intermediate s interpolates continuously.
+            //
+            // The blend is applied to the recurring "deviation" expression
+            //   dev = ninj_eff - 1 + 2*sin(alpha/2)^2   (the last term is the c0
+            // spontaneous-curvature offset, sign-independent). Because
+            //   d(ninj_eff)/d(ninj) = (1 - s) + s * sign(ninj) =: dsym,
+            // every director gradient (the splay torque) picks up the factor dsym,
+            // while the purely radial c0 contribution -- which comes from the
+            // sin(alpha/2)^2 term, not from ninj -- is unchanged.
             double ks = ksplay[itype][jtype];
+            double ss = splay_symmetry[itype][jtype];
+
+            double abs_ninj = fabs(ninj);
+            double ninj_eff = (1.0 - ss) * ninj + ss * abs_ninj;
+            double sgn_ninj = (ninj >= 0.0) ? 1.0 : -1.0;
+            double dsym = (1.0 - ss) + ss * sgn_ninj;   // d(ninj_eff)/d(ninj)
 
             double ni_x_nj[3];
             ni_x_nj[0] = ni[1]*nj[2] - ni[2]*nj[1];
             ni_x_nj[1] = ni[2]*nj[0] - ni[0]*nj[2];
             ni_x_nj[2] = ni[0]*nj[1] - ni[1]*nj[0];
 
-            double Usplay = 0.5 * ks * (ninj - 1.0 + 2.0 * (sin_a2*sin_a2))*(ninj - 1.0 + 2.0 * (sin_a2*sin_a2));
+            double splay_dev = ninj_eff - 1.0 + 2.0 * (sin_a2 * sin_a2);
+            double Usplay = 0.5 * ks * splay_dev * splay_dev;
 
             // --- F. Radial Correction (Energy Conservation) ---
             // This force is purely radial (along rhat) and repulsive
@@ -442,7 +484,9 @@ void PairMesoMem::compute(int eflag, int vflag)
               fz += w * f_rad_tilt * rhat[2];
 
             // --- Radial part coming from splay term ---
-              double f_rad_splay = - ks * (ninj - 1.0 + 2 * sin_a2 * sin_a2) * (c0[itype][jtype] * c0[itype][jtype] * r);
+            // r-derivative of Usplay through sin(alpha/2) = 0.5*r*c0 only, so it
+            // uses splay_dev but NOT dsym (the symmetry blend touches ninj, not r).
+              double f_rad_splay = - ks * splay_dev * (c0[itype][jtype] * c0[itype][jtype] * r);
               fx += w * f_rad_splay * rhat[0];
               fy += w * f_rad_splay * rhat[1];
               fz += w * f_rad_splay * rhat[2];
@@ -451,8 +495,9 @@ void PairMesoMem::compute(int eflag, int vflag)
 
 
             // --- G. Torques ---
-            // Torque on I
-            double splay_pref = ks * (ninj - 1.0 + 2 * sin_a2 * sin_a2);
+            // Torque on I. dsym carries the splay-symmetry blend into the
+            // director gradient: d(Usplay)/d(ninj) = ks * splay_dev * dsym.
+            double splay_pref = ks * splay_dev * dsym;
 
             tx += w * (kt * diff_i * rh_x_ni[0] + splay_pref * ni_x_nj[0]);
             ty += w * (kt * diff_i * rh_x_ni[1] + splay_pref * ni_x_nj[1]);
@@ -542,6 +587,7 @@ void PairMesoMem::write_restart(FILE *fp)
         fwrite(&weight_rcut[i][j], sizeof(double), 1, fp);
         fwrite(&zeta[i][j], sizeof(double), 1, fp);
         fwrite(&c0[i][j], sizeof(double), 1, fp); // Write c0
+        fwrite(&splay_symmetry[i][j], sizeof(double), 1, fp);
 
       }
     }
@@ -572,6 +618,7 @@ void PairMesoMem::read_restart(FILE *fp)
           utils::sfread(FLERR, &weight_rcut[i][j], sizeof(double), 1, fp, nullptr, error);
           utils::sfread(FLERR, &zeta[i][j], sizeof(double), 1, fp, nullptr, error);
           utils::sfread(FLERR, &c0[i][j], sizeof(double), 1, fp, nullptr, error); // Read c0
+          utils::sfread(FLERR, &splay_symmetry[i][j], sizeof(double), 1, fp, nullptr, error);
 
         }
 
@@ -582,6 +629,7 @@ void PairMesoMem::read_restart(FILE *fp)
         MPI_Bcast(&cut[i][j], 1, MPI_DOUBLE, 0, world);
         MPI_Bcast(&weight_rcut[i][j], 1, MPI_DOUBLE, 0, world);
         MPI_Bcast(&zeta[i][j], 1, MPI_DOUBLE, 0, world);
+        MPI_Bcast(&splay_symmetry[i][j], 1, MPI_DOUBLE, 0, world);
 
       }
     }

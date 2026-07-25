@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The Energy Ladder of Molecular Dynamics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#080b16;
+    --ink2:#0d1222;
+    --paper:#e8ecf5;
+    --muted:#8891a8;
+    --teal:#3ad6c4;
+    --amber:#f3b83e;
+    --orange:#f26a3d;
+    --magenta:#e364d6;
+    --grid:#1a2136;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--ink);color:var(--paper);
+    font-family:"IBM Plex Sans",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1120px;margin:0 auto;padding:16px;}
+  svg{width:100%;height:auto;display:block;
+    background:
+      radial-gradient(1200px 700px at 50% 0%, #121a30 0%, var(--ink) 60%);
+    border:1px solid #1b2438;border-radius:14px;}
+  .cap{max-width:1120px;margin:14px auto 40px;padding:0 20px;
+    color:var(--muted);font-size:14px;line-height:1.6;}
+  .cap b{color:var(--paper);font-weight:600;}
+  @media print{ html,body{background:#fff;color:#000;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <svg id="chart" viewBox="0 0 1120 1460" role="img"
+       aria-label="Logarithmic energy-level diagram of molecular dynamics processes"></svg>
+</div>
+<p class="cap">
+  Every energy shown as a level on a logarithmic scale, read out in three units at once.
+  The single fact that unlocks the picture: <b>1&nbsp;eV&nbsp;&asymp;&nbsp;40&nbsp;kT</b> at room temperature.
+  Biology works within a handful of kT of the thermal floor, so it is soft and reversible.
+  A covalent bond sits ~140&nbsp;kT up, effectively permanent at 300&nbsp;K. Ion beams reach
+  10&sup3; to 10&#8310;&nbsp;kT, energies thermal motion can never supply, which is exactly why
+  implantation and etching need them.
+</p>
+
+<script>
+const svg = document.getElementById('chart');
+const NS = 'http://www.w3.org/2000/svg';
+const W = 1120, H = 1460;
+
+// ---- scale ----------------------------------------------------
+const plotTop = 288, plotBottom = 1408;
+const axisX = 176;                 // vertical energy axis
+const levelEnd = 452;              // where level lines stop
+const labelX = 476;                // where text blocks begin
+const Emin = 0.002, Emax = 300000; // eV
+const lMin = Math.log10(Emin), lMax = Math.log10(Emax);
+const y = E => plotTop + (lMax - Math.log10(E)) / (lMax - lMin) * (plotBottom - plotTop);
+
+const COL = {teal:'#3ad6c4', amber:'#f3b83e', orange:'#f26a3d', magenta:'#e364d6'};
+
+function el(name, attrs, text){
+  const e = document.createElementNS(NS, name);
+  for(const k in attrs) e.setAttribute(k, attrs[k]);
+  if(text!=null) e.textContent = text;
+  svg.appendChild(e); return e;
+}
+
+// ---- defs: soft glow -----------------------------------------
+const defs = document.createElementNS(NS,'defs');
+defs.innerHTML = `
+  <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+    <feGaussianBlur stdDeviation="5" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="soft" x="-120%" y="-120%" width="340%" height="340%">
+    <feGaussianBlur stdDeviation="26"/>
+  </filter>`;
+svg.appendChild(defs);
+
+// ---- regime bands (meaningful colour = how energetic) --------
+const bands = [
+  {name:'ION BEAMS & PLASMA', sub:'10³ to 10⁶ kT · energies thermal motion cannot supply',
+   e0:2000, e1:Emax, c:COL.magenta},
+  {name:'DISPLACEMENT & ETCH', sub:'knock atoms off lattice sites · sputter & reactive-ion etch',
+   e0:10, e1:2000, c:COL.orange},
+  {name:'BONDS HOLD MATTER', sub:'covalent & metallic cohesion · ~140 kT, permanent at 300 K',
+   e0:1, e1:10, c:COL.amber},
+  {name:'THERMAL & BIOLOGICAL', sub:'within ~20 kT of the floor · soft, dynamic, reversible',
+   e0:Emin, e1:1, c:COL.teal},
+];
+bands.forEach(b=>{
+  const yt = y(b.e1), yb = y(b.e0);
+  const cy = (yt+yb)/2;
+  el('rect',{x:axisX, y:yt, width:W-axisX-28, height:yb-yt,
+    fill:b.c, 'fill-opacity':0.05});
+  el('rect',{x:axisX, y:yt, width:6, height:yb-yt, fill:b.c, 'fill-opacity':0.55});
+  const tx = axisX+26;
+  el('text',{x:tx, y:cy, fill:b.c, 'font-family':'"Space Grotesk"',
+    'font-weight':700,'font-size':15.5,'letter-spacing':'0.16em',
+    'text-anchor':'middle', transform:`rotate(-90 ${tx} ${cy})`}, b.name);
+});
+
+// ---- axis + decade ticks -------------------------------------
+el('line',{x1:axisX, y1:plotTop-10, x2:axisX, y2:plotBottom+10,
+  stroke:'#4a5578','stroke-width':1.4});
+[0.01,0.1,1,10,100,1000,10000,100000].forEach(t=>{
+  const yy = y(t);
+  el('line',{x1:axisX, y1:yy, x2:W-28, y2:yy, stroke:'#141b2e','stroke-width':1});
+  el('line',{x1:axisX-9, y1:yy, x2:axisX, y2:yy, stroke:'#4a5578','stroke-width':1.4});
+  const lab = t>=1000 ? (t/1000)+'k' : String(t);
+  el('text',{x:axisX-16, y:yy+4, fill:'#6b7590','text-anchor':'end',
+    'font-family':'"IBM Plex Mono"','font-size':13}, lab);
+});
+el('text',{x:axisX-16, y:plotTop-22, fill:'#6b7590','text-anchor':'end',
+  'font-family':'"IBM Plex Mono"','font-size':12.5,'letter-spacing':'0.1em'},'eV');
+
+// ---- data: the levels ----------------------------------------
+// eV is the plotting value; readouts carry the full story.
+const rows = [
+  {label:'Ion implantation', sub:'doping Si with B, P, As · keV to MeV · collision cascades',
+   e:70000, ev:'10 - 500 keV', kcal:'2×10⁵ - 10⁷', kt:'~10⁶', c:COL.magenta},
+
+  {label:'Sputter & RIE ions', sub:'physical etch (Ar⁺ knock-on) + directional reactive-ion etch',
+   e:150, ev:'30 - 1000', kcal:'700 - 2×10⁴', kt:'10³ - 4×10⁴', c:COL.orange},
+
+  {label:'Displacement threshold', sub:'energy to eject one atom from its lattice site (Frenkel pair)',
+   e:25, ev:'15 - 40', kcal:'350 - 920', kt:'600 - 1500', c:COL.orange},
+
+  {label:'Covalent bond · metal cohesion', sub:'C-C 3.6 · Cu cohesive 3.5 · Si 4.6 · the skeleton scale',
+   e:3.6, ev:'3.5 - 4.6', kcal:'80 - 106', kt:'~140', c:COL.amber},
+
+  {label:'Binding · folding · ATP', sub:'nM ligand ~12 · fold stability 5-15 · ATP ~12 kcal/mol',
+   e:0.5, ev:'0.2 - 0.65', kcal:'5 - 15', kt:'8 - 25', c:COL.teal},
+
+  {label:'Hydrogen bond (net)', sub:'in a folded protein, competing against water',
+   e:0.065, ev:'0.04 - 0.22', kcal:'1 - 5', kt:'2 - 8', c:COL.teal},
+
+  {label:'kT at 300 K', sub:'the thermal floor · the ruler everything is measured against',
+   e:0.025, ev:'0.025', kcal:'0.6', kt:'1', c:'#ffffff', ref:true},
+
+  {label:'van der Waals contact', sub:'one atom pair · weaker than thermal jiggle on its own',
+   e:0.0043, ev:'0.004', kcal:'0.1', kt:'0.17', c:COL.teal},
+];
+
+rows.forEach(r=>{
+  const yy = y(r.e);
+  const isRef = r.ref;
+  // level line
+  el('line',{x1:axisX+8, y1:yy, x2:levelEnd, y2:yy, stroke:r.c,
+    'stroke-width':isRef?2.6:1.8,'stroke-opacity':isRef?0.95:0.8,
+    'stroke-dasharray':isRef?'':'', filter:'url(#glow)'});
+  // node
+  el('circle',{cx:axisX+8, cy:yy, r:isRef?7:5.5, fill:r.c, filter:'url(#glow)'});
+  if(isRef){
+    el('circle',{cx:axisX+8, cy:yy, r:13, fill:'none', stroke:'#fff','stroke-opacity':0.35,'stroke-width':1.4});
+  }
+  // label block
+  el('text',{x:labelX, y:yy-8, fill:isRef?'#ffffff':'#eef1f8',
+    'font-family':'"Space Grotesk"','font-weight':isRef?700:500,
+    'font-size':isRef?21:19}, r.label);
+  el('text',{x:labelX, y:yy+12, fill:'#8891a8',
+    'font-family':'"IBM Plex Sans"','font-size':13,'font-weight':400}, r.sub);
+  // triple readout, right-aligned mono
+  const rx = W-40;
+  const chip = (t, col, dx) => el('text',{x:rx-dx, y:yy-6, fill:col,'text-anchor':'end',
+    'font-family':'"IBM Plex Mono"','font-weight':500,'font-size':14}, t);
+  el('text',{x:rx, y:yy-6, fill:r.c,'text-anchor':'end',
+    'font-family':'"IBM Plex Mono"','font-weight':600,'font-size':15}, r.ev+' eV');
+  el('text',{x:rx, y:yy+13, fill:'#7a8399','text-anchor':'end',
+    'font-family':'"IBM Plex Mono"','font-weight':400,'font-size':12.5},
+    r.kcal+' kcal/mol   ·   '+r.kt+' kT');
+});
+
+// ---- header ---------------------------------------------------
+el('text',{x:44, y:70, fill:'#ffffff','font-family':'"Space Grotesk"',
+  'font-weight':700,'font-size':40,'letter-spacing':'-0.01em'}, 'The Energy Ladder');
+el('text',{x:46, y:104, fill:'#aeb7cc','font-family':'"IBM Plex Sans"',
+  'font-size':17,'font-weight':400},
+  'Where molecular dynamics happens, from thermal jiggle to ion beams');
+
+// conversion key chip
+const kx=44, ky=140, kw=W-88, kh=64;
+el('rect',{x:kx, y:ky, width:kw, height:kh, rx:12, fill:'#0f1626',
+  stroke:'#26324e','stroke-width':1});
+el('text',{x:kx+22, y:ky+27, fill:'#6b7590','font-family':'"Space Grotesk"',
+  'font-weight':700,'font-size':12,'letter-spacing':'0.16em'}, 'CONVERSION KEY');
+el('text',{x:kx+22, y:ky+50, fill:'#eef1f8','font-family':'"IBM Plex Mono"',
+  'font-weight':500,'font-size':18},
+  '1 eV  =  23.06 kcal/mol  =  96.5 kJ/mol  \u2248  40 kT   (300 K)');
+// small right-side reminder in the chip
+el('text',{x:kx+kw-22, y:ky+50, fill:'#7a8399','text-anchor':'end',
+  'font-family':'"IBM Plex Mono"','font-size':13.5},
+  'kT = 0.6 kcal/mol = 2.5 kJ/mol');
+
+// column headers over the readout area
+el('text',{x:W-40, y:plotTop-22, fill:'#6b7590','text-anchor':'end',
+  'font-family':'"IBM Plex Mono"','font-size':12.5,'letter-spacing':'0.08em'},
+  'eV   ·   kcal/mol   ·   \u00d7kT');
+</script>
+</body>
+</html>

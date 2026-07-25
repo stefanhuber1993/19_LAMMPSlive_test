@@ -27,6 +27,8 @@ continuously on the device's own high-rate position/velocity sensing:
 """
 import math
 import random
+import threading
+import time
 
 from .base import InputSource
 
@@ -67,7 +69,7 @@ TWIST_DEADZONE = 0.15
 
 
 class JoystickInput(InputSource):
-    def __init__(self):
+    def __init__(self, background=True):
         try:
             from sidewinder.ff2 import FF2Device
         except ImportError as e:
@@ -101,17 +103,87 @@ class JoystickInput(InputSource):
         self._last_xy = (0.0, 0.0)
         self._last_yaw = 0.0
         self._twist_center = None  # captured from the first reading (see _process_twist)
+        # Last force-feedback conditions actually written to the device, so a
+        # redundant re-write is skipped. Each set_condition is a blocking HID
+        # transfer; the shaped values quantize to signed bytes, so frame-to-frame
+        # (and especially at rest) they are very often unchanged -- skipping those
+        # writes avoids needless HID traffic. (Only ever touched on the I/O side --
+        # the worker thread in background mode, else the calling thread.)
+        self._last_axis0 = None   # (cp_offset, coeff) last sent on spring axis 0
+        self._last_axis1 = None   # ... axis 1
+        self._last_damper = None  # last damper coefficient
+        self._last_jitter_mag = None  # last sine (jitter) magnitude
+
+        # --- Background HID I/O -------------------------------------------------
+        # Every HID read and write on this device is a BLOCKING transfer: the
+        # driver's read waits for a report (a still stick emits none, so it burns
+        # its whole timeout), and each force-feedback write is a synchronous
+        # SetReport that can take milliseconds -- and a frame issues up to six of
+        # them. Doing all that inline on the 60 fps render thread is what ate
+        # 20-30 ms/frame. So all device I/O runs on a daemon thread: the render
+        # thread only swaps values in memory (instant), and because the `hid`
+        # package is a ctypes wrapper (its blocking C calls release the GIL), the
+        # worker's waits never stall the main thread.
+        #
+        # The worker samples the stick and pushes the latest desired FF state each
+        # loop; the render thread reads the cached input and stores its desired FF
+        # under this lock. background=False keeps everything synchronous (used by
+        # the --calibrate CLI, which reads the device directly on one thread).
+        self._lock = threading.Lock()
+        self._want_force = None     # (fx, fy, stiffness) requested by the app, or None
+        self._want_damper = None    # requested damper coefficient, or None
+        self._want_heat = None      # requested jitter heat fraction, or None
+        self._running = False
+        self._worker = None
+        if background:
+            self._running = True
+            self._worker = threading.Thread(target=self._io_loop, name="ff2-io",
+                                            daemon=True)
+            self._worker.start()
+
+    # ---- render-thread API (non-blocking: only touches memory) --------------
 
     def poll(self):
-        # read_input() returns the newest InputState (every axis already decoded
-        # and normalized to -1..1), or None until the first report arrives -- the
-        # device only reports on *change*, so a perfectly still stick sends
-        # nothing at first. Keep the last known value in that case.
-        state = self.ff.read_input()
-        if state is not None:
-            self._last_xy = (state.x, -state.y)  # device convention -> sim convention (+y up)
-            self._last_yaw = self._process_twist(state.twist)
-        return self._last_xy
+        # Return the latest sampled stick position. In background mode the worker
+        # keeps _last_xy fresh; with no worker (calibrate/synchronous) read here.
+        if self._worker is None:
+            self._read_once(timeout_ms=0)
+        with self._lock:
+            return self._last_xy
+
+    def _read_once(self, timeout_ms=0):
+        """Sample the stick once (blocking up to timeout_ms) and cache it. Called
+        on the worker thread in background mode, else inline from poll(). The
+        device only emits on change, so an empty read just keeps the last value --
+        exactly right: no report means nothing moved."""
+        state = self.ff.read_input(timeout_ms=timeout_ms)
+        if state is None:
+            return
+        xy = (state.x, -state.y)             # device convention -> sim (+y up)
+        yaw = self._process_twist(state.twist)
+        with self._lock:
+            self._last_xy = xy
+            self._last_yaw = yaw
+
+    def _io_loop(self):
+        """Daemon loop: sample the stick, then flush the latest requested force-
+        feedback state to the device. The read's timeout paces the loop (~250 Hz
+        when the stick is idle and emitting nothing) so it never busy-spins, and
+        drains instantly when reports are flowing. FF requests coalesce to the
+        newest -- if the render thread updates faster than the device accepts, only
+        the latest is written, so no backlog builds."""
+        while self._running:
+            self._read_once(timeout_ms=4)
+            with self._lock:
+                force = self._want_force; self._want_force = None
+                damper = self._want_damper; self._want_damper = None
+                heat = self._want_heat; self._want_heat = None
+            if force is not None:
+                self._apply_force(*force)
+            if damper is not None:
+                self._apply_damper(damper)
+            if heat is not None:
+                self._apply_jitter(heat)
 
     def _process_twist(self, twist):
         # state.twist arrives already normalized to -1..1 (the driver decodes
@@ -129,7 +201,8 @@ class JoystickInput(InputSource):
         return -max(-1.0, min(1.0, val))
 
     def poll_yaw(self):
-        return self._last_yaw
+        with self._lock:
+            return self._last_yaw
 
     def calibrate(self, n=200):
         """Print live decoded stick state -- a sanity check that the device is
@@ -168,37 +241,86 @@ class JoystickInput(InputSource):
         stiffness (None = SPRING_STIFFNESS_MAX) is the ramped limp->strong
         coefficient computed from that same combined bias's magnitude -- see
         SPRING_STIFFNESS_MIN/MAX above.
+
+        This only records the request; the actual (blocking) HID write happens on
+        the I/O worker in background mode -- see _apply_force / _io_loop.
         """
-        if stiffness is None:
-            stiffness = SPRING_STIFFNESS_MAX
+        req = (fx, fy, SPRING_STIFFNESS_MAX if stiffness is None else stiffness)
+        if self._worker is None:
+            self._apply_force(*req)
+        else:
+            with self._lock:
+                self._want_force = req
+
+    def set_damper_coefficient(self, coefficient):
+        if self._worker is None:
+            self._apply_damper(coefficient)
+        else:
+            with self._lock:
+                self._want_damper = coefficient
+
+    def update_jitter(self, heat_fraction):
+        if self._worker is None:
+            self._apply_jitter(heat_fraction)
+        else:
+            with self._lock:
+                self._want_heat = heat_fraction
+
+    # ---- I/O-thread write helpers (blocking HID; caches skip no-op re-sends) --
+
+    def _apply_force(self, fx, fy, stiffness):
         k = max(0, min(127, int(round(stiffness))))
         cx = max(-CP_OFFSET_MAX, min(CP_OFFSET_MAX, int(round(fx))))
         cy = max(-CP_OFFSET_MAX, min(CP_OFFSET_MAX, int(round(-fy))))
-        self.spring.set_condition(axis=0, cp_offset=cx,
-                                   pos_coeff=k, neg_coeff=k,
-                                   pos_sat=SPRING_SATURATION, neg_sat=SPRING_SATURATION)
-        self.spring.set_condition(axis=1, cp_offset=cy,
-                                   pos_coeff=k, neg_coeff=k,
-                                   pos_sat=SPRING_SATURATION, neg_sat=SPRING_SATURATION)
+        # Only re-send an axis whose (offset, stiffness) actually changed -- an
+        # unchanged spring condition already lives on the device.
+        a0 = (cx, k)
+        if a0 != self._last_axis0:
+            self.spring.set_condition(axis=0, cp_offset=cx,
+                                       pos_coeff=k, neg_coeff=k,
+                                       pos_sat=SPRING_SATURATION, neg_sat=SPRING_SATURATION)
+            self._last_axis0 = a0
+        a1 = (cy, k)
+        if a1 != self._last_axis1:
+            self.spring.set_condition(axis=1, cp_offset=cy,
+                                       pos_coeff=k, neg_coeff=k,
+                                       pos_sat=SPRING_SATURATION, neg_sat=SPRING_SATURATION)
+            self._last_axis1 = a1
 
-    def set_damper_coefficient(self, coefficient):
+    def _apply_damper(self, coefficient):
         k = max(0, min(127, int(round(coefficient))))
+        if k == self._last_damper:   # unchanged -> already on the device
+            return
+        self._last_damper = k
         self.damper.set_condition(axis=0, pos_coeff=k, neg_coeff=k,
                                    pos_sat=DAMPER_SATURATION, neg_sat=DAMPER_SATURATION)
         self.damper.set_condition(axis=1, pos_coeff=k, neg_coeff=k,
                                    pos_sat=DAMPER_SATURATION, neg_sat=DAMPER_SATURATION)
 
-    def update_jitter(self, heat_fraction):
+    def _apply_jitter(self, heat_fraction):
         heat_fraction = max(0.0, min(1.0, heat_fraction))
         # sqrt: jitter amplitude ~ thermal speed ~ sqrt(kinetic energy) ~
         # sqrt(T), not linear in T -- matches how the crystal's own Langevin
         # jitter grows too.
         magnitude = int(round(JITTER_MAX_MAGNITUDE * math.sqrt(heat_fraction)))
+        # When cold there is no jitter: once it has reached zero, stop re-writing
+        # the sine effect every loop (the common case at the default near-frozen
+        # temperature). While warm, keep re-writing so the direction re-randomizes
+        # into an incoherent buzz.
+        if magnitude == 0 and self._last_jitter_mag == 0:
+            return
+        self._last_jitter_mag = magnitude
         self.jitter.set_base(direction_deg=random.uniform(0, 360),
                               axis_x=True, axis_y=True, direction_enable=True)
         self.jitter.set_periodic(magnitude=magnitude, period_ms=JITTER_PERIOD_MS)
 
     def close(self):
+        # Stop the I/O worker first, so freeing the effects (which are themselves
+        # HID writes) can't race with the worker's own device access.
+        self._running = False
+        if self._worker is not None:
+            self._worker.join(timeout=1.0)
+            self._worker = None
         try:
             self.spring.free()
             self.damper.free()

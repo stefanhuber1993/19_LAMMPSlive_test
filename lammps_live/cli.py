@@ -51,7 +51,9 @@ def main(argv=None):
 
     if args.calibrate:
         from .input import JoystickInput
-        js = JoystickInput()
+        # Synchronous (no I/O worker): calibrate reads the device directly on this
+        # thread, so a background reader would race it for reports.
+        js = JoystickInput(background=False)
         try:
             js.calibrate()
         finally:

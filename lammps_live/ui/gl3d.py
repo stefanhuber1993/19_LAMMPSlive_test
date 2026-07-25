@@ -113,8 +113,7 @@ uniform vec3 white_col;
 uniform float white_min;
 uniform float white_soft;
 uniform vec2 boxHalf;     // periodic-box half-extents in world x,y (centered at origin)
-uniform float clipEnable; // 1 for periodic scenes (clip + edge vignette), 0 otherwise
-uniform float edgeBand;   // world width of the soft edge fade inside each box face
+uniform float clipEnable; // 1 for periodic scenes (clip beads to the box), 0 otherwise
 in vec3 v_centerView;
 in float v_radius;
 in vec3 v_dirView;
@@ -136,16 +135,13 @@ void main() {
     // box faces so a bead crossing a seam has its sliced area move continuously
     // to the wrapped ghost on the opposite face -- and beyond-box fragments are
     // discarded (no depth/color written), so they never falsely occlude what is
-    // behind. dEdge = distance to the nearest x/y face (>=0 inside).
-    float edgeFade = 0.0;
+    // behind. The soft edge fade is done in screen space in the composite pass
+    // (see its `vignette`), not per-bead here, so it no longer depends on which
+    // world face a bead sits near.
     if (clipEnable > 0.5) {
         vec3 wp = (viewInv * vec4(hit, 1.0)).xyz;
         float dEdge = min(boxHalf.x - abs(wp.x), boxHalf.y - abs(wp.y));
         if (dEdge < 0.0) discard;             // outside the periodic cell -> gone
-        // Soft opaque vignette: fade the bead color toward the background over
-        // the last edgeBand before the face, so the geometric cut reads as a
-        // gentle edge rather than a hard line (see the composite's bg mix).
-        edgeFade = 1.0 - smoothstep(0.0, edgeBand, dEdge);
     }
     vec3 N = normalize(hit - c);
     // Correct per-pixel depth so overlapping beads intersect via the depth test.
@@ -160,9 +156,7 @@ void main() {
     // Over-paint the +n pole white (down to ~80% latitude) so director sense reads.
     float w = smoothstep(white_min - white_soft, white_min + white_soft, s);
     albedo = mix(albedo, white_col, w);
-    // Alpha carries the opaque edge-vignette factor for the composite to blend
-    // toward the background (it is NOT transparency -- the fragment is opaque).
-    o_albedo = vec4(albedo * v_bright, edgeFade);
+    o_albedo = vec4(albedo * v_bright, 1.0);
     o_normal = N;
     o_viewpos = hit;
 }
@@ -247,7 +241,6 @@ uniform sampler2D albedoTex;
 uniform sampler2D normalTex;
 uniform sampler2D posTex;
 uniform sampler2D aoTex;
-uniform sampler2D depthTex;
 uniform vec3 lightDir;
 uniform float ambient;
 uniform vec3 bgColor;
@@ -257,15 +250,20 @@ uniform float fogFar;
 uniform float fogStrength;
 uniform float aoStrength;
 uniform float aoPower;
+uniform float vignette;   // screen-space edge-darken strength (0 = off)
 in vec2 uv;
 out vec4 frag;
 void main() {
-    if (texture(depthTex, uv).r >= 1.0) { frag = vec4(bgColor, 1.0); return; }
+    // Background test off the G-buffer view-position (z < 0 on any bead, cleared
+    // to 0 on the background) instead of sampling the depth texture. The depth
+    // texture is this framebuffer's own depth attachment, and sampling it here
+    // would be a framebuffer feedback loop -- undefined in GL, and on a tile-based
+    // GPU (Apple Silicon) it surfaced as intermittent black tiles/squares.
+    vec3 P = texture(posTex, uv).xyz;
+    if (P.z >= -1e-4) { frag = vec4(bgColor, 1.0); return; }
     vec4 albedoSample = texture(albedoTex, uv);
     vec3 alb = albedoSample.rgb;
-    float edgeFade = albedoSample.a;           // opaque edge vignette (see _GEOM_FS)
     vec3 N = normalize(texture(normalTex, uv).xyz);
-    vec3 P = texture(posTex, uv).xyz;
     float ao = texture(aoTex, uv).r;
     vec3 L = normalize(lightDir);
     float diff = max(dot(N, L), 0.0);
@@ -283,10 +281,19 @@ void main() {
     float depth = -P.z;                        // distance along the view axis
     float fog = fogStrength * clamp((depth - fogNear) / max(fogFar - fogNear, 1e-4), 0.0, 1.0);
     col = mix(col, hazeColor, fog);
-    // Soft opaque edge: fade toward the background near the periodic box faces
-    // (fragment stays opaque; this only tints the color), so the clipped cell
-    // boundary reads as a gentle vignette rather than a hard cut.
-    col = mix(col, bgColor, clamp(edgeFade, 0.0, 1.0));
+    // Screen-space edge vignette: darken beads toward the frame edges, uniformly
+    // in screen space rather than per-bead by world position. This is applied
+    // only to bead fragments (the background already returned above, and the
+    // white box outline is drawn in a LATER line pass so it stays bright), so a
+    // whole depth-column of beads near the frame edge fades together -- no more
+    // "front bead gone, the one behind it still bright". `vignette` is the
+    // strength (0 disables); it also softens the periodic clip seam, which for
+    // the sheet sits near the frame edge.
+    if (vignette > 0.0) {
+        vec2 dc = abs(uv - 0.5) * 2.0;         // 0 at center -> 1 at each edge
+        float e = max(dc.x, dc.y);
+        col = mix(col, bgColor, vignette * smoothstep(0.55, 1.0, e));
+    }
     frag = vec4(col, 1.0);
 }
 """
@@ -381,11 +388,10 @@ class GLScene:
         self.geom_prog["white_col"].value = tuple(c_ / 255.0 for c_ in BEAD_WHITE_POLE_COLOR)
         self.geom_prog["white_min"].value = BEAD_WHITE_POLE_MIN
         self.geom_prog["white_soft"].value = BEAD_WHITE_POLE_SOFT
-        # Periodic clipping / edge-vignette default to OFF; render() sets them per
-        # frame for periodic scenes (see render()).
+        # Periodic bead-clipping defaults to OFF; render() sets it per frame for
+        # periodic scenes (see render()).
         self.geom_prog["clipEnable"].value = 0.0
         self.geom_prog["boxHalf"].value = (1e9, 1e9)
-        self.geom_prog["edgeBand"].value = 1.0
 
         kernel = _ssao_kernel(SSAO_KERNEL_SIZE)
         self.ssao_prog["samples"].write(kernel.tobytes())
@@ -410,9 +416,10 @@ class GLScene:
         self.comp_prog["aoStrength"].value = 0.85
         self.comp_prog["aoPower"].value = 1.6
 
+        self.comp_prog["vignette"].value = 0.0   # per-frame in render()
         # Texture unit assignments.
         for name, unit in (("albedoTex", 0), ("normalTex", 1), ("posTex", 2),
-                           ("aoTex", 3), ("depthTex", 4)):
+                           ("aoTex", 3)):
             if name in self.comp_prog:
                 self.comp_prog[name].value = unit
         self.ssao_prog["posTex"].value = 0
@@ -538,14 +545,14 @@ class GLScene:
 
     def render(self, view, proj, centers, radii, directors, near, far,
                line_verts=None, line_colors=None, brights=None,
-               box_half=None, edge_band=1.0):
+               box_half=None, vignette=0.0):
         """Render the beads (+ optional depth-occluded lines) into self.final_fbo.
         view/proj are row-major 4x4 numpy matrices (see view_matrix/proj_matrix).
         `brights` (albedo multiplier) is an optional per-bead array. For a
         periodic scene, pass `box_half=(hx, hy)` (world half-extents, box centered
-        at the origin): beads are then clipped to the box faces and softly faded
-        toward the background over `edge_band` inside each face -- all opaque, so
-        wrapped beads compose correctly with no transparency artifacts."""
+        at the origin): beads are then clipped to the box faces so wrapped ghosts
+        compose correctly (opaque, no transparency). `vignette` (0..1) is the
+        screen-space edge-darken strength applied to the beads in the composite."""
         c = self.ctx
         vb, pb = _gl(view), _gl(proj)
         n = len(centers)
@@ -559,11 +566,10 @@ class GLScene:
         # --- geometry pass -> G-buffer (all beads, opaque) ---
         self.geom_prog["view"].write(vb)
         self.geom_prog["proj"].write(pb)
-        # Periodic clipping + soft edge vignette (opaque). Off for non-periodic.
+        # Periodic clipping of beads to the box faces (opaque). Off for non-periodic.
         if box_half is not None:
             self.geom_prog["viewInv"].write(_gl(np.linalg.inv(view)))
             self.geom_prog["boxHalf"].value = (float(box_half[0]), float(box_half[1]))
-            self.geom_prog["edgeBand"].value = float(edge_band)
             self.geom_prog["clipEnable"].value = 1.0
         else:
             self.geom_prog["clipEnable"].value = 0.0
@@ -594,14 +600,18 @@ class GLScene:
         self.ao_blur_fbo.use()
         self._render_fullscreen(self.blur_prog)
 
-        # --- composite (lighting + AO + fog) -> final_fbo ---
+        # --- composite (lighting + AO + fog + screen vignette) -> final_fbo ---
+        # NB: the composite must NOT sample depth_tex here -- it is final_fbo's own
+        # depth attachment, and reading an attached texture is a framebuffer
+        # feedback loop (undefined; black-tile artifacts on tile-based GPUs). The
+        # background is detected from pos_tex.z instead (see _COMPOSITE_FS).
         self.albedo_tex.use(0)
         self.normal_tex.use(1)
         self.pos_tex.use(2)
         self.ao_blur_tex.use(3)
-        self.depth_tex.use(4)
         self.comp_prog["fogNear"].value = float(near)
         self.comp_prog["fogFar"].value = float(far)
+        self.comp_prog["vignette"].value = float(vignette)
         self.final_fbo.use()
         c.disable(c.DEPTH_TEST)
         self._render_fullscreen(self.comp_prog)

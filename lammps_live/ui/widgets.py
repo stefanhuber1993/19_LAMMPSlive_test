@@ -4,9 +4,32 @@ import math
 import pygame
 
 from .theme import (
+    BUTTON_ACTIVE_BG, BUTTON_ACTIVE_TEXT, BUTTON_BG, BUTTON_BORDER, BUTTON_TEXT,
     MELT_MARK_COLOR, OPTIMUM_MARK_COLOR, SLIDER_HANDLE, SLIDER_HANDLE_ACTIVE,
     SLIDER_TRACK, TEXT_COLOR,
 )
+
+
+class Button:
+    """A simple rectangular click button. Geometry + label only; the caller owns
+    the action and decides when it reads as 'active' (highlighted). Used for the
+    Play / Pause / Reset playback controls."""
+
+    def __init__(self, name, label):
+        self.name = name
+        self.label = label
+        self.rect = pygame.Rect(0, 0, 0, 0)
+
+    def draw(self, screen, font, active=False):
+        bg = BUTTON_ACTIVE_BG if active else BUTTON_BG
+        fg = BUTTON_ACTIVE_TEXT if active else BUTTON_TEXT
+        pygame.draw.rect(screen, bg, self.rect, border_radius=6)
+        pygame.draw.rect(screen, BUTTON_BORDER, self.rect, width=1, border_radius=6)
+        surf = font.render(self.label, True, fg)
+        screen.blit(surf, surf.get_rect(center=self.rect.center))
+
+    def hit(self, pos):
+        return self.rect.collidepoint(pos)
 
 
 class Slider:
@@ -14,7 +37,7 @@ class Slider:
     -- callers own the semantics of what the value drives."""
 
     def __init__(self, rect, vmin, vmax, value, label, fmt="{:.3f}", unit="",
-                 optimum=None):
+                 optimum=None, advanced=False):
         self.rect = pygame.Rect(rect)
         self.vmin, self.vmax = vmin, vmax
         self.value = max(vmin, min(vmax, value))
@@ -22,13 +45,15 @@ class Slider:
         self.fmt = fmt
         self.unit = unit
         self.optimum = optimum
+        self.advanced = advanced
         self.dragging = False
 
     @classmethod
     def from_spec(cls, rect, spec):
         """Build from a systems.base.SliderSpec."""
         return cls(rect, spec.vmin, spec.vmax, spec.default, spec.label,
-                   fmt=spec.fmt, unit=spec.unit, optimum=spec.optimum)
+                   fmt=spec.fmt, unit=spec.unit, optimum=spec.optimum,
+                   advanced=spec.advanced)
 
     def reset(self, spec):
         """Re-apply a (possibly different, on system switch) SliderSpec's
@@ -40,6 +65,7 @@ class Slider:
         self.fmt = spec.fmt
         self.unit = spec.unit
         self.optimum = spec.optimum
+        self.advanced = spec.advanced
         self.dragging = False
 
     def _frac(self):

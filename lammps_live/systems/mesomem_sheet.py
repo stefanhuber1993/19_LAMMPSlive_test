@@ -47,10 +47,20 @@ C0 = 0.0
 # recommended value marked as the slider "optimum" (see the 7-bead patch for the
 # per-parameter rationale; same standard-condition centers and spans).
 K_TILT_MIN, K_TILT_MAX, K_TILT_OPT = 0.0, 50.0, 12.0
-K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY_OPT = 0.5, 2.0, 1.0
+K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY_OPT = 0.0, 40.0, 1.0
 ZETA_MIN, ZETA_MAX, ZETA_OPT = 0.0, 12.0, 5.0
-RC_MIN, RC_MAX, RC_OPT = 2.5, 3.0, 2.5
-WC_MIN, WC_MAX, WC_OPT = 1.8, 3.0, 2.0
+# Both cutoffs are allowed all the way down to 0 (interactions can be switched
+# fully off) rather than starting at the paper's operating values.
+RC_MIN, RC_MAX, RC_OPT = 0.0, 3.0, 2.5
+WC_MIN, WC_MAX, WC_OPT = 0.0, 3.0, 2.0
+
+# Splay symmetry (advanced): 0..1 weight blending the splay term's SIGNED
+# director dot product (0, the paper's original form -- antiparallel neighbours
+# punished) toward its ABSOLUTE value (1 -- parallel and antiparallel treated
+# identically, i.e. the term cares only about the axis, not the sense). See the
+# pair style's compute() and _apply_pair_coeff below.
+SPLAY_SYM = 0.0
+SPLAY_SYM_MIN, SPLAY_SYM_MAX = 0.0, 1.0
 
 # --- Sheet "cleanup" forces (housekeeping, not MesoMem physics) --------------
 # Two soft per-frame corrections keep the free periodic monolayer well-posed for
@@ -63,8 +73,8 @@ WC_MIN, WC_MAX, WC_OPT = 1.8, 3.0, 2.0
 #     torque, so the membrane stays face-on to the camera.
 # K_PLANE is the tunable "pull toward the central plane" stiffness the demo asks
 # to expose; K_ALIGN is the normal-up torque strength.
-K_PLANE = 3.0
-K_ALIGN = 4.0
+K_PLANE = 0.1
+K_ALIGN = 10.0
 
 # --- Sheet geometry -----------------------------------------------------------
 A_LATTICE = 0.8      # hexagonal nearest-neighbor spacing (paper's benchmark value)
@@ -130,7 +140,7 @@ SPEC = SystemSpec(
     timestep=TIMESTEP,
     temperature=SliderSpec("Temperature", T_MIN, T_MAX, 0.001, fmt="{:.3f}", unit=" T*"),
     damping=SliderSpec("Puller damping", PULLER_DAMPING_MIN, PULLER_DAMPING_MAX,
-                       PULLER_DAMPING_DEFAULT, fmt="{:.2f}"),
+                       PULLER_DAMPING_DEFAULT, fmt="{:.2f}", advanced=True),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
     max_input_force=12.0,   # reduced units at full deflection, shared by joystick/WASD/mouse
@@ -156,12 +166,17 @@ SPEC = SystemSpec(
                    key="k_tilt", optimum=K_TILT_OPT),
         SliderSpec("k_splay", K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY, fmt="{:.2f}",
                    key="k_splay", optimum=K_SPLAY_OPT),
-        SliderSpec("zeta (attraction steepness)", ZETA_MIN, ZETA_MAX, ZETA,
-                   fmt="{:.1f}", key="eta", optimum=ZETA_OPT),
+        SliderSpec("zeta (attraction falloff, higher=shorter reach)",
+                   ZETA_MIN, ZETA_MAX, ZETA, fmt="{:.1f}", key="eta",
+                   optimum=ZETA_OPT),
+        # Advanced controls, hidden behind the panel's "Advanced" toggle.
+        SliderSpec("splay symmetry (0=signed, 1=|dot|)", SPLAY_SYM_MIN,
+                   SPLAY_SYM_MAX, SPLAY_SYM, fmt="{:.2f}", key="splay_symmetry",
+                   advanced=True),
         SliderSpec("rc (interaction cutoff)", RC_MIN, RC_MAX, RC, fmt="{:.2f}",
-                   key="rc", optimum=RC_OPT),
+                   key="rc", optimum=RC_OPT, advanced=True),
         SliderSpec("wc (orientation cutoff)", WC_MIN, WC_MAX, WC, fmt="{:.2f}",
-                   key="wc", optimum=WC_OPT),
+                   key="wc", optimum=WC_OPT, advanced=True),
     ),
 )
 
@@ -184,6 +199,7 @@ class MesoMemSheetSystem(MDSystem):
         self._zeta = ZETA
         self._rc = RC
         self._wc = WC
+        self._splay_sym = SPLAY_SYM
         # Throttled cache for the whole-sheet potential total (O(pairs) each time,
         # so it's recomputed every few frames rather than every frame).
         self._total_terms_cache = None
@@ -377,17 +393,24 @@ class MesoMemSheetSystem(MDSystem):
         return min(self._wc, self._rc)
 
     def _apply_pair_coeff(self):
-        """(Re)issue the mesomem pair_coeff from the current live coefficients."""
+        """(Re)issue the mesomem pair_coeff from the current live coefficients.
+
+        The trailing 11th argument is `splay_symmetry` (0..1): 0 gives the paper's
+        original splay term built on the signed director dot product ni.nj; 1
+        makes it use |ni.nj|, so parallel and antiparallel neighbour directors are
+        penalised identically (the term then cares only about the shared axis, not
+        the sense). Intermediate values blend the two continuously -- see the pair
+        style's compute()."""
         self.lmp.command(
             f"pair_coeff 1 1 {SIGMA} {EPS} {self._ktilt} {self._ksplay} "
-            f"{self._rc} {self._effective_wc()} {self._zeta} {C0}"
+            f"{self._rc} {self._effective_wc()} {self._zeta} {C0} {self._splay_sym}"
         )
 
     def set_extra_param(self, key, value):
-        """Live k_tilt / k_splay / zeta / rc / wc dials; re-issue pair_coeff on
-        change (and the pair_style global cutoff too when rc moves)."""
+        """Live k_tilt / k_splay / zeta / rc / wc / splay_symmetry dials; re-issue
+        pair_coeff on change (and the pair_style global cutoff too when rc moves)."""
         attr = {"k_tilt": "_ktilt", "k_splay": "_ksplay", "eta": "_zeta",
-                "rc": "_rc", "wc": "_wc"}.get(key)
+                "rc": "_rc", "wc": "_wc", "splay_symmetry": "_splay_sym"}.get(key)
         if attr is None or getattr(self, attr) == value:
             return
         setattr(self, attr, value)
@@ -404,7 +427,7 @@ class MesoMemSheetSystem(MDSystem):
     # Leash: keep the puller near its home column and below a runaway speed. The
     # in-plane (x) range is a few lattice spacings; z is the out-of-plane pull.
     _CTRL_X = (-5.0, 5.0)
-    _CTRL_Z = (-2.5, 2.5)
+    _CTRL_Z = (-3.5, 3.5)
     _SPEED_CAP = 6.0
 
     def _constrain_center(self):
@@ -520,7 +543,9 @@ class MesoMemSheetSystem(MDSystem):
     def get_potential_terms(self):
         """Live additive decomposition of the puller's MesoMem energy over its
         neighbours within RC (vectorized over the whole sheet, minimum-image in
-        the periodic x,y). Same three terms as the 7-bead patch."""
+        the periodic x,y). Same three terms as the 7-bead patch. The splay term
+        mirrors the pair style's splay_symmetry blend (signed ni.nj -> |ni.nj|)
+        so the panel matches the force actually being applied."""
         idx, n = self._id_index()
         ic = idx.get(self.center_id)
         if ic is None:
@@ -558,8 +583,9 @@ class MesoMemSheetSystem(MDSystem):
                 nir = float(ni @ rhat)
                 njr = float(nj @ rhat)
                 ninj = float(ni @ nj)
+                ninj_eff = (1.0 - self._splay_sym) * ninj + self._splay_sym * abs(ninj)
                 u_tilt += 0.5 * self._ktilt * (nir * nir + njr * njr) * w
-                u_splay += 0.5 * self._ksplay * (ninj - 1.0) ** 2 * w
+                u_splay += 0.5 * self._ksplay * (ninj_eff - 1.0) ** 2 * w
         terms = [
             ("isotropic  (repel + attract)", u_iso),
             ("tilt  (directors normal to bonds)", u_tilt),
@@ -630,8 +656,9 @@ class MesoMemSheetSystem(MDSystem):
             nir = np.einsum("ij,ij->i", ni, rhat)
             njr = np.einsum("ij,ij->i", nj, rhat)
             ninj = np.einsum("ij,ij->i", ni, nj)
+            ninj_eff = (1.0 - self._splay_sym) * ninj + self._splay_sym * np.abs(ninj)
             u_tilt = float((0.5 * self._ktilt * (nir * nir + njr * njr) * w).sum())
-            u_splay = float((0.5 * self._ksplay * (ninj - 1.0) ** 2 * w).sum())
+            u_splay = float((0.5 * self._ksplay * (ninj_eff - 1.0) ** 2 * w).sum())
 
         terms = [
             ("isotropic  (repel + attract)", u_iso),

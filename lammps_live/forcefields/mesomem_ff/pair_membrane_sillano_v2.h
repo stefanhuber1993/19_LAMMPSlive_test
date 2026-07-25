@@ -48,10 +48,11 @@ class PairMesoMem : public Pair {
 // double **cutsq;
   double **sigma, **eps;
   double **ktilt, **ksplay;
-  double **weight_rcut; 
+  double **weight_rcut;
   double **zeta;
   double cut_global;
   double **c0; // for spont curvature
+  double **splay_symmetry; // 0..1: blend signed<->|ninj| in the splay term (see coeff/compute)
 
 
 virtual void allocate();

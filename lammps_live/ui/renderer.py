@@ -11,6 +11,7 @@ from .. import units
 from .gl3d import GLScene, proj_matrix, view_matrix
 from .glcompositor import GLCompositor
 from .plotting import draw_plot
+from .widgets import Button
 from .theme import (
     ARROWHEAD_ANGLE, ARROWHEAD_LEN, ATOM_MAX_RADIUS, ATOM_MIN_RADIUS, BG,
     BEAD_BAND_HALFWIDTH, BEAD_BAND_SOFT, BEAD_EQUATOR_COLOR, BEAD_POLE_COLOR,
@@ -18,8 +19,8 @@ from .theme import (
     BOND_3D_COLOR, BOND_COLOR, BOND_FALLOFF, BOND_LINES_ENABLED, BOND_MIN_ALPHA,
     BOND_PEAK_ALPHA, BOND_STICK_COLOR, BOND_WIDTH, BOX_3D_ALPHA, BOX_3D_COLOR,
     BOX_OUTLINE, CRYSTAL_COLOR,
-    CRYSTAL_RADIUS, DIM_TEXT_COLOR, DIRECTOR_ARROW_COLOR, HAZE_COLOR,
-    HAZE_STRENGTH, HBOND_COLOR, HBOND_DASH,
+    CRYSTAL_RADIUS, DIM_TEXT_COLOR, DIRECTOR_ARROW_COLOR, EDGE_VIGNETTE_STRENGTH,
+    HAZE_COLOR, HAZE_STRENGTH, HBOND_COLOR, HBOND_DASH,
     HBOND_WIDTH, HEADER_TEXT_COLOR, HUD_BG, HUD_TEXT_COLOR, INPUT_VEC_COLOR,
     ION_LABEL_COLOR, MELT_MARK_COLOR, MEMBRANE_BEAD_COLOR, NET_COLOR,
     NET_LINE_ALPHA, PANEL_BG, PANEL_DIVIDER, PANEL_PAD, PANEL_WIDTH, PLOT_COLORS,
@@ -67,6 +68,22 @@ class Renderer:
         self.font = pygame.font.SysFont(None, 18)
         self.small_font = pygame.font.SysFont(None, 15)
         self.header_font = pygame.font.SysFont(None, 22, bold=True)
+
+        # Collapsible "Advanced" slider group: the app owns the open/closed state
+        # (self.show_advanced, set before each draw) and reads back the clickable
+        # header rect (self.advanced_toggle_rect) to toggle it. None -> no
+        # advanced sliders this frame (nothing drawn / clickable).
+        self.show_advanced = False
+        self.advanced_toggle_rect = None
+
+        # Play / Pause / Reset buttons for playback systems (self-assembly). Their
+        # rects are (re)positioned every frame in draw_playback_controls; the app
+        # reads them back via playback_hit to route clicks. Empty-rect until first
+        # drawn, so a stray click can't hit a button for a non-playback system.
+        self.playback_buttons = [Button("play", "Play"),
+                                 Button("pause", "Pause"),
+                                 Button("reset", "Reset")]
+        self._playback_visible = False
 
         # Per-species glyphs (e.g. "+"/"-" on ions) are stamped on a few
         # hundred atoms every frame, so each label string is rendered once and
@@ -1097,9 +1114,9 @@ class Renderer:
 
         # Beads to draw = the real beads plus opaque wrapped ghost copies near
         # periodic seams; brightness spotlights any tagged cluster. For a periodic
-        # scene the shader clips beads to the box faces and softly fades the color
-        # toward the background over edge_band inside each face (all opaque), so a
-        # bead crossing a seam slides across continuously with no transparency.
+        # scene the shader clips beads to the box faces (all opaque), so a bead
+        # crossing a seam slides across continuously with no transparency; the soft
+        # edge is a screen-space vignette in the composite, not a per-bead fade.
         bpts, bdips, bbright = self._wrap_ghost_instances(pts, dipoles3d,
                                                           brightness, spec)
         radii = np.full(len(bpts), phys_r, dtype=np.float32)
@@ -1107,8 +1124,13 @@ class Renderer:
         box_half = (self.box_x / 2.0, self.box_y / 2.0) if periodic else None
         verts, cols = self._build_gl_lines(camera, pts, spec, bonds, control_grid,
                                            depth, near, far, box_bounds)
+        # Screen-space edge vignette on periodic scenes (the sheet): softens the
+        # frame edge / clip seam uniformly across the whole depth column, instead
+        # of the old per-bead world-face fade. The white box outline is drawn
+        # after the composite, so it stays bright.
+        vignette = EDGE_VIGNETTE_STRENGTH if periodic else 0.0
         self.gl_scene.render(view, proj, bpts, radii, bdips, near, far, verts, cols,
-                             brights=bbright, box_half=box_half, edge_band=2.0 * phys_r)
+                             brights=bbright, box_half=box_half, vignette=vignette)
         # Sim viewport is the left sim_width columns, full height (GL origin is
         # bottom-left, so its y origin is 0).
         self.gl_scene.blit_to_viewport(0, 0, W, H)
@@ -1350,10 +1372,19 @@ class Renderer:
         ix, iy = input_force
         rx, ry = reaction_force
         sim_time_str = units.format_sim_time(sim_time_ps)
+        # Input/reaction torque (director twist about the control-plane normal),
+        # shown alongside the forces. torque_signals are the fractions [-1, 1] the
+        # torque arcs use (green = your twist, red = membrane restoring twist).
+        torque_str = ""
+        if torque_signals is not None:
+            applied, reaction = torque_signals
+            torque_str = (f"input torque: {applied:+.2f}   "
+                          f"membrane torque: {reaction:+.2f}   ")
         label = self.font.render(
             f"{spec.name}  |  sim time: {sim_time_str}   steps: {total_steps:,} ({steps_per_frame}/frame)   "
             f"input force: ({ix:4.1f}, {iy:4.1f})   "
-            f"membrane force: ({rx:5.1f}, {ry:5.1f})   fps: {fps:4.0f}",
+            f"membrane force: ({rx:5.1f}, {ry:5.1f})   "
+            f"{torque_str}fps: {fps:4.0f}",
             True, (200, 200, 200),
         )
         self.screen.blit(label, (10, 10))
@@ -1515,6 +1546,32 @@ class Renderer:
         self._draw_hud(hud_lines)
         self._draw_debug_line(debug_line)
 
+    def draw_playback_controls(self, playing):
+        """Play / Pause / Reset buttons centered along the bottom of the sim view
+        (playback systems only). The button matching the current run state is
+        highlighted: Play while running, Pause while stopped. Reset never latches.
+        Positions the button rects so the app can hit-test clicks (playback_hit)."""
+        bw, bh, gap = 96, 34, 12
+        total = 3 * bw + 2 * gap
+        x0 = (self.sim_width - total) // 2
+        y0 = self.window_size[1] - bh - 16
+        active = {"play": playing, "pause": not playing, "reset": False}
+        for i, btn in enumerate(self.playback_buttons):
+            btn.rect = pygame.Rect(x0 + i * (bw + gap), y0, bw, bh)
+            btn.draw(self.screen, self.font, active=active[btn.name])
+        self._playback_visible = True
+
+    def playback_hit(self, pos):
+        """Name of the playback button under `pos` ("play"/"pause"/"reset"), or
+        None. Returns None while the controls aren't shown, so a click never hits
+        a stale button rect from a system that has since been switched away."""
+        if not self._playback_visible:
+            return None
+        for btn in self.playback_buttons:
+            if btn.hit(pos):
+                return btn.name
+        return None
+
     def draw_panel(self, systems, current_key, sliders, thermo_now, puller_energy,
                     history, rdf, spec, puller_speed_m_s=None):
         pygame.draw.rect(self.screen, PANEL_BG, self.panel_rect)
@@ -1550,20 +1607,44 @@ class Renderer:
         pygame.draw.line(self.screen, PANEL_DIVIDER, (x, y), (x + w, y), 1)
         y += 12
 
-        # sliders = (temperature, damping, *extra_sliders). Temperature carries
-        # the melt marker; the rest are plain. Extra sliders (e.g. the MesoMem
-        # k_tilt / k_splay / eta dials) are laid out one per row after damping.
-        temp_slider, damping_slider = sliders[0], sliders[1]
+        # sliders = (temperature, damping, *extra_sliders). Temperature (always
+        # sliders[0], never advanced) carries the melt marker and is drawn first.
+        # The rest split into "basic" (drawn in order right after temperature) and
+        # "advanced" (hidden behind a collapsible toggle -- see self.show_advanced).
+        temp_slider = sliders[0]
         temp_slider.rect = pygame.Rect(x, y, w, 4)
         temp_slider.draw(self.screen, self.font, mark_value=spec.melt_temp, mark_label="melt")
         y += 46
-        damping_slider.rect = pygame.Rect(x, y, w, 4)
-        damping_slider.draw(self.screen, self.font)
-        y += 34
-        for extra in sliders[2:]:
+
+        basic = [s for s in sliders[1:] if not s.advanced]
+        advanced = [s for s in sliders[1:] if s.advanced]
+        for extra in basic:
             extra.rect = pygame.Rect(x, y, w, 4)
             extra.draw(self.screen, self.font)
             y += 34
+
+        if advanced:
+            arrow = "v" if self.show_advanced else ">"
+            toggle_surf = self.font.render(
+                f"[ {arrow} ] Advanced ({len(advanced)})", True, HEADER_TEXT_COLOR)
+            self.screen.blit(toggle_surf, (x, y))
+            # Clickable hit-box, padded a little for easy targeting; read back by
+            # the app to flip self.show_advanced.
+            self.advanced_toggle_rect = pygame.Rect(
+                x - 2, y - 2, toggle_surf.get_width() + 8, toggle_surf.get_height() + 6)
+            y += toggle_surf.get_height() + 8
+            if self.show_advanced:
+                for extra in advanced:
+                    extra.rect = pygame.Rect(x, y, w, 4)
+                    extra.draw(self.screen, self.font)
+                    y += 34
+            else:
+                # Collapsed: park the hidden sliders off-screen so a stale rect
+                # from when they were last visible can't be clicked/dragged.
+                for extra in advanced:
+                    extra.rect = pygame.Rect(-1000, -1000, 0, 0)
+        else:
+            self.advanced_toggle_rect = None
 
         # MesoMem runs in reduced (LJ) units, so its readouts and plot axes drop
         # the Kelvin/bar/eV/m-s labels (meaningless here) for the dimensionless
@@ -1668,7 +1749,7 @@ class Renderer:
               history, rdf, heat_fraction=0.0, sim_time_ps=0.0, puller_speed_m_s=None,
               atom_trails=None, species=None, bond_pairs=None, hbond_pairs=None,
               hud_lines=None, scene_3d=None, total_steps=0, steps_per_frame=1,
-              debug_line=None):
+              debug_line=None, playback_playing=None):
         # In GL mode the default framebuffer is cleared to BG first; the 3D scene
         # (if any) is drawn straight into its sim viewport, and every 2D surface
         # is composited over it at the end. In CPU mode self.screen IS the display
@@ -1698,6 +1779,10 @@ class Renderer:
                            debug_line=debug_line)
         self.draw_panel(systems, current_key, sliders, thermo_now, puller_energy,
                          history, rdf, spec, puller_speed_m_s)
+        # Play / Pause / Reset controls for playback systems, over the sim view.
+        self._playback_visible = False
+        if spec.playback_controls and playback_playing is not None:
+            self.draw_playback_controls(playback_playing)
         if self.gl_enabled:
             self.compositor.present(self.screen)
         pygame.display.flip()

@@ -30,6 +30,11 @@ class SliderSpec:
     # Empty for the built-in temperature/damping sliders, which have dedicated
     # setters (set_target_temp / set_puller_damping).
     key: str = ""
+    # "Advanced" parameters are hidden by default behind a collapsible "Advanced"
+    # toggle in the panel, so the everyday controls stay uncluttered. The user
+    # clicks the toggle to reveal (and drag) them. Applies to both built-in and
+    # extra sliders.
+    advanced: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,14 @@ class SystemSpec:
     # physically meaningless here) and show the dimensionless reduced-unit
     # quantities instead. Only the two MesoMem 3D systems set this.
     reduced_units: bool = False
+    # Whether this system is driven by Play / Pause / Reset buttons (drawn at the
+    # bottom of the sim view) rather than a continuously-controlled puller atom.
+    # When True the app steps the simulation only while "playing", offers a Reset
+    # that rebuilds the system from a fresh state (see MDSystem.reset), and skips
+    # the puller/joystick input entirely. The self-assembly system sets this;
+    # every interactive (puller) system leaves it False. Space toggles play/pause
+    # and R resets when set.
+    playback_controls: bool = False
 
 
 class MDSystem(ABC):
@@ -162,6 +175,13 @@ class MDSystem(ABC):
     @abstractmethod
     def step(self, n):
         """Advance the simulation by n timesteps."""
+
+    def reset(self):
+        """Optional: rebuild the system from a fresh initial state, keeping the
+        current live parameters (temperature, force-field coefficients). Used by
+        the Play/Pause/Reset playback systems (see SystemSpec.playback_controls)
+        to restart a run -- e.g. re-randomizing the self-assembly box. No-op by
+        default (interactive puller systems are never reset this way)."""
 
     @abstractmethod
     def get_puller_state(self):

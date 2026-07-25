@@ -7,6 +7,7 @@ from .cu_deposition import CopperEAMSystem
 from .lipid_membrane import LipidMembraneSystem
 from .lj_argon import LJArgonSystem
 from .mb_water import MBWaterSystem
+from .mesomem_assembly import MesoMemAssemblySystem
 from .mesomem_hex import MesoMemHexSystem
 from .mesomem_sheet import MesoMemSheetSystem
 from .nacl import NaClSystem
@@ -19,6 +20,7 @@ REGISTRY = {
     MBWaterSystem.spec.key: MBWaterSystem,
     MesoMemHexSystem.spec.key: MesoMemHexSystem,
     MesoMemSheetSystem.spec.key: MesoMemSheetSystem,
+    MesoMemAssemblySystem.spec.key: MesoMemAssemblySystem,
 }
 
 

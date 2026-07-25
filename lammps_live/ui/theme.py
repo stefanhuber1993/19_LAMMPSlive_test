@@ -110,6 +110,12 @@ TORQUE_ARC_HEAD_LEN = 9
 HAZE_COLOR = BG
 HAZE_STRENGTH = 1.0
 DEPTH_FADE_START = 0.5   # fraction of the max bead distance at which haze begins
+# Screen-space edge vignette applied to the beads of periodic scenes (the
+# membrane sheet): beads fade toward the background over the outer frame margin,
+# uniformly in screen space, softening the frame edge and the periodic clip seam
+# without darkening the white box outline. 0 disables it; 1 fully fades the very
+# edge to BG. See gl3d._COMPOSITE_FS.
+EDGE_VIGNETTE_STRENGTH = 0.65
 # Light direction for the shaded-sphere sprite (points FROM the light, in
 # screen space: up-left and toward the viewer). Sphere shading is baked once
 # from this and reused for every bead.
@@ -167,6 +173,15 @@ BEAD_BAND_SOFT = 0.07
 BEAD_WHITE_POLE_COLOR = (245, 246, 250)
 BEAD_WHITE_POLE_MIN = 0.954
 BEAD_WHITE_POLE_SOFT = 0.03
+
+# Play / Pause / Reset playback buttons (self-assembly system), drawn along the
+# bottom of the sim view. The button matching the current state (e.g. Play while
+# running) is highlighted with the active colors.
+BUTTON_BG = (40, 42, 52)
+BUTTON_TEXT = (215, 218, 228)
+BUTTON_BORDER = (90, 94, 108)
+BUTTON_ACTIVE_BG = (70, 150, 220)
+BUTTON_ACTIVE_TEXT = (12, 14, 20)
 
 PANEL_WIDTH = 480
 PANEL_PAD = 14

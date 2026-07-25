@@ -69,18 +69,30 @@ C0 = 0.0           # spontaneous curvature (0 -> flat preferred)
 #     Below that bound it barely affects structure but strongly tunes stiffness
 #     (paper Sec. III D 4) -> optimum 2.0.
 K_TILT_MIN, K_TILT_MAX, K_TILT_OPT = 0.0, 50.0, 12.0
-K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY_OPT = 0.5, 2.0, 1.0
+K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY_OPT = 0.0, 3.0, 1.0
 ZETA_MIN, ZETA_MAX, ZETA_OPT = 0.0, 12.0, 5.0
-RC_MIN, RC_MAX, RC_OPT = 2.5, 3.0, 2.5
-WC_MIN, WC_MAX, WC_OPT = 1.8, 3.0, 2.0
+# Both cutoffs are allowed all the way down to 0 (interactions can be switched
+# fully off) rather than starting at the paper's operating values.
+RC_MIN, RC_MAX, RC_OPT = 0.0, 3.0, 2.5
+WC_MIN, WC_MAX, WC_OPT = 0.0, 3.0, 2.0
+
+# Splay symmetry (advanced): 0..1 weight blending the splay term's SIGNED
+# director dot product (0, the paper's original form -- antiparallel neighbours
+# punished) toward its ABSOLUTE value (1 -- parallel and antiparallel treated
+# identically, i.e. the term cares only about the axis, not the sense). See the
+# pair style's compute() and _apply_pair_coeff below.
+SPLAY_SYM = 0.0
+SPLAY_SYM_MIN, SPLAY_SYM_MAX = 0.0, 1.0
 
 A_LATTICE = 1.0    # in-plane nearest-neighbor spacing (near the isotropic min at r=sigma)
 BEAD_DIAMETER = 2.0  # sphere radius = sigma -> moment of inertia I = (2/5) m sigma^2 (paper)
 
-# Cubic box half-extent is BOX/2; non-periodic, just a container (with reflecting
-# z walls). Sized snugly around the patch and its pull reach (leash +/-2.3 in x,
-# +/-1.7 in z, bead radius 0.5) rather than large and arbitrary, so the white box
-# outline drawn in the scene frames the interactive cell without dwarfing it.
+# Cubic box half-extent is BOX/2; non-periodic, just a container with reflecting
+# walls on all six faces (see _build). Sized snugly around the patch and its pull
+# reach (leash +/-1.4 in x and z, bead radius 0.5 -> a bead edge reaches 1.9 <
+# BOX/2 = 2.0) rather than large and arbitrary: because the camera frames the box
+# outline (get_scene_fit_points), a tight box makes the beads fill the view
+# instead of floating small inside a cavernous cell.
 BOX = 6.0
 
 TIMESTEP = 0.005   # tau_LJ (paper uses 0.01; halved for stability while pulling)
@@ -167,7 +179,7 @@ SPEC = SystemSpec(
     timestep=TIMESTEP,
     temperature=SliderSpec("Temperature", T_MIN, T_MAX, 0.001, fmt="{:.3f}", unit=" T*"),
     damping=SliderSpec("Puller damping", PULLER_DAMPING_MIN, PULLER_DAMPING_MAX,
-                       PULLER_DAMPING_DEFAULT, fmt="{:.2f}"),
+                       PULLER_DAMPING_DEFAULT, fmt="{:.2f}", advanced=True),
     melt_temp=T_MELT,
     force_feedback=FORCE_FEEDBACK,
     max_input_force=9.0,   # reduced units at full deflection, shared by joystick/WASD/mouse
@@ -183,22 +195,31 @@ SPEC = SystemSpec(
                    key="k_tilt", optimum=K_TILT_OPT),
         SliderSpec("k_splay", K_SPLAY_MIN, K_SPLAY_MAX, K_SPLAY, fmt="{:.2f}",
                    key="k_splay", optimum=K_SPLAY_OPT),
-        SliderSpec("zeta (attraction steepness)", ZETA_MIN, ZETA_MAX, ZETA,
-                   fmt="{:.1f}", key="eta", optimum=ZETA_OPT),
+        SliderSpec("zeta (attraction falloff, higher=shorter reach)",
+                   ZETA_MIN, ZETA_MAX, ZETA, fmt="{:.1f}", key="eta",
+                   optimum=ZETA_OPT),
+        # Advanced controls, hidden behind the panel's "Advanced" toggle.
+        SliderSpec("splay symmetry (0=signed, 1=|dot|)", SPLAY_SYM_MIN,
+                   SPLAY_SYM_MAX, SPLAY_SYM, fmt="{:.2f}", key="splay_symmetry",
+                   advanced=True),
         SliderSpec("rc (interaction cutoff)", RC_MIN, RC_MAX, RC, fmt="{:.2f}",
-                   key="rc", optimum=RC_OPT),
+                   key="rc", optimum=RC_OPT, advanced=True),
         SliderSpec("wc (orientation cutoff)", WC_MIN, WC_MAX, WC, fmt="{:.2f}",
-                   key="wc", optimum=WC_OPT),
+                   key="wc", optimum=WC_OPT, advanced=True),
     ),
 )
 
 # Camera for the three-quarter view: looking at the patch from below in y and
 # above in z, so the membrane (xy-plane) tilts and the directors (+z) stand up.
+# Pulled further back than the scene is wide (eye ~12.6 from the patch) so the
+# perspective foreshortening stays gentle; fit_to_points then zooms in to fill
+# the viewport, so the extra distance costs no apparent size, only a flatter,
+# more telephoto look.
 CAMERA_PARAMS = dict(
-    eye=(0.0, -7.5, 5.2),
-    target=(0.0, 0.0, 0.2),
+    eye=(0.0, -10.5, 7.0),
+    target=(0.0, 0.0, 0.1),
     up=(0.0, 0.0, 1.0),
-    fov_deg=34.0,
+    fov_deg=30.0,
 )
 
 
@@ -222,6 +243,7 @@ class MesoMemHexSystem(MDSystem):
         self._zeta = ZETA
         self._rc = RC
         self._wc = WC
+        self._splay_sym = SPLAY_SYM
 
         # id 1 = central puller; ids 2..7 = hexagonal ring.
         self.center_id = 1
@@ -288,6 +310,13 @@ class MesoMemHexSystem(MDSystem):
         # get_interaction_force), since the mesomem pair style has no single()
         # method and so can't feed compute group/group.
         c("fix integrate all nve/sphere update dipole")
+        # Reflecting walls on all six box faces: a ring bead flung out during
+        # violent play (past where the soft centering/homing forces can recover it)
+        # bounces back elastically instead of escaping the box and being lost. The
+        # box is sized so resting beads sit well inside, so the walls only act in
+        # those rare runaway spots.
+        c("fix wall all wall/reflect xlo EDGE xhi EDGE ylo EDGE yhi EDGE "
+          "zlo EDGE zhi EDGE")
         c(f"fix bath ring langevin {self._target_temp} {self._target_temp} "
           f"{LANGEVIN_DAMP} {self._seed} omega yes")
         # The ring's centering + normal-up alignment are applied each frame in
@@ -369,19 +398,27 @@ class MesoMemHexSystem(MDSystem):
     def _apply_pair_coeff(self):
         """(Re)issue the mesomem pair_coeff from the current live coefficients.
         LAMMPS overwrites the stored per-type coefficients in place and re-inits
-        the pair style on the next run, so this is safe to call between steps."""
+        the pair style on the next run, so this is safe to call between steps.
+
+        The trailing 11th argument is `splay_symmetry` (0..1): 0 gives the paper's
+        original splay term built on the signed director dot product ni.nj; 1
+        makes it use |ni.nj|, so parallel and antiparallel neighbour directors are
+        penalised identically (the term then cares only about the shared axis, not
+        the sense). Intermediate values blend the two continuously -- see the pair
+        style's compute()."""
         self.lmp.command(
             f"pair_coeff 1 1 {SIGMA} {EPS} {self._ktilt} {self._ksplay} "
-            f"{self._rc} {self._effective_wc()} {self._zeta} {C0}"
+            f"{self._rc} {self._effective_wc()} {self._zeta} {C0} {self._splay_sym}"
         )
 
     def set_extra_param(self, key, value):
-        """Live k_tilt / k_splay / zeta / rc / wc dials. Re-issues pair_coeff only
-        when a value actually changes so it's a cheap no-op most frames. Changing
-        rc also resizes the pair_style's global cutoff (and thus the neighbour
-        list), so the pair_style is re-declared before the coeffs in that case."""
+        """Live k_tilt / k_splay / zeta / rc / wc / splay_symmetry dials. Re-issues
+        pair_coeff only when a value actually changes so it's a cheap no-op most
+        frames. Changing rc also resizes the pair_style's global cutoff (and thus
+        the neighbour list), so the pair_style is re-declared before the coeffs in
+        that case."""
         attr = {"k_tilt": "_ktilt", "k_splay": "_ksplay", "eta": "_zeta",
-                "rc": "_rc", "wc": "_wc"}.get(key)
+                "rc": "_rc", "wc": "_wc", "splay_symmetry": "_splay_sym"}.get(key)
         if attr is None or getattr(self, attr) == value:
             return
         setattr(self, attr, value)
@@ -396,8 +433,8 @@ class MesoMemHexSystem(MDSystem):
     # sqrt(1 + z^2) from its neighbors; past the rc = 2.5 cutoff it would detach
     # and float free), so the membrane always exerts a restoring pull and the
     # bead snaps back on release instead of sticking at the ceiling.
-    _CTRL_X = (-2.3, 2.3)
-    _CTRL_Z = (-1.7, 1.7)
+    _CTRL_X = (-2.8, 2.8)
+    _CTRL_Z = (-2.8, 2.8)
     _SPEED_CAP = 6.0
 
     def _constrain_center(self):
@@ -526,8 +563,10 @@ class MesoMemHexSystem(MDSystem):
           - splay      U_splay: (k_splay/2)(n_i.n_j - 1)^2 w(r)
                                  -- penalizes neighbouring directors misaligning
                                  (NB: as published this is polar -- parallel is
-                                 favoured over antiparallel; see the question
-                                 raised with the authors before changing it)
+                                 favoured over antiparallel; the splay_symmetry
+                                 dial blends n_i.n_j toward |n_i.n_j| to remove
+                                 that polarity, mirrored here so the panel matches
+                                 the applied force)
         These three add up to the bead's total interaction energy -- the whole
         point of the demo's display."""
         idx, _ = self._id_index()
@@ -572,8 +611,9 @@ class MesoMemHexSystem(MDSystem):
                 nir = float(ni @ rhat)
                 njr = float(nj @ rhat)
                 ninj = float(ni @ nj)
+                ninj_eff = (1.0 - self._splay_sym) * ninj + self._splay_sym * abs(ninj)
                 u_tilt += 0.5 * self._ktilt * (nir * nir + njr * njr) * w
-                u_splay += 0.5 * self._ksplay * (ninj - 1.0) ** 2 * w
+                u_splay += 0.5 * self._ksplay * (ninj_eff - 1.0) ** 2 * w
         terms = [
             ("isotropic  (repel + attract)", u_iso),
             ("tilt  (directors normal to bonds)", u_tilt),
@@ -606,8 +646,9 @@ class MesoMemHexSystem(MDSystem):
                 nir = float(ni @ rhat)
                 njr = float(nj @ rhat)
                 ninj = float(ni @ nj)
+                ninj_eff = (1.0 - self._splay_sym) * ninj + self._splay_sym * abs(ninj)
                 u_tilt = 0.5 * self._ktilt * (nir * nir + njr * njr) * w
-                u_splay = 0.5 * self._ksplay * (ninj - 1.0) ** 2 * w
+                u_splay = 0.5 * self._ksplay * (ninj_eff - 1.0) ** 2 * w
         return u_iso, u_tilt, u_splay
 
     def get_total_potential_terms(self):
