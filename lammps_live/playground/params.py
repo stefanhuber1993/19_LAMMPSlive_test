@@ -154,9 +154,22 @@ class ParamSet:
     def live_params(self):
         return tuple(p for p in self.params if p.tier.is_live)
 
-    def slider_specs(self):
-        """SliderSpecs for every live parameter, in declaration order."""
-        return tuple(p.slider_spec() for p in self.live_params())
+    def slider_specs(self, range_overrides=None):
+        """SliderSpecs for every live parameter, in declaration order.
+
+        `range_overrides` maps a parameter name to (vmin, vmax). A slider's span
+        is a property of what a particular playground wants to explore, not of the
+        force field: a splay modulus useful up to 3 on a 7-bead patch is worth
+        dialling to 40 on a large sheet, where it buckles the membrane rather than
+        just stiffening it. That was the one constant the three old MesoMem modules
+        genuinely disagreed on.
+        """
+        import dataclasses
+        specs = []
+        for p in self.live_params():
+            lo, hi = (range_overrides or {}).get(p.name, (p.vmin, p.vmax))
+            specs.append(dataclasses.replace(p, vmin=lo, vmax=hi).slider_spec())
+        return tuple(specs)
 
     def tier_of(self, name):
         return self._by_name[name].tier

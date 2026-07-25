@@ -35,4 +35,7 @@ lammps-live = "lammps_live.cli:main"
 include = ["lammps_live*"]
 
 [tool.setuptools.package-data]
-"lammps_live.systems" = ["data/*.eam"]
+# Tabulated potentials, and the C++ sources for custom pair styles -- the plugin
+# builder compiles those on demand from the installed tree, so they have to ship.
+"lammps_live.forcefields" = ["data/*.eam"]
+"lammps_live.forcefields.mesomem_ff" = ["*.cpp", "*.h"]

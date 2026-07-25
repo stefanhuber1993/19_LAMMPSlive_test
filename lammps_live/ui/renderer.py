@@ -1466,19 +1466,26 @@ class Renderer:
                 self._blit_glyph(sx, sy, labels[sp])
 
         # Puller anchor for the force-vector arrows: its single position, or the
-        # centroid of the control lipid's beads.
+        # centroid of the control lipid's beads. A 2D scene can legitimately have
+        # no controlled atom at all (a playground running in sim mode), in which
+        # case there is nothing to anchor arrows to and nothing to ring below.
+        puller_xy = None
         if puller_pts:
             ax = sum(q[0] for q in puller_pts) / len(puller_pts)
             ay = sum(q[1] for q in puller_pts) / len(puller_pts)
             puller_xy = (ax, ay)
-        else:
+        elif puller_pos is not None:
             puller_xy = self.sim_to_screen(*puller_pos)
 
-        knee = spec.force_feedback.ff_knee
-        self._draw_arrow(puller_xy, input_force, INPUT_VEC_COLOR, knee)
-        self._draw_arrow(puller_xy, reaction_force, REACTION_VEC_COLOR, knee)
+        if puller_xy is not None:
+            knee = spec.force_feedback.ff_knee
+            self._draw_arrow(puller_xy, input_force, INPUT_VEC_COLOR, knee)
+            self._draw_arrow(puller_xy, reaction_force, REACTION_VEC_COLOR, knee)
 
-        if len(puller_pts) > 1:
+        label_r = 0
+        if puller_xy is None:
+            pass          # nothing controlled: no ring, no glyph, no energy stamp
+        elif len(puller_pts) > 1:
             # Multi-bead control lipid. Its beads are drawn in their true
             # head/tail species colors (like every other lipid) and linked by
             # the brighter backbone above; what marks it as YOURS is the bright
@@ -1512,7 +1519,8 @@ class Renderer:
         # just beneath it on two lines -- KE (its motion) and PE (how bound it is,
         # the negative-when-attracted number) shown separately rather than summed,
         # over a faint backdrop so they stay legible on top of atoms and bonds.
-        if puller_energy is not None and puller_energy[0] is not None:
+        if (puller_xy is not None and puller_energy is not None
+                and puller_energy[0] is not None):
             e_lines = [f"KE = {units.format_energy(puller_energy[0])}",
                        f"PE = {units.format_energy(puller_energy[1])}"]
             surfs = [self.small_font.render(t, True, PULLER_LABEL_COLOR) for t in e_lines]

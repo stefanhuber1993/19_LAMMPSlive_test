@@ -161,10 +161,17 @@ def build_pairs(positions, cutoff, box=None):
 
     if per_axes:
         lengths = [box.lengths[i] for i in per_axes]
-        # cKDTree's toroidal topology needs coordinates inside [0, L).
-        pts = np.column_stack([
-            (positions[:, i] - box.lo[i]) % box.lengths[i] for i in per_axes
-        ])
+        # cKDTree's toroidal topology needs coordinates strictly inside [0, L).
+        # The modulo alone is not enough: a coordinate a hair BELOW the lower
+        # bound (LAMMPS hands back x = -9e-16 for an atom nominally at 0) wraps to
+        # a value that rounds to exactly L, which cKDTree rejects. Under
+        # periodicity L and 0 are the same point, so fold it back.
+        cols = []
+        for i in per_axes:
+            w = (positions[:, i] - box.lo[i]) % box.lengths[i]
+            w[w >= box.lengths[i]] = 0.0
+            cols.append(w)
+        pts = np.column_stack(cols)
         tree = cKDTree(pts, boxsize=lengths)
     else:
         tree = cKDTree(positions)

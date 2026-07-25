@@ -330,3 +330,45 @@ class MDSystem(ABC):
     @abstractmethod
     def close(self):
         ...
+
+
+class MDSystem3D(MDSystem):
+    """A system the app renders as a 3D scene (SystemSpec.render_3d = True).
+
+    These five methods were previously an undeclared, unenforced protocol: only a
+    comment on SystemSpec.render_3d mentioned them, yet app._tick called all five
+    unconditionally for any 3D system. Declaring them here means a 3D system that
+    forgets one fails at construction with a clear message instead of raising
+    AttributeError mid-frame.
+    """
+
+    @abstractmethod
+    def get_positions_3d(self):
+        """(ids, positions (N,3), is_puller (N,) bool) in a stable order."""
+
+    @abstractmethod
+    def get_dipoles_3d(self):
+        """Per-particle unit orientation vectors (N,3), aligned with
+        get_positions_3d's ordering. Zero rows for particles with no
+        orientation."""
+
+    @abstractmethod
+    def get_bonds_3d(self):
+        """Bond sticks to draw, as index pairs into get_positions_3d's ordering.
+        Empty list for systems whose particles overlap into a continuous surface
+        (bonds would be invisible clutter, and would not tile across a periodic
+        seam anyway)."""
+
+    @abstractmethod
+    def get_camera_params(self):
+        """dict(eye=, target=, up=, fov_deg=) for the scene's perspective
+        camera. The app then calls get_scene_fit_points to zoom to fit, so this
+        only needs to set a good viewing angle and rough distance."""
+
+    @abstractmethod
+    def get_control_grid(self):
+        """The interactive control plane to draw as a faint "net", as
+        dict(origin=, u_axis=, v_axis=, u_range=, v_range=, step=), or None when
+        there is nothing to steer. Its extents should be exactly the controlled
+        particle's movement limits, so the net marks precisely where it can be
+        dragged."""

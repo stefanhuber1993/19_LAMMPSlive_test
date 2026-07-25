@@ -1,0 +1,86 @@
+"""Discovery and loading of playground files.
+
+A playground is any importable module exposing a module-level `PLAYGROUND`.
+Bundled ones live in `lammps_live/playgrounds/`; a user's own can be passed to the
+CLI as a path, so exploring a new idea needs no changes inside the package.
+
+Discovery reads the module (cheap -- a playground file is declarations) but does
+NOT construct anything, so listing playgrounds costs no LAMMPS instance.
+"""
+import importlib
+import importlib.util
+import os
+import pkgutil
+
+_PACKAGE = "lammps_live.playgrounds"
+
+
+def _load_module(name):
+    return importlib.import_module(f"{_PACKAGE}.{name}")
+
+
+def _from_path(path):
+    """Import a playground from a filesystem path, so a researcher can keep their
+    own playgrounds anywhere."""
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"no playground file at {path}")
+    stem = os.path.splitext(os.path.basename(path))[0]
+    spec = importlib.util.spec_from_file_location(f"_playground_{stem}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, stem
+
+
+def _playground_of(module, fallback_key):
+    pg = getattr(module, "PLAYGROUND", None)
+    if pg is None:
+        raise AttributeError(
+            f"{module.__name__} defines no module-level PLAYGROUND. A playground "
+            f"file must expose exactly one: PLAYGROUND = Playground(...)"
+        )
+    if not pg.key:
+        # Default the CLI id to the module basename, so a file named
+        # mesomem_sheet.py is selectable as --playground mesomem_sheet.
+        import dataclasses
+        pg = dataclasses.replace(pg, key=fallback_key)
+    return pg
+
+
+def bundled_keys():
+    """Names of the bundled playground modules, in alphabetical order."""
+    package = importlib.import_module(_PACKAGE)
+    return sorted(m.name for m in pkgutil.iter_modules(package.__path__)
+                  if not m.name.startswith("_"))
+
+
+def load(ref):
+    """A Playground from a bundled name or a filesystem path."""
+    if os.path.sep in ref or ref.endswith(".py"):
+        module, stem = _from_path(ref)
+        return _playground_of(module, stem)
+    return _playground_of(_load_module(ref), ref)
+
+
+def all_playgrounds():
+    """[(key, Playground), ...] for every bundled playground."""
+    out = []
+    for name in bundled_keys():
+        try:
+            out.append((name, load(name)))
+        except Exception as exc:            # a broken user file shouldn't hide the rest
+            print(f"warning: skipping playground {name!r}: {exc}")
+    return out
+
+
+def list_playgrounds():
+    """[(key, SystemSpec), ...] -- what the CLI listing and the app's picker show.
+    Builds specs only; no LAMMPS instance is created."""
+    from .system import make_spec
+    return [(key, make_spec(pg, pg.mode)) for key, pg in all_playgrounds()]
+
+
+def build(ref, mode=None, preset=None):
+    """Construct a running PlaygroundSystem."""
+    from .system import PlaygroundSystem
+    return PlaygroundSystem(load(ref), mode_name=mode, preset=preset)

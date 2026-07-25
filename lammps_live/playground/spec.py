@@ -1,0 +1,163 @@
+"""The declarations a playground file writes.
+
+A playground file is a Python module with one module-level `PLAYGROUND = ...`
+constant -- no class to subclass, no methods to implement. That is deliberately
+the same shape as the old `SPEC = SystemSpec(...)` pattern, which worked well and
+which both people and language models get right first time; the difference is
+that it now names a force field, a scenario and a mode instead of being the
+metadata header of an 800-line class.
+
+    PLAYGROUND = Playground(
+        name="MesoMem membrane patch",
+        force_field="mesomem",
+        scenario=hex_patch(n_rings=1),
+        mode="game",
+        control=Control(atom="first", plane="xz", leash=(2.8, 2.8)),
+        observables=["nematic_S", "thickness"],
+        presets={"paper": {}, "floppy": {"k_tilt": 2.0, "k_splay": 0.1}},
+    )
+"""
+from dataclasses import dataclass, field
+
+from ..systems.base import ForceFeedbackProfile
+
+
+# Force-feedback tuning scaled to reduced-unit mesoscale forces, which run
+# O(1-10) on a pulled particle -- with enough stick authority to tent a membrane
+# and pop a particle out against tilt/splay resistance. A playground may override
+# it; most should not need to.
+REDUCED_UNIT_FEEDBACK = ForceFeedbackProfile(
+    ff_exaggeration=1.3,
+    ff_knee=4.0,
+    ff_max_mag=120.0,
+    stiffness_threshold=0.3,
+    stiffness_knee=2.5,
+    damper_min_fraction=0.10,
+    damper_max_fraction=0.55,
+    vel_damp_max_fraction=0.5,
+)
+
+
+@dataclass(frozen=True)
+class Control:
+    """How the user drives the controlled particle, in game mode.
+
+    `leash` is the half-extent of the rectangle the particle can be dragged in,
+    on the control plane's two axes -- and it is what the scene draws as a net, so
+    it is a statement about the interaction, not a rendering detail. Keep it
+    inside the force field's interaction range: a particle dragged past the cutoff
+    detaches and floats free instead of being pulled back, and the snap-back on
+    release is the whole point.
+    """
+    atom: str = "nearest_center"
+    plane: str = "xz"
+    leash: tuple = (3.0, 3.0)
+    speed_cap: float = 6.0
+    # Whether to hold the particle on the control plane inside the leash at all.
+    # False gives a genuinely free particle -- the deposition setups, where the
+    # atom is meant to fly in, stick, and be knocked loose again, and where the
+    # simulation is 2D so there is no out-of-plane axis to pin. A free particle
+    # draws no net, because there is no boundary to draw.
+    confine: bool = True
+    # Maximum displacement per timestep for the controlled particle, via
+    # `nve/limit`. This is how an unconfined particle is kept stable through a
+    # hard contact impact instead of tunnelling through the lattice. None -> the
+    # global integrator handles it.
+    displacement_cap: float = None
+    max_input_force: float = 9.0
+    damping_default: float = 4.0
+    damping_range: tuple = (0.0, 8.0)
+    # Yaw steering: an angular-momentum kick about the plane normal per unit yaw
+    # per frame, plus the per-frame rotational-velocity retention. Strong enough
+    # that a firm twist drives a director over the tilt term's barrier at 45 deg
+    # and flips it to the opposite normal -- the term is bistable, both +n and -n
+    # are minima, and that flip is the pedagogical point. A gentle twist just
+    # deflects and springs back.
+    yaw_torque: float = 1.0
+    rot_damp: float = 0.88
+    # Reaction torque that fills the display arc. The tilt term reaches
+    # O(k_tilt/2) at large deflection; this is picked so a firm twist against it
+    # fills the arc.
+    reaction_torque_max: float = 6.0
+    grid_step: float = 0.5
+
+    @property
+    def u_range(self):
+        return (-self.leash[0], self.leash[0])
+
+    @property
+    def v_range(self):
+        return (-self.leash[1], self.leash[1])
+
+
+@dataclass(frozen=True)
+class Playground:
+    """One explorable setup: a force field on a scenario, driven in a mode."""
+
+    name: str
+    force_field: str
+    scenario: object
+    description: str = ""
+    # Constructor keyword arguments for the force field -- non-parameter choices
+    # like the sphere diameter that sets the rotational inertia. Distinct from
+    # `params`, which are the declared tunables.
+    force_field_options: dict = field(default_factory=dict)
+    key: str = ""                      # CLI id; defaults to the module basename
+    mode: str = "game"                 # "game" or "sim"
+    control: Control = None
+    # Live force-field parameter overrides applied on top of its declared
+    # defaults. For a different STRUCTURAL value, configure the scenario instead
+    # -- that is the file/GUI boundary.
+    params: dict = field(default_factory=dict)
+    # Per-playground slider spans, {name: (vmin, vmax)}. Use when this setup wants
+    # to explore a wider or narrower range than the force field's default span.
+    param_ranges: dict = field(default_factory=dict)
+    # Named parameter sets, selectable with --preset. A preset is the unit of
+    # "the setting I found interesting", and is what makes a demo reproducible.
+    presets: dict = field(default_factory=dict)
+    observables: tuple = ()
+    # Temperature dial, in the force field's own units.
+    temperature: tuple = (0.0, 0.5)    # (min, max)
+    temperature_default: float = 0.001
+    melt_temp: float = 0.3
+    force_feedback: ForceFeedbackProfile = REDUCED_UNIT_FEEDBACK
+    # Rendered particle radius, in world units.
+    particle_radius: float = 0.5
+    reduced_units: bool = True
+    seed: int = None                   # None -> a fresh random seed each build
+
+    # --- rendering ------------------------------------------------------------
+    # Whether to draw as a 3D scene (perspective spheres and directors) or the
+    # top-down 2D box. The membrane playgrounds are 3D; a 2D crystal slab is not.
+    render_3d: bool = True
+    element_label: str = ""            # legend text, e.g. "Ar (LJ)"
+    lattice_spacing: float = 1.0       # informational, and the bond-overlay optimum
+    # Flat draw colour for a single-species 2D system, so different materials read
+    # as different materials rather than sharing one generic crystal colour.
+    crystal_color: tuple = None
+    species_colors: tuple = None
+    species_labels: tuple = None
+    species_radii: tuple = None
+    # The generic "faint line between atoms near their equilibrium spacing"
+    # overlay. Useful for a crystal; meaningless for overlapping membrane beads.
+    bond_overlay: bool = False
+    # Force-feedback speed scale, in the scenario's length units per time unit.
+    # None -> derived from the timestep.
+    puller_speed_cap: float = None
+
+    def resolved_params(self, preset=None):
+        """Live parameter overrides: the playground's own, then the named preset
+        on top."""
+        merged = dict(self.params)
+        if preset:
+            if preset not in self.presets:
+                known = ", ".join(sorted(self.presets)) or "(none defined)"
+                raise KeyError(
+                    f"{self.key or self.name}: unknown preset {preset!r}. "
+                    f"Defined: {known}"
+                )
+            merged.update(self.presets[preset])
+        return merged
+
+    def effective_control(self):
+        return self.control or Control()

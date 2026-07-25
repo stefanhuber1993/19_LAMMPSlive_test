@@ -78,6 +78,12 @@ class ForceField(ABC):
     # FrameState.directors is populated and whether director-based observables
     # are offered.
     has_directors = False
+    # Whether the pair style implements single(), i.e. whether LAMMPS can report
+    # the force between two groups directly with `compute group/group`. False
+    # forces the caller to recover it as "total force minus the forces we applied
+    # ourselves", which is exact but fragile -- see modes.GameMode.interaction_force.
+    # MesoMem's pair style has no single(); lj/cut and eam do.
+    supports_single = False
     # Bar half-range for the energy panels, per particle involved. Scaled by the
     # relevant particle count so the same force field reads sensibly on a 7-bead
     # patch and a 1500-bead box.
@@ -97,6 +103,14 @@ class ForceField(ABC):
         anything the pair style needs on each particle. Returns a list of LAMMPS
         command strings."""
         return []
+
+    def integrator_command(self):
+        """The time integrator. Orientation-carrying particles need their
+        rotational degrees of freedom integrated too, which is a property of the
+        force field (it is what makes the directors move), not of the scenario."""
+        if self.has_directors:
+            return "fix integrate all nve/sphere update dipole"
+        return "fix integrate all nve"
 
     @abstractmethod
     def pair_commands(self, params):
@@ -130,6 +144,14 @@ class ForceField(ABC):
         """The largest separation at which this force field does anything, used
         to build the pair list for the energy decomposition and observables."""
         return 0.0
+
+    @property
+    def thermo_is_per_atom(self):
+        """Whether LAMMPS normalizes this unit style's thermodynamic output per
+        atom. True for `lj` (`thermo_modify norm yes` is the default there),
+        false for `metal` and the other physical unit styles -- which the verifier
+        must undo, or a correct force field looks off by a factor of N."""
+        return self.units == "lj"
 
     def energy_terms(self, state, pairs, params):
         """Per-pair energy in each additive term of the potential.

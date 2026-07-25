@@ -11,7 +11,7 @@ from time import perf_counter
 
 import pygame
 
-from . import config, units
+from . import catalog, config, units
 from .forcefeedback import (
     ExponentialSmoother2D, shape_damper_coefficient, shape_interaction_force,
     shape_stiffness, shape_velocity_damping,
@@ -20,7 +20,6 @@ from .input import (
     CP_OFFSET_MAX, DAMPER_COEFFICIENT_MAX, JoystickInput, KeyboardInput,
     MouseInput, SPRING_STIFFNESS_MAX,
 )
-from .systems import get_system_class, list_systems
 from .ui import AtomTrails, Renderer, RollingHistory, Slider
 from .ui.camera import Camera3D
 
@@ -28,16 +27,28 @@ STEPS_PER_FRAME_CAP = 200  # sanity cap if a system's timestep is set absurdly s
 
 
 class App:
-    def __init__(self, input_mode, initial_system_key, fullscreen=False, debug=False):
+    def __init__(self, input_mode, initial_system_key, fullscreen=False, debug=False,
+                 mode=None, preset=None):
         self.input_mode = input_mode
         self.debug = debug
+        # Interaction mode ("game"/"sim") and named parameter preset, applied to
+        # playgrounds. Both are None for legacy systems, which have neither.
+        self.mode_override = mode
+        self.preset = preset
         # Exponential moving averages (ms) of the per-frame timing breakdown, and
         # the header line built from them -- shown only under --debug. The line is
         # built from the PREVIOUS frame (a frame's own render time isn't known
         # until after it's drawn), which is fine for a running average.
-        self._prof_ms = {"sim": 0.0, "read": 0.0, "ff": 0.0, "render": 0.0, "other": 0.0}
+        # "analysis" is broken out of "sim" because it is the Python-side cost the
+        # playground layer adds between LAMMPS steps (energy decomposition and
+        # observables); keeping it visible is what makes the frame budget
+        # something you can check rather than assume.
+        self._prof_ms = {"sim": 0.0, "analysis": 0.0, "read": 0.0, "ff": 0.0,
+                         "render": 0.0, "other": 0.0}
         self._debug_line = None
-        self.systems = list_systems()  # [(key, SystemSpec), ...], stable order for the picker/number keys
+        # [(key, SystemSpec), ...] -- playgrounds then legacy systems, in a stable
+        # order for the picker and number keys.
+        self.systems = catalog.list_specs()
 
         # Not pygame.init() -- that also brings up SDL's joystick subsystem,
         # which grabs the Sidewinder as a native SDL game controller. When
@@ -149,8 +160,10 @@ class App:
         if self.system is not None:
             self.system.close()
 
-        cls = get_system_class(key)
-        self.system = cls()
+        # A playground or a legacy system, whichever the key names. The mode and
+        # preset are only meaningful for playgrounds; catalog.build ignores them
+        # for legacy systems.
+        self.system = catalog.build(key, mode=self.mode_override, preset=self.preset)
         self.system_key = key
         spec = self.system.spec
 
@@ -412,12 +425,17 @@ class App:
         puller_speed_m_s = units.speed_to_m_per_s(math.hypot(*vel)) if vel is not None else None
 
         ids, positions, is_puller, species = self.system.get_all_positions()
-        bond_pairs = self.system.get_bond_pairs()
-        hbond_pairs = self.system.get_hbond_pairs()
         hud_lines = self.system.get_hud_lines()
-        self._trail_frame_counter += 1
-        if self._trail_frame_counter % config.TRAIL_SAMPLE_EVERY_N_FRAMES == 0:
-            self.atom_trails.add(self.sim_wall_time, ids, positions, is_puller)
+        # Explicit bonds, the hydrogen-bond overlay and the motion trails are drawn
+        # only by the 2D path, so a 3D system was previously paying for three
+        # whole-system gathers per frame whose results it then discarded.
+        bond_pairs = hbond_pairs = None
+        if not spec.render_3d:
+            bond_pairs = self.system.get_bond_pairs()
+            hbond_pairs = self.system.get_hbond_pairs()
+            self._trail_frame_counter += 1
+            if self._trail_frame_counter % config.TRAIL_SAMPLE_EVERY_N_FRAMES == 0:
+                self.atom_trails.add(self.sim_wall_time, ids, positions, is_puller)
 
         scene_3d = None
         if spec.render_3d:
@@ -454,34 +472,43 @@ class App:
         )
         if self.debug:
             render_seconds = perf_counter() - t_render_start
+            # Playgrounds report the time their throttled analysis spent inside
+            # step(), so it can be shown separately from the LAMMPS run rather
+            # than hiding inside it.
+            analysis_seconds = getattr(self.system, "analysis_seconds", 0.0)
             self._update_debug(perf_counter() - t_frame_start, sim_seconds,
-                               render_seconds, read_seconds, ff_seconds)
+                               render_seconds, read_seconds, ff_seconds,
+                               analysis_seconds)
 
         new_dt = self.clock.tick(60) / 1000.0
         self.sim_wall_time += new_dt
         return new_dt
 
     def _update_debug(self, work_seconds, sim_seconds, render_seconds,
-                      read_seconds, ff_seconds):
+                      read_seconds, ff_seconds, analysis_seconds=0.0):
         """Fold this frame's timings into the smoothed breakdown and rebuild the
         header line for the next frame. 'work' is everything the app does per
         frame except the fps-cap sleep. The device I/O is split into 'read' (the
         stick poll) and 'ff' (the force-feedback writes), both broken out because
-        on the joystick they are blocking HID traffic; 'other' is the remainder
-        after sim, render, read and ff -- force shaping and the per-frame readouts
-        (positions, RDF, potential terms)."""
+        on the joystick they are blocking HID traffic; 'analysis' is the
+        playground layer's energy decomposition and observables, carved out of the
+        step so it can be budgeted; 'other' is the remainder after sim, render,
+        read and ff -- force shaping and the per-frame readouts."""
+        # analysis_seconds is measured INSIDE step(), so it is already part of
+        # sim_seconds; subtract it out to keep the parts summing to the frame.
+        sim_only = max(0.0, sim_seconds - analysis_seconds)
         other_seconds = max(0.0, work_seconds - sim_seconds - render_seconds
                             - read_seconds - ff_seconds)
         alpha = 0.1   # EMA weight -- steady enough to read, quick enough to track
-        for name, secs in (("sim", sim_seconds), ("read", read_seconds),
-                           ("ff", ff_seconds), ("render", render_seconds),
-                           ("other", other_seconds)):
+        for name, secs in (("sim", sim_only), ("analysis", analysis_seconds),
+                           ("read", read_seconds), ("ff", ff_seconds),
+                           ("render", render_seconds), ("other", other_seconds)):
             self._prof_ms[name] += alpha * (secs * 1000.0 - self._prof_ms[name])
         total = sum(self._prof_ms.values()) or 1e-9
         def part(name):
             ms = self._prof_ms[name]
             return f"{name} {100.0 * ms / total:2.0f}% ({ms:4.1f}ms)"
         self._debug_line = (
-            f"DEBUG  {part('sim')}   {part('read')}   {part('ff')}   "
-            f"{part('render')}   {part('other')}   frame {total:4.1f}ms"
+            f"DEBUG  {part('sim')}  {part('analysis')}  {part('read')}  "
+            f"{part('ff')}  {part('render')}  {part('other')}  frame {total:4.1f}ms"
         )

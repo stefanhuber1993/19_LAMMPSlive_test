@@ -34,30 +34,33 @@ switchable *while the demo is running* -- press `1`/`2`/... or `Tab`:
 
 | key | name | potential | notes |
 |---|---|---|---|
-| `cu_eam` | Copper deposition (EAM) | real Cu EAM (`Cu_u3.eam`) | strong metallic bonding, high melting range (dial goes to 6000 K) |
-| `lj_argon` | Argon melting (Lennard-Jones) | generic `lj/cut`, real argon parameters | much softer/weaker, melts near 84 K (argon's real melting point) |
+| `mesomem_patch` | MesoMem membrane patch (**3D**) | the **real** MesoMem pair-style | 7-bead hexagonal patch (hexagon + center). Pull the **center bead** out along the on-screen **net** and feel tilt/splay resist through force feedback |
+| `mesomem_sheet` | MesoMem membrane sheet (**3D**) | same **real** MesoMem pair-style | the paper's planar-stability test at scale: a ~900-bead hexagonal sheet, periodic in-plane and barostat-relaxed to a tension-free spacing. Pull one bead out and watch tilt/splay propagate. A brightened cluster tags beads you can follow as they diffuse; beads crossfade across the periodic seam |
+| `mesomem_assembly` | MesoMem self-assembly (**3D**) | same **real** MesoMem pair-style | the paper's spontaneous-assembly run: 1500 beads at random positions and orientations in a periodic 20-sigma box coarsen into planar membranes. Play / Pause / Reset. Dial `k_tilt` through the compact-vs-planar transition (~10) and watch the morphology change |
+| `cu_deposition` | Copper deposition (EAM) | real Cu EAM (`Cu_u3.eam`) | strong metallic bonding, high melting range (dial goes to 10000 K) |
+| `lj_argon` | Argon melting (Lennard-Jones) | `lj/cut`, real argon parameters | much softer/weaker, melts near 84 K (argon's real melting point). `epsilon` is a live slider, so you can feel what the well depth does |
 | `nacl` | Salt crystal (ionic, NaCl) | Born-Mayer + damped shifted-force Coulomb (`born/coul/dsf`) | alternating Na(+)/Cl(-) ions (labeled `+`/`-`, drawn at their real size ratio) on a checkerboard square lattice -- the bipartite, 2D-stable ionic arrangement -- bound by Coulomb (Madelung) attraction |
 | `lipid` | Lipid membrane (coarse-grained) | soft repulsion + cosine-squared tail attraction (`cosine/squared`), harmonic bonds/angles, Langevin implicit solvent | a solvent-free 2D lipid bilayer of 3-bead amphiphiles (head + 2 tails); the puller is a lipid you also **orient** (joystick yaw / Q-E) to insert into the membrane. Inspired by the MesoMem model (Sillano, Marrink & Idema 2026); see the module docstring |
 | `mb_water` | Mercedes-Benz water (ice floats) | rigid 3-arm molecules (`fix rigid/small` + Langevin), directional hydrogen bond via `cosine/squared` arm-tip well | the 2D Mercedes-Benz water model (Ben-Naim 1971): each molecule is an O with three 120-degree hydrogen-bonding arms. Starts as the open hydrogen-bonded honeycomb **ice**; heat it and the network **collapses to denser liquid** -- water's freezing-expansion anomaly (why ice floats), with a live O-O spacing / density readout. The puller is a water molecule you also **orient** (joystick yaw / Q-E) to line its arms up and catch hydrogen bonds |
-| `mesomem` | MesoMem membrane patch (**3D**) | the **real** MesoMem pair-style (`mesomem`, Sillano, Marrink & Idema 2026): 4-2 soft core + cosine-squared attraction + orientation-dependent **tilt** and **splay** terms on oriented (dipole) beads | a 3D, perspective-rendered 7-bead membrane patch (hexagon + center). Each bead is a bilayer patch carrying a director (the yellow spike + the white-capped pole). Pull the **center bead** out of the sheet along the on-screen **net** (a plane perpendicular to the membrane) and feel tilt/splay resist through force feedback. Unlike `lipid` (which mimics MesoMem with stock styles), this loads the authors' actual C++ pair-style as a runtime LAMMPS plugin -- see below |
-| `membrane` | MesoMem membrane sheet (**3D**) | same **real** MesoMem pair-style as `mesomem` | the paper's planar-stability test at scale: a ~900-bead hexagonal sheet, periodic in-plane and barostat-relaxed to a tension-free spacing, then frozen for interactive pulling. Pull one bead out and watch tilt/splay propagate across the membrane. A brightened front-left bead + its six neighbours tag a cluster you can follow as it diffuses; beads crossfade smoothly across the periodic seam |
 
-Run `lammps-live --list-systems` to print this from the code. See
-"Adding a new system" below to add your own.
+Run `lammps-live --list` to print this from the code (and
+`--list-presets` for each playground's named parameter sets). The first five
+are **playgrounds** -- declarative ~40-line files; the last three are older
+hand-written systems. See "Writing a playground" below.
 
 ### The MesoMem force field (3D systems)
 
-The 3D `mesomem` and `membrane` systems run the authors' **actual** custom
+The three `mesomem_*` playgrounds run the authors' **actual** custom
 LAMMPS pair-style (`pair_membrane_sillano_v2.{cpp,h}` from
 [gitlab.tudelft.nl/idema-group/mesomem](https://gitlab.tudelft.nl/idema-group/mesomem),
 [arXiv:2602.24123](https://arxiv.org/abs/2602.24123)), rather than approximating
 it. Because the pip-installed LAMMPS ships the `PLUGIN` package, we don't rebuild
-LAMMPS: the sources are **vendored** in `lammps_live/systems/mesomem_ff/` and
+LAMMPS: the sources are **vendored** in `lammps_live/forcefields/mesomem_ff/` and
 compiled once into a small shared library that is pulled in at runtime with
 `plugin load`. The build runs automatically the first time you open one of these
 systems (and rebuilds only when a source file changes); it uses the C++ compiler
 and MPICH headers from the [prerequisites](#1-system-prerequisites) above, so
-there is no separate download or manual build step -- set `MESOMEM_MPI_INCLUDE`
+there is no separate download or manual build step -- set `LAMMPS_LIVE_MPI_INCLUDE`
 only if the `mpi.h` auto-detection ever misses.
 
 The three general problems this system solves -- **compiling a custom LAMMPS
@@ -137,7 +140,7 @@ Why MPICH specifically: the `lammps` PyPI wheel dynamically links MPICH's
 ABI-incompatible with Open MPI, so MPICH -- not Open MPI -- must be what your
 system resolves at runtime *and* what the plugin build compiles against. (The
 plugin build auto-detects `mpi.h` via `mpicxx`/the usual install paths; override
-with `MESOMEM_MPI_INCLUDE` if it ever misses.)
+with `LAMMPS_LIVE_MPI_INCLUDE` if it ever misses.)
 
 ### 2. Install
 
@@ -210,8 +213,13 @@ before trying `--input joystick`.
 lammps-live --input mouse                        # pointer: position moves, L/R buttons rotate
 lammps-live --input keyboard                       # WASD moves, Q/E rotate (no pointer)
 lammps-live --input joystick                      # Sidewinder FF2
-lammps-live --input mouse --system lj_argon        # start on a specific system
-lammps-live --list-systems                          # print available systems and exit
+lammps-live --playground mesomem_sheet             # start on a specific playground
+lammps-live --playground mesomem_assembly --mode game   # override its mode
+lammps-live --playground mesomem_sheet --preset buckled # start from a named parameter set
+lammps-live --playground ./my_idea.py              # your own playground file, from anywhere
+lammps-live --list                                 # print everything runnable and exit
+lammps-live --list-presets                         # print each playground's presets
+lammps-live --verify                               # check the force fields against LAMMPS
 ```
 
 **Controls:**
@@ -227,8 +235,13 @@ lammps-live --list-systems                          # print available systems an
   turn a lipid head-out to insert it into the bilayer, or line a water molecule's
   arms up to catch hydrogen bonds
 - Mouse-drag the **Temperature** / **Puller damping** sliders in the
-  right-hand panel (works regardless of `--input` mode); the 3D MesoMem systems
-  add **k_tilt** / **k_splay** / **eta** force-field sliders below them
+  right-hand panel (works regardless of `--input` mode). Below them sits one
+  slider **per live force-field parameter**, generated automatically from the
+  force field's declarations -- **k_tilt** / **k_splay** / **zeta** (and
+  **rc** / **wc** / **splay symmetry** under "Advanced") for MesoMem,
+  **epsilon** / **sigma** / **cutoff** for Lennard-Jones
+- `Space` / `R` -- Play-Pause / Reset, on playgrounds running in **sim** mode
+  (`mesomem_assembly`, or anything started with `--mode sim`)
 - `Up`/`Down` arrow keys or the mouse scroll wheel -- nudge Temperature
 - `Esc` or closing the window -- quit
 
@@ -262,18 +275,39 @@ lammps_live/
   forcefeedback.py  force -> device-feedback signal shaping, parameterized by each
                      system's ForceFeedbackProfile
   units.py          metal-units -> SI display conversions (sim time, puller speed)
-  systems/
-    base.py           MDSystem interface + SystemSpec/SliderSpec/ForceFeedbackProfile
-    cu_deposition.py  copper EAM system
-    lj_argon.py       argon Lennard-Jones system
-    nacl.py           ionic NaCl (Born-Mayer + DSF Coulomb) system
-    lipid_membrane.py coarse-grained lipid bilayer system
-    mb_water.py       2D Mercedes-Benz water (rigid 3-arm, hydrogen bonds) system
-    mesomem_hex.py    3D MesoMem 7-bead membrane patch (real pair-style)
-    mesomem_sheet.py  3D MesoMem ~900-bead periodic membrane sheet
-    rdf2d.py          in-plane radial distribution function (shared by the 3D systems)
-    mesomem_ff/       vendored MesoMem C++ pair-style + the runtime plugin builder
+  catalog.py        one listing of everything runnable: playgrounds + legacy systems
+  playground/       the declarative layer (see "Writing a playground")
+    spec.py           Playground + Control -- what a playground file declares
+    params.py         Param/ParamSet + the STRUCTURAL / HOT / HOT_RESTYLE tiers
+                       that decide file-time vs slider-time
+    forcefield.py     ForceField interface + registry
+    scenario.py       Scenario interface, the membrane geometries, housekeeping forces
+    deposition.py     the 2D crystal-slab + free-puller scenario
+    thermostat.py     Langevin (implicit solvent) and CSVR (velocity rescaling)
+    modes.py          game (controlled particle, leash, haptics) vs sim (Play/Pause/Reset)
+    observables.py    declared observables + the throttled analysis scheduler
+    state.py          Box, FrameState, the shared pair list -- pure numpy, no LAMMPS
+    rdf.py            in-plane, 3D-radial and LAMMPS-native radial distribution functions
+    verify.py         cross-checks a force field's Python energy against LAMMPS
+    system.py         PlaygroundSystem: composes the above into an MDSystem
+    registry.py       discovers playground files (bundled, or any path)
+  playgrounds/        one file per explorable setup
+    mesomem_patch.py     7-bead MesoMem patch
+    mesomem_sheet.py     ~900-bead periodic MesoMem sheet
+    mesomem_assembly.py  1500-bead MesoMem self-assembly (sim mode)
+    lj_argon.py          2D Lennard-Jones argon deposition
+    cu_deposition.py     2D copper EAM deposition
+  forcefields/
+    mesomem.py        the real MesoMem pair-style + its one vectorized energy expression
+    stock.py          LennardJones and EAM, on stock LAMMPS styles (no C++)
+    mesomem_ff/       vendored MesoMem C++ sources, compiled on demand
     data/             bundled potential files (Cu_u3.eam)
+  systems/            the older hand-written systems
+    base.py           MDSystem / MDSystem3D interfaces + SystemSpec/SliderSpec/
+                       ForceFeedbackProfile
+    nacl.py           ionic NaCl (Born-Mayer + DSF Coulomb)
+    lipid_membrane.py coarse-grained lipid bilayer
+    mb_water.py       2D Mercedes-Benz water (rigid 3-arm, hydrogen bonds)
   input/
     base.py     InputSource interface
     mouse.py    mouse control
@@ -294,32 +328,101 @@ lammps_live/
     renderer.py     the sim box + instrumentation panel (2D and 3D paths)
 ```
 
-## Adding a new system
+## Writing a playground
 
-Each system is one self-contained module implementing `MDSystem` (see
-`lammps_live/systems/base.py`'s docstrings for the full interface). At
-minimum:
+A **playground** is one file naming a **force field**, a **scenario** and a
+**mode**. That is the whole thing -- no class to subclass, no methods to
+implement, and no registry to edit:
 
-1. Create `lammps_live/systems/my_system.py`. Set up your LAMMPS box in
-   `__init__`/a private `_build` method -- `cu_deposition.py` and
-   `lj_argon.py` are two working examples with the same region/group/fix
-   layout (crystal + frozen floor + interactively-controlled puller +
-   csvr velocity-rescaling thermostat + RDF), just with different pair
-   styles/constants.
-2. Define a module-level `SystemSpec` (temperature/damping slider ranges,
-   melt-temp dial mark, a `max_input_force` -- the single force ceiling every
-   input device shares -- and a `ForceFeedbackProfile` scaled to your
-   potential's characteristic force magnitude -- see the comments on
-   `max_input_force` and `ForceFeedbackProfile` in `base.py` for why these need
-   tuning per system) and set it as the class's `spec` attribute.
-3. Register it in `lammps_live/systems/__init__.py`'s `REGISTRY` dict.
+```python
+# lammps_live/playgrounds/my_idea.py
+from ..playground import Control, Playground, compose, hex_patch
 
-Nothing in `app.py`, `forcefeedback.py`, or `ui/` needs to change -- they
-only depend on the `MDSystem`/`SystemSpec` interface. If you're adding a
-system with a genuinely different interaction (e.g. no puller/deposition
-concept at all), the interface will need extending; open an issue/PR
-description explaining the shape rather than special-casing it in the
-existing systems.
+PLAYGROUND = Playground(
+    name="MesoMem: two patches colliding",
+    force_field="mesomem",
+    scenario=compose(hex_patch(n_rings=2, at=(-6, 0, 0)),
+                     hex_patch(n_rings=2, at=(+6, 0, 0))),
+    mode="game",
+    control=Control(atom="nearest:0,0,0", plane="xz", leash=(5.0, 3.0)),
+    observables=["nematic_S", "mean_tilt_deg"],
+    presets={"floppy": {"k_tilt": 2.0, "k_splay": 0.1}},
+)
+```
+
+Drop it in `lammps_live/playgrounds/` and it appears in `--list`, or keep it
+anywhere and run `lammps-live --playground path/to/my_idea.py`.
+
+### What goes in the file, and what goes on a slider
+
+One rule decides it: **does changing this require rebuilding the simulation?**
+
+| tier | examples | where |
+|---|---|---|
+| `STRUCTURAL` | particle counts, box size, boundary conditions, lattice spacing | **file only** -- a slider here would tear down and rebuild the simulation on every drag frame, throwing away the state you were watching |
+| `HOT` | `pair_coeff` arguments, thermostat target | **slider, generated automatically** from the declared range/default/optimum |
+| `HOT_RESTYLE` | a cutoff that moves the pair style's *global* cutoff (`rc`) | same, but the whole `pair_style` is re-declared first |
+| `DERIVED` | `wc <= rc` | a declared clamp, applied everywhere the value is read |
+
+A force field declares each parameter **once** (see
+`lammps_live/playground/params.py`) and the slider follows. A playground can
+widen or narrow a slider's span for its own purposes with `param_ranges`, since
+what is worth exploring on a 7-bead patch differs from a 900-bead sheet.
+
+### Writing a force field
+
+A force field owns its parameters, its LAMMPS commands, and -- optionally -- one
+vectorized Python expression of its energy, decomposed into the additive terms it
+is built from. Subclass `ForceField`, `@register` it, and you are done;
+`forcefields/mesomem.py` is a custom C++ pair style and `forcefields/stock.py`
+holds two built on stock LAMMPS styles with no C++ at all.
+
+**Custom C++ pair styles are compiled on demand.** Point a `PluginSpec` at a
+directory of `pair_*.cpp` sources and they are built into a shared library and
+pulled into the stock pip-installed LAMMPS with `plugin load`, rebuilt only when
+a source changes. Edit your C++, restart, and the sliders still work.
+
+**The energy expression is a test, not just a panel.** It drives the live
+additive-energy bars, and `lammps-live --verify` asserts that its terms sum to
+the potential energy LAMMPS computed from the compiled pair style, across several
+parameter regimes:
+
+```
+$ lammps-live --verify
+[verify] OK   mesomem_patch [defaults]
+    LAMMPS  potential energy : -12.3908...
+    Python  sum of terms     : -12.3908...
+    relative error           : 2.868e-16 (tolerance 1e-06)
+      isotropic  (repel + attract)           -12.4046  (+100.1%)
+      tilt  (directors normal to bonds)      +0.01377  (-0.1%)
+      splay  (neighbour directors align)     +1.218e-06 (-0.0%)
+```
+
+If your C++ and the expression you meant to implement disagree, this is where it
+shows up -- as a number, at startup. Force fields whose energy is not
+pairwise-additive (EAM) declare no terms and are correctly skipped.
+
+### Scenarios, modes and observables
+
+- **Scenarios** (`playground/scenario.py`, `playground/deposition.py`) own
+  geometry, the cell, relaxation and per-frame housekeeping. The core contract is
+  pure numpy -- `build(params, rng) -> positions, directors, box` -- so a scenario
+  is unit-testable with no LAMMPS instance, and its particles reach LAMMPS in a
+  single `create_atoms` call.
+- **Modes** (`playground/modes.py`) are chosen at run time, not baked in, so
+  `--mode game` and `--mode sim` both work on *any* playground. That is what lets
+  you watch a structure self-assemble and then grab a particle and probe it.
+- **Observables** (`playground/observables.py`) are named quantities -- nematic
+  order `S`, membrane thickness, coordination -- declared by name and plotted
+  live. They run on a declared cadence with a shared pair list, so adding them
+  does not cost the frame budget.
+
+### The older hand-written systems
+
+`nacl`, `lipid` and `mb_water` are still monolithic `MDSystem` subclasses (see
+`lammps_live/systems/base.py`). They work unchanged and are listed alongside the
+playgrounds, but new work should be a playground. Nothing in `app.py`,
+`forcefeedback.py` or `ui/` depends on which kind it is.
 
 ## Units and physics notes, for readers who know physics but not MD
 
