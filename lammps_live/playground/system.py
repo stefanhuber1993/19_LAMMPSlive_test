@@ -21,6 +21,7 @@ from .modes import GameMode, SimMode, select_controlled
 from .observables import Analysis
 from .rdf import InPlaneRDF, RadialRDF3D
 from .scenario import Scenario
+from .smoothing import TrajectorySmoother
 from .state import Box, FrameState, normalize_rows
 
 
@@ -88,8 +89,34 @@ def make_spec(playground, mode_name=None, preset=None):
         # declaration. The old code wrote each of these out twice: as a
         # SliderSpec here and again as a string key in a hand-maintained
         # set_extra_param dispatch dict, in each of three system modules.
-        extra_sliders=params.slider_specs(playground.param_ranges),
+        extra_sliders=(params.slider_specs(playground.param_ranges)
+                       + smoothing_slider_specs(playground, scenario)),
     )
+
+
+# The view key `set_extra_param` recognises, alongside the force field's own live
+# parameters. Not a ParamSet entry, because it never reaches LAMMPS.
+SMOOTHING_KEY = "view_smoothing"
+# The slider's top end, as a number of frames' worth of memory. 20 frames is a
+# third of a second at 60 Hz -- enough to flatten the rattle completely while a
+# real rearrangement still reads as prompt.
+SMOOTHING_MAX_FRAMES = 20
+
+
+def smoothing_slider_specs(playground, scenario):
+    """The trajectory-smoothing slider, or nothing if the playground declines it.
+
+    The span is expressed in the scenario's own simulated time, scaled to its
+    per-frame slice, so "full right" means the same ~20 frames of averaging on
+    every playground rather than an arbitrary constant that would be gentle on one
+    and glacial on the next.
+    """
+    if not playground.trajectory_smoothing:
+        return ()
+    per_frame = scenario.sim_time_per_frame
+    return (SliderSpec("Smoothing", 0.0, SMOOTHING_MAX_FRAMES * per_frame, 0.0,
+                       fmt="{:.2f}", unit=" tau", key=SMOOTHING_KEY,
+                       advanced=True),)
 
 
 class PlaygroundSystem(MDSystem3D):
@@ -120,6 +147,15 @@ class PlaygroundSystem(MDSystem3D):
         self._state_frame = -1
         self._order_cache = None
         self._order_frame = -1
+        # Visual-only trajectory smoothing (see smoothing.py). Its own frame cache,
+        # deliberately separate from the analysis one: the filtered coordinates must
+        # reach the renderer and NOTHING else, so the two states cannot share a
+        # slot that an observable might pick up by accident.
+        self._smoothing_tau = 0.0
+        self._smoother = TrajectorySmoother()
+        self._render_cache = None
+        self._render_frame = -1
+        self._last_step_dt = 0.0
         self.analysis_seconds = 0.0
         # Latched message once the simulation has been driven unstable, else None,
         # plus the last finite thermo reading to fall back on.
@@ -135,6 +171,10 @@ class PlaygroundSystem(MDSystem3D):
             is not Scenario.director_housekeeping
         )
 
+        # Whether the next `run` has to do a full setup (neighbour rebuild + force
+        # evaluation) because something structural changed since the last one.
+        # See command() and step().
+        self._setup_dirty = True
         self.lmp = None
         self._setup(self._new_seed())
 
@@ -266,6 +306,12 @@ class PlaygroundSystem(MDSystem3D):
         if hasattr(self.mode, "on_built"):
             self.mode.on_built()
         self._rdf = self._make_rdf()
+        self._setup_dirty = True   # the first chunk after a build sets up in full
+        # A rebuild is a new set of particles; a filter still holding the old ones
+        # would drag the first frames of the new scene toward the previous one.
+        self._smoother.reset()
+        self._render_cache = None
+        self._render_frame = -1
         self._sim_time = 0.0
         # Populate the panels for the paused first frame (sim mode shows its fresh
         # state before Play is pressed, and would otherwise show empty bars).
@@ -336,6 +382,36 @@ class PlaygroundSystem(MDSystem3D):
         self.analysis = Analysis(self.force_field, self.playground.observables)
         self._unstable = None      # a rebuild is the way out of an unstable state
         self._setup(self._new_seed())
+
+    # ---- mid-flight commands ------------------------------------------------
+
+    def command(self, cmd):
+        """Issue a LAMMPS command between chunks, and remember that the next `run`
+        must therefore do a full setup.
+
+        EVERY mid-flight command goes through here rather than straight to
+        self.lmp, because `run ... pre no` (see step()) is only valid while the
+        system has not changed structurally, and the things this app changes
+        between chunks -- redefining the thermostat fix, re-issuing pair
+        coefficients or a whole pair style, a scenario's per-frame command --
+        are exactly the changes that invalidate it.
+
+        The flag is set for ANY command, not only the ones that genuinely matter
+        (a bare `velocity` change does not need a re-setup), because a
+        conservative flag costs one full setup on the frames where a control
+        actually moved, while getting the distinction wrong costs silently wrong
+        forces. The systems where the saving matters -- the big MesoMem ones --
+        issue no per-frame commands at all, so they take `pre no` every frame.
+
+        Direct writes into the extracted x/v/mu/omega arrays (housekeeping, the
+        controlled particle's constraints) deliberately do NOT set the flag: they
+        change no fix, pair style, box or atom count. What they do cost is that
+        the first step of the next chunk sees forces computed before the write --
+        one step of staleness on a clamp that moves an atom by a fraction of a
+        lattice spacing, which is far below the thermostat noise it swims in.
+        """
+        self._setup_dirty = True
+        self.lmp.command(cmd)
 
     # ---- id <-> local-index bookkeeping -------------------------------------
 
@@ -420,23 +496,30 @@ class PlaygroundSystem(MDSystem3D):
         seed = random.randint(1, 900_000_000)
         for cmd in self._thermostat.pre_change_commands(
                 self._bath_group, self._measured_temp(), T, seed):
-            self.lmp.command(cmd)
+            self.command(cmd)
         for cmd in self._thermostat.set_commands(
                 self._bath_group, T,
                 self.scenario.thermostat_damp(self.scenario_params), seed):
-            self.lmp.command(cmd)
+            self.command(cmd)
 
     def set_extra_param(self, key, value):
         """Live force-field dials. Generic: the Param's declared tier decides
         whether the coefficients or the whole pair style get re-issued, and its
         declared clamp is applied when the value is read. No per-system dispatch
         table, and no `if key == "rc"` special case."""
+        # The one slider that is not a force-field parameter: it changes how the
+        # frame is DRAWN and issues no command, so it is handled before the
+        # ParamSet lookup (which would reject it) and never reaches self.command
+        # -- a view setting must not cost the next chunk its `pre no`.
+        if key == SMOOTHING_KEY:
+            self._smoothing_tau = max(0.0, float(value))
+            return
         if not self.params.has(key):
             return
         if not self.params.set(key, value):
             return
         for cmd in self.force_field.live_commands(self.params, key):
-            self.lmp.command(cmd)
+            self.command(cmd)
 
     def step(self, n):
         """Advance the simulation, surviving a user-induced blow-up.
@@ -448,20 +531,42 @@ class PlaygroundSystem(MDSystem3D):
         loses the session, which is a far worse outcome than a visibly broken
         simulation the user can Reset or dial back out of. So it is caught, latched,
         and reported in the HUD; stepping stops until a rebuild.
+
+        A chunk is a fresh `run`, and by default LAMMPS treats each one as a new
+        simulation: it rebuilds the neighbour lists and evaluates the forces once
+        before taking the first step. Nothing in a 20-step chunk warrants that --
+        it repeats work the previous chunk's last step already did -- so it is
+        skipped with `pre no` whenever nothing structural has changed since,
+        which command() tracks. `post no` drops the end-of-run timing summary
+        that -screen none throws away anyway.
+
+        Measured on the MesoMem systems (900-1500 beads, 20 steps/chunk), this
+        takes 1-2 ms off an 18 ms chunk, i.e. 5-14%; the end-of-run thermo
+        evaluation still happens, so get_thermo and the per-atom computes the app
+        reads every frame stay exact (verified against a forced `run 0`).
         """
         from time import perf_counter
         if self._unstable:
             return
         dt = n * self.scenario.timestep
+        setup = "" if self._setup_dirty else " pre no post no"
         try:
-            self.lmp.command(f"run {n}")
+            self.lmp.command(f"run {n}{setup}")
         except Exception as exc:
             self._unstable = str(exc).strip().splitlines()[0]
             return
+        # Only now: a run that threw leaves the instance in an unknown state, and
+        # the next one (after a rebuild) should set up in full.
+        self._setup_dirty = False
         # Bump the frame counter immediately: `run` may have reordered LAMMPS'
         # local arrays, so every id-order and frame-state cache is now stale.
         # Everything below this line sees consistent, freshly-gathered data.
         self._frame += 1
+        # The sim time this frame covered, which is the interval the visual
+        # smoothing filter averages over (see _render_state). Taken from the actual
+        # chunk rather than the scenario's nominal per-frame slice, so a capped or
+        # short chunk filters by what it really advanced.
+        self._last_step_dt = dt
         self._apply_housekeeping(dt)
         # Constrain AFTER the housekeeping kick, so the readouts (and the
         # renderer) see the post-constraint positions -- the order the original
@@ -470,7 +575,7 @@ class PlaygroundSystem(MDSystem3D):
         # Per-frame commands that depend on measured state and so cannot be a fix
         # (e.g. a drag proportional to this frame's centre-of-mass velocity).
         for cmd in self.scenario.frame_commands(self.scenario_params, self.lmp):
-            self.lmp.command(cmd)
+            self.command(cmd)
         self._sim_time += dt
         t0 = perf_counter()
         self.analysis.update(self._analysis_state(), self.params)
@@ -589,6 +694,35 @@ class PlaygroundSystem(MDSystem3D):
             self._state_frame = self._frame
         return self._state
 
+    def _render_state(self):
+        """The frame state AS DRAWN: the physics state, optionally temporally
+        smoothed (see smoothing.py). Rebuilt at most once per frame, which is also
+        what advances the filter exactly one step per frame however many readouts
+        ask for it.
+
+        Everything that goes on screen comes through here, so the beads, their
+        directors, the bond sticks between them and their wrapped ghosts all agree
+        on where a particle is. Everything that MEASURES -- the observables, the
+        RDF, the energy panels, the puller's own position and the haptics -- goes
+        through _analysis_state() instead and never sees the filtered coordinates.
+        """
+        state = self._analysis_state()
+        if self._smoothing_tau <= 0.0:
+            if self._smoother.active:
+                self._smoother.reset()
+            return state
+        if self._render_frame != self._frame:
+            # The controlled particle is written straight through: the user is
+            # moving it deliberately, so its motion is signal, not the jitter this
+            # is here to hide -- and it has to keep agreeing with the puller marker
+            # and force arrows, which are drawn from the unsmoothed physics.
+            self._render_cache = self._smoother.apply(
+                state, self._smoothing_tau, self._last_step_dt,
+                keep_exact=(None if self.controlled_id is None
+                            else self.controlled_id - 1))
+            self._render_frame = self._frame
+        return self._render_cache
+
     def get_potential_terms(self):
         """The controlled particle's share of the additive energy.
 
@@ -636,7 +770,7 @@ class PlaygroundSystem(MDSystem3D):
         so an ionic lattice draws its cations and anions at their own sizes and
         colours. A single-type force field reports None and every particle is
         drawn the same."""
-        state = self._analysis_state()
+        state = self._render_state()
         species = None
         if self.force_field.n_types > 1 and state.types is not None:
             species = (np.asarray(state.types) - 1).astype(int)
@@ -678,11 +812,11 @@ class PlaygroundSystem(MDSystem3D):
     # ---- 3D rendering data --------------------------------------------------
 
     def get_positions_3d(self):
-        state = self._analysis_state()
+        state = self._render_state()
         return state.ids, state.positions, self._is_controlled_mask()
 
     def get_dipoles_3d(self):
-        state = self._analysis_state()
+        state = self._render_state()
         if state.directors is None:
             return np.zeros((len(state.positions), 3))
         return state.directors

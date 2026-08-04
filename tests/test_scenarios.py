@@ -13,8 +13,9 @@ from lammps_live.playground.params import Param, ParamSet, Tier, structural
 from lammps_live.playground.scenario import (
     HexPatch, HexSheet, RandomFill, align_normal_rate, compose, hex_patch,
 )
+from lammps_live.playground.smoothing import TrajectorySmoother
 from lammps_live.playground.state import (
-    Box, build_pairs, hex_lattice_2d, hex_ring_2d, principal_normal,
+    Box, FrameState, build_pairs, hex_lattice_2d, hex_ring_2d, principal_normal,
 )
 
 
@@ -321,3 +322,94 @@ def test_upright_field_off_at_zero():
     n = rng.normal(size=(64, 3))
     n /= np.linalg.norm(n, axis=1, keepdims=True)
     assert scen.director_housekeeping(np.zeros_like(n), n, params) is None
+
+
+# --- visual trajectory smoothing ----------------------------------------------
+
+def _state(pos, dirs=None, box=None):
+    return FrameState(positions=np.asarray(pos, dtype=float), directors=dirs,
+                      box=box or Box.cube(10.0, periodic=(True, True, True)))
+
+
+def test_smoothing_off_returns_the_state_untouched():
+    sm = TrajectorySmoother()
+    st = _state([[1.0, 2.0, 3.0]])
+    assert sm.apply(st, tau=0.0, dt=0.1) is st
+    assert not sm.active
+
+
+def test_smoothing_first_frame_seeds_rather_than_lagging():
+    """A filter that started from zero would drag the whole scene in from the
+    origin on the frame it was switched on."""
+    sm = TrajectorySmoother()
+    st = _state([[1.0, 2.0, 3.0]])
+    assert sm.apply(st, tau=1.0, dt=0.1) is st
+    assert sm.active
+
+
+def test_smoothing_lags_toward_the_live_position_at_the_declared_rate():
+    sm = TrajectorySmoother()
+    tau, dt = 1.0, 0.5
+    sm.apply(_state([[0.0, 0.0, 0.0]]), tau, dt)          # seed at the origin
+    out = sm.apply(_state([[1.0, 0.0, 0.0]]), tau, dt)
+    assert out.positions[0][0] == pytest.approx(1.0 - math.exp(-dt / tau))
+
+
+def test_smoothing_weight_is_per_sim_time_not_per_frame():
+    """Two half-length frames must land where one full-length frame does, or the
+    amount of smoothing would depend on the frame rate."""
+    one, two = TrajectorySmoother(), TrajectorySmoother()
+    target = _state([[1.0, 0.0, 0.0]])
+    one.apply(_state([[0.0, 0.0, 0.0]]), tau=1.0, dt=0.4)
+    a = one.apply(target, tau=1.0, dt=0.4).positions[0][0]
+    two.apply(_state([[0.0, 0.0, 0.0]]), tau=1.0, dt=0.2)
+    two.apply(target, tau=1.0, dt=0.2)
+    b = two.apply(target, tau=1.0, dt=0.2).positions[0][0]
+    assert b == pytest.approx(a, abs=0.02)
+
+
+def test_smoothing_follows_a_particle_across_a_periodic_seam():
+    """THE failure mode: averaging x = +4.9 with x = -4.9 across a periodic wall
+    puts the drawn bead in the middle of the box, streaking through everything."""
+    box = Box.cube(10.0, periodic=(True, True, True))
+    sm = TrajectorySmoother()
+    sm.apply(_state([[4.9, 0.0, 0.0]], box=box), tau=1.0, dt=0.5)
+    out = sm.apply(_state([[-4.9, 0.0, 0.0]], box=box), tau=1.0, dt=0.5)
+    x = out.positions[0][0]
+    # It must stay near the seam (either side) and never near the middle.
+    assert abs(abs(x) - 5.0) < 0.5, x
+    # And inside the cell, so the renderer's wrap/ghost logic still holds.
+    assert -5.0 <= x < 5.0
+
+
+def test_smoothing_keeps_the_controlled_particle_exact():
+    """The particle the user is dragging is signal, not jitter -- and the puller
+    marker drawn over it comes from the unsmoothed physics."""
+    sm = TrajectorySmoother()
+    sm.apply(_state([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]), tau=1.0, dt=0.5)
+    out = sm.apply(_state([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]), tau=1.0, dt=0.5,
+                   keep_exact=1)
+    assert out.positions[1][0] == pytest.approx(1.0)
+    assert out.positions[0][0] < 0.9
+
+
+def test_smoothing_normalizes_smoothed_directors():
+    sm = TrajectorySmoother()
+    a = np.array([[0.0, 0.0, 1.0]])
+    b = np.array([[1.0, 0.0, 0.0]])
+    sm.apply(_state([[0.0, 0.0, 0.0]], dirs=a), tau=1.0, dt=0.5)
+    out = sm.apply(_state([[0.0, 0.0, 0.0]], dirs=b), tau=1.0, dt=0.5)
+    assert np.linalg.norm(out.directors[0]) == pytest.approx(1.0)
+    assert 0.0 < out.directors[0][0] < 1.0     # partway from a toward b
+
+
+def test_smoothing_drops_a_nan_frame_instead_of_poisoning_the_history():
+    """An unstable simulation hands back NaN; one NaN in the running average would
+    make every later frame NaN too, long after a Reset."""
+    sm = TrajectorySmoother()
+    sm.apply(_state([[0.0, 0.0, 0.0]]), tau=1.0, dt=0.5)
+    bad = _state([[np.nan, 0.0, 0.0]])
+    assert sm.apply(bad, tau=1.0, dt=0.5) is bad
+    assert not sm.active
+    good = _state([[1.0, 0.0, 0.0]])
+    assert np.isfinite(sm.apply(good, tau=1.0, dt=0.5).positions).all()

@@ -201,7 +201,17 @@ class GameMode(Mode):
     def control_commands(self, params):
         if self.runtime.controlled_id is None:
             return []
-        cmds = ["fix drive controlled addforce 0.0 0.0 0.0",
+        # The drive is variable-driven rather than a literal force, so that
+        # steering it (set_input_force, potentially every frame) sets three
+        # internal variables instead of REDEFINING the fix. Redefining a fix
+        # invalidates `run ... pre no` -- so the old literal form silently cost
+        # every interactive system a full neighbour rebuild and force evaluation
+        # per chunk, for a number that fix addforce is perfectly happy to read
+        # from a variable each step. See PlaygroundSystem.command.
+        cmds = ["variable drive_x internal 0.0",
+                "variable drive_y internal 0.0",
+                "variable drive_z internal 0.0",
+                "fix drive controlled addforce v_drive_x v_drive_y v_drive_z",
                 f"fix damp controlled viscous {self._damping}"]
         if self.control.displacement_cap:
             # An unconfined particle needs a per-step displacement cap to survive
@@ -253,9 +263,10 @@ class GameMode(Mode):
         f = [0.0, 0.0, 0.0]
         f[self.u_axis] = fx
         f[self.v_axis] = fy
-        self.runtime.lmp.command(
-            f"fix drive controlled addforce {f[0]} {f[1]} {f[2]}"
-        )
+        # Not a command: setting the internal variables the drive fix reads leaves
+        # the fix itself untouched, so the next chunk can still skip its setup.
+        for name, value in zip(("drive_x", "drive_y", "drive_z"), f):
+            self.runtime.lmp.set_internal_variable(name, value)
 
     def set_damping(self, gamma):
         lo, hi = self.control.damping_range
@@ -264,7 +275,9 @@ class GameMode(Mode):
             return
         self._damping = gamma
         if self.runtime.controlled_id is not None:
-            self.runtime.lmp.command(f"fix damp controlled viscous {gamma}")
+            # Redefines a fix, so it goes through command(): the chunk after a
+            # damping change does a full setup, the ones after it do not.
+            self.runtime.command(f"fix damp controlled viscous {gamma}")
 
     def steer_orientation(self, rate, dt):
         # Sign flipped so the twist turns the director the way the hand expects

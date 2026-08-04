@@ -95,5 +95,9 @@ PLAYGROUND = Playground(
     melt_temp=0.3,
     particle_radius=0.5,
     reduced_units=True,
+    # A warm sheet ripples thermally at every wavelength at once; smoothing the
+    # drawn beads leaves the long-wavelength undulations and the healing of a hole
+    # visible without the shimmer on top. Advanced slider, 0 (off) by default.
+    trajectory_smoothing=True,
     render_style=STYLE,
 )

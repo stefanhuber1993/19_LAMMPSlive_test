@@ -91,6 +91,10 @@ PLAYGROUND = Playground(
     melt_temp=0.3,
     particle_radius=0.5,
     reduced_units=True,
+    # The clearest case for it: coarsening is a slow collective change buried under
+    # a fast thermal rattle, and the rattle is what a still frame is mostly made of.
+    # Advanced slider, 0 (off) by default. See playground/smoothing.py.
+    trajectory_smoothing=True,
     render_style=STYLE,
     # Nothing here is steered, and what forms is a 3D morphology -- whether the
     # aggregates are compact droplets or flat lamellae is exactly the thing one

@@ -94,5 +94,9 @@ PLAYGROUND = Playground(
     melt_temp=0.3,
     particle_radius=0.5,
     reduced_units=True,
+    # Offered for consistency with the other two, but this is the one playground it
+    # works against: with seven beads their individual motion IS the subject, and
+    # enough smoothing will soften the director flip the patch exists to show.
+    trajectory_smoothing=True,
     render_style=STYLE,
 )

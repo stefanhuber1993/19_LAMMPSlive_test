@@ -153,6 +153,13 @@ class Playground:
     # what is forming is a 3D morphology and one fixed angle hides it. A
     # render_style.CameraOrbit, or None.
     camera_orbit: object = None
+    # Offer the "Smoothing" slider (an advanced control): a visual-only temporal
+    # low-pass on the drawn bead positions and directors, so thermal jitter
+    # averages out of the picture and the slow rearrangements underneath it are
+    # what the eye follows. See playground/smoothing.py. Worth it on a scene whose
+    # interest IS a slow collective change (assembly, a healing membrane);
+    # pointless on a handful of beads whose individual motion is the subject.
+    trajectory_smoothing: bool = False
     element_label: str = ""            # legend text, e.g. "Ar (LJ)"
     lattice_spacing: float = 1.0       # informational, and the bond-overlay optimum
     # Flat draw colour for a single-species 2D system, so different materials read
