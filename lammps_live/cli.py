@@ -4,7 +4,7 @@
 A PLAYGROUND names a force field, a scenario and a mode; every live force-field
 parameter becomes a slider you can drag while the simulation runs. Add a new one
 by writing a ~30-line file in lammps_live/playgrounds/ (or anywhere, and pass its
-path). Older hand-written systems still work and are listed alongside.
+path).
 
     lammps-live --list                          # everything runnable
     lammps-live --playground mesomem_sheet      # drag one bead out of a membrane
@@ -30,8 +30,8 @@ def build_parser():
                              "(default: mouse)")
     parser.add_argument("--playground", "--system", dest="target", default=None,
                         metavar="KEY_OR_PATH",
-                        help="what to run: a bundled playground or legacy system "
-                             "key, or a path to your own playground .py "
+                        help="what to run: a bundled playground key, or a path "
+                             "to your own playground .py "
                              "(default: the first playground; see --list)")
     parser.add_argument("--mode", choices=["game", "sim"], default=None,
                         help="override a playground's mode: game (drive a "
@@ -60,18 +60,13 @@ def build_parser():
 
 
 def _print_listing():
-    from . import catalog
-    entries = catalog.list_entries()
-    width = max((len(k) for k, _s, _kd in entries), default=12)
-    for kind_name, kind in (("Playgrounds", catalog.PLAYGROUND),
-                            ("Legacy systems", catalog.SYSTEM)):
-        rows = [(k, s) for k, s, kd in entries if kd == kind]
-        if not rows:
-            continue
-        print(f"\n{kind_name}:")
-        for key, spec in rows:
-            mode = "sim " if spec.playback_controls else "game"
-            print(f"  {key:<{width}}  [{mode}]  {spec.name} -- {spec.description}")
+    from .playground import registry
+    entries = registry.list_playgrounds()
+    width = max((len(k) for k, _s in entries), default=12)
+    print("\nPlaygrounds:")
+    for key, spec in entries:
+        mode = "sim " if spec.playback_controls else "game"
+        print(f"  {key:<{width}}  [{mode}]  {spec.name} -- {spec.description}")
     print()
     return 0
 
@@ -130,14 +125,14 @@ def main(argv=None):
             js.close()
         return 0
 
-    from . import catalog
+    from .playground import registry
     if args.target:
-        initial_key = catalog.resolve(args.target)
+        initial_key = registry.resolve(args.target)
     else:
-        entries = catalog.list_entries()
-        if not entries:
-            parser.error("nothing runnable found")
-        initial_key = entries[0][0]
+        keys = registry.bundled_keys()
+        if not keys:
+            parser.error("no playgrounds found")
+        initial_key = keys[0]
 
     from .app import App
     app = App(input_mode=args.input, initial_system_key=initial_key,

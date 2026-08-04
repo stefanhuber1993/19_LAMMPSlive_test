@@ -50,7 +50,7 @@ class Slider:
 
     @classmethod
     def from_spec(cls, rect, spec):
-        """Build from a systems.base.SliderSpec."""
+        """Build from an mdsystem.SliderSpec."""
         return cls(rect, spec.vmin, spec.vmax, spec.default, spec.label,
                    fmt=spec.fmt, unit=spec.unit, optimum=spec.optimum,
                    advanced=spec.advanced)

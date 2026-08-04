@@ -11,17 +11,19 @@ from time import perf_counter
 
 import pygame
 
-from . import catalog, config, units
+from . import config, units
 from .forcefeedback import (
     ExponentialSmoother2D, shape_damper_coefficient, shape_interaction_force,
     shape_stiffness, shape_velocity_damping,
 )
+from .playground import registry
+from .stepper import SimStepper
 from .input import (
     CP_OFFSET_MAX, DAMPER_COEFFICIENT_MAX, JoystickInput, KeyboardInput,
     MouseInput, SPRING_STIFFNESS_MAX,
 )
 from .ui import AtomTrails, Renderer, RollingHistory, Slider
-from .ui.camera import Camera3D
+from .ui.camera import Camera3D, OrbitController
 
 STEPS_PER_FRAME_CAP = 200  # sanity cap if a system's timestep is set absurdly small
 
@@ -46,9 +48,9 @@ class App:
         self._prof_ms = {"sim": 0.0, "analysis": 0.0, "read": 0.0, "ff": 0.0,
                          "render": 0.0, "other": 0.0}
         self._debug_line = None
-        # [(key, SystemSpec), ...] -- playgrounds then legacy systems, in a stable
-        # order for the picker and number keys.
-        self.systems = catalog.list_specs()
+        # [(key, SystemSpec), ...] in a stable order for the picker and the
+        # number keys. Specs only -- no LAMMPS instance is built to list them.
+        self.systems = registry.list_playgrounds()
 
         # Not pygame.init() -- that also brings up SDL's joystick subsystem,
         # which grabs the Sidewinder as a native SDL game controller. When
@@ -74,6 +76,9 @@ class App:
         self.clock = pygame.time.Clock()
 
         self.source = self._make_source()
+        # The simulation runs on a worker thread while the frame is drawn -- see
+        # stepper.py for the rule that imposes and what it buys.
+        self.stepper = SimStepper(enabled=config.OVERLAP_SIM_AND_RENDER)
 
         self.ff_smoother = ExponentialSmoother2D(config.FF_SMOOTHING_TAU)
         self.interaction_smoother = ExponentialSmoother2D(config.FF_SMOOTHING_TAU)
@@ -98,6 +103,15 @@ class App:
         # interactive puller systems, which always step. Set per-system in
         # _build_system (playback systems start paused on their fresh state).
         self.sim_playing = False
+
+        # Turntable camera for the 3D systems that ask for one (spec.camera_orbit),
+        # and whether the left button is currently dragging it. Rebuilt per
+        # system, kept across window resizes -- see _setup_viewport.
+        self.orbit_cam = None
+        self._orbit_dragging = False
+        # Previous frame's state of the joystick's grab/release button, for edge
+        # detection (see _poll_attach_button).
+        self._attach_button_down = False
 
         self.system_key = None
         self.system = None
@@ -131,12 +145,23 @@ class App:
             )
             # Zoom to fit the scene to the (possibly fullscreen, any-aspect) sim
             # viewport instead of the fixed vertical FOV, so the beads fill the
-            # available width/height rather than leaving big side margins.
+            # available width/height rather than leaving big side margins. This
+            # is also what fixes the focal length an orbit then keeps: the
+            # turntable dollies by moving the eye, not by re-zooming.
             fit_pts = self.system.get_scene_fit_points()
             if fit_pts is not None:
                 self.camera3d.fit_to_points(fit_pts)
+            # A turntable camera survives a resize (self.orbit_cam is cleared
+            # only when the SYSTEM changes), so the view does not snap back to
+            # its starting angle just because the window was dragged.
+            if spec.camera_orbit is not None and self.orbit_cam is None:
+                self.orbit_cam = OrbitController(cam["eye"], cam["target"],
+                                                 spec.camera_orbit)
+            if self.orbit_cam is not None:
+                self.camera3d.move_to(self.orbit_cam.eye())
         else:
             self.camera3d = None
+            self.orbit_cam = None
 
     def _toggle_fullscreen(self):
         self.renderer.toggle_fullscreen()
@@ -149,25 +174,41 @@ class App:
     def _after_resize(self):
         """Re-establish everything tied to the window size after the display
         surface changed (fullscreen toggle or an OS window resize)."""
+        # Resizing happens between frames, i.e. potentially mid-step, and
+        # re-establishing the viewport reads back through the system. Rare enough
+        # that simply waiting is the right trade.
+        self._sim_idle()
         self._setup_viewport()
         if self.input_mode == "mouse":
             self.source = self._make_source()
+        # The simulation runs on a worker thread while the frame is drawn -- see
+        # stepper.py for the rule that imposes and what it buys.
+        self.stepper = SimStepper(enabled=config.OVERLAP_SIM_AND_RENDER)
+
+    def _sim_idle(self):
+        """Let any in-flight step finish. Anything that rebuilds, resets or
+        closes the simulation has to call this first -- the worker is inside
+        LAMMPS until it returns (see stepper.py)."""
+        self.stepper.wait()
 
     def _build_system(self, key):
         """(Re)build the active system and everything downstream of its
         SystemSpec -- renderer scale, sliders, history, smoothers. Safe to
         call again later to switch systems live."""
         if self.system is not None:
+            self._sim_idle()
             self.system.close()
 
-        # A playground or a legacy system, whichever the key names. The mode and
-        # preset are only meaningful for playgrounds; catalog.build ignores them
-        # for legacy systems.
-        self.system = catalog.build(key, mode=self.mode_override, preset=self.preset)
+        self.system = registry.build(key, mode=self.mode_override,
+                                     preset=self.preset)
         self.system_key = key
         spec = self.system.spec
 
-        # Box<->screen mapping and (for 3D systems) the perspective camera.
+        # Box<->screen mapping and (for 3D systems) the perspective camera. The
+        # turntable is dropped first: a new system means a new scene, so it must
+        # be framed from that scenario's own angle, not the last one's.
+        self.orbit_cam = None
+        self._orbit_dragging = False
         self._setup_viewport()
 
         if self.temp_slider is None:
@@ -242,6 +283,7 @@ class App:
                 running = self._handle_events(dt)
                 dt = self._tick(dt)
         finally:
+            self._sim_idle()
             self.source.close()
             self.system.close()
             pygame.quit()
@@ -266,6 +308,10 @@ class App:
                     self.sim_playing = not self.sim_playing
                 elif event.key == pygame.K_r and self.system.spec.playback_controls:
                     self._reset_simulation()
+                elif event.key == pygame.K_c and self.orbit_cam is not None:
+                    self.orbit_cam.toggle_auto()
+                elif event.key == pygame.K_b:
+                    self._toggle_puller_attached()
                 elif pygame.K_1 <= event.key <= pygame.K_9:
                     idx = event.key - pygame.K_1
                     if idx < len(self.systems):
@@ -276,8 +322,17 @@ class App:
                 self.renderer.handle_resize(event.size)
                 self._after_resize()
             elif event.type == pygame.MOUSEWHEEL:
-                step = self.temp_slider.vmax - self.temp_slider.vmin
-                self.temp_slider.nudge(event.y * config.TEMP_WHEEL_STEP_FRACTION * step)
+                # Over the sim view of a turntable system the wheel dollies the
+                # camera; everywhere else (and on every other system) it stays
+                # the temperature dial it has always been. MOUSEWHEEL carries no
+                # position of its own, so ask where the pointer is.
+                if self.orbit_cam is not None and self._in_sim_view(pygame.mouse.get_pos()):
+                    self.orbit_cam.zoom(event.y)
+                else:
+                    step = self.temp_slider.vmax - self.temp_slider.vmin
+                    self.temp_slider.nudge(event.y * config.TEMP_WHEEL_STEP_FRACTION * step)
+            elif self._handle_orbit_mouse(event):
+                pass          # consumed by the turntable camera
             else:
                 # A click on a Play/Pause/Reset button (playback systems) is
                 # routed to the playback action and consumes the event, so it
@@ -286,6 +341,9 @@ class App:
                     name = self.renderer.playback_hit(event.pos)
                     if name is not None:
                         self._playback_action(name)
+                        continue
+                    if self.renderer.bead_color_hit(event.pos):
+                        self.renderer.bead_color_energy = not self.renderer.bead_color_energy
                         continue
                 # A click on the "Advanced" header flips the group open/closed.
                 # When collapsing, cancel any in-progress drag on a now-hidden
@@ -312,6 +370,7 @@ class App:
                         continue
                     s.handle_event(event)
 
+        self._sync_orbit_camera(dt)
         keys = pygame.key.get_pressed()
         temp_range = self.temp_slider.vmax - self.temp_slider.vmin
         rate = config.TEMP_KEY_RATE_FRACTION * temp_range
@@ -321,11 +380,78 @@ class App:
             self.temp_slider.nudge(-rate * dt)
         return True
 
+    def _toggle_puller_attached(self):
+        """Grab / release the puller (B, or the joystick trigger). Released, the
+        stick stops driving it and stops feeling it -- so the smoothers, which are
+        still carrying the last frames of contact force, are reset rather than
+        left to decay a force onto a hand that is no longer holding anything."""
+        self._sim_idle()
+        self.system.toggle_puller_attached()
+        self.ff_smoother.reset()
+        self.interaction_smoother.reset()
+
+    def _poll_attach_button(self):
+        """Edge-detect the joystick's grab/release button. Held is not pressed:
+        without this the puller would flip state every frame the trigger is
+        down."""
+        buttons = self.source.poll_buttons()
+        pressed = config.JOYSTICK_ATTACH_BUTTON in buttons
+        fired = pressed and not self._attach_button_down
+        self._attach_button_down = pressed
+        if fired:
+            self._toggle_puller_attached()
+
+    # ---- turntable camera ---------------------------------------------------
+
+    def _in_sim_view(self, pos):
+        """Is a window position inside the simulation viewport (not the panel)?"""
+        return 0 <= pos[0] < self.renderer.sim_width
+
+    def _handle_orbit_mouse(self, event):
+        """Left-drag inside the sim view orbits the turntable camera. Returns
+        True if the event was consumed, so it never also reaches the sliders or
+        the puller.
+
+        The drag has to START in the sim view: a drag that began on a slider and
+        wandered left over the scene is still a slider drag, and grabbing the
+        camera out from under it would be a surprise. The Play/Pause/Reset
+        buttons are drawn INSIDE the sim view, so they are excluded too -- a
+        click on Play is a click on Play, not a camera grab."""
+        if self.orbit_cam is None:
+            return False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._in_sim_view(event.pos) and self.renderer.playback_hit(event.pos) is None:
+                self._orbit_dragging = True
+                return True
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self._orbit_dragging:
+                self._orbit_dragging = False
+                return True
+        elif event.type == pygame.MOUSEMOTION and self._orbit_dragging:
+            self.orbit_cam.drag(*event.rel)
+            return True
+        return False
+
+    def _sync_orbit_camera(self, dt):
+        """Advance the automatic orbit and push the result onto the camera."""
+        if self.orbit_cam is None or self.camera3d is None:
+            return
+        self.orbit_cam.update(dt)
+        self.camera3d.move_to(self.orbit_cam.eye())
+
     def _tick(self, dt):
         t_frame_start = perf_counter()
         spec = self.system.spec
         ff_profile = spec.force_feedback
 
+        # ---- 1. collect the step launched at the end of the LAST frame -------
+        # It has been running while this frame's predecessor was drawn, so this
+        # blocks only for whatever of it the drawing did not cover. Nothing may
+        # have touched LAMMPS since it was launched -- see stepper.py.
+        self.total_steps += self.stepper.wait()
+        sim_seconds = self.stepper.wait_seconds
+
+        # ---- 2. push this frame's control inputs into the simulation ---------
         self.system.set_target_temp(self.temp_slider.value)
         self.system.set_puller_damping(self.damping_slider.value)
         for key, s in zip(self.extra_slider_keys, self.extra_sliders):
@@ -334,8 +460,12 @@ class App:
         # While actively dragging a slider (which lives in the right-hand
         # panel, off to the side of the sim box), don't also feed that mouse
         # position to the puller as a deflection -- zero the input force
-        # instead of letting a slider drag yank the atom.
+        # instead of letting a slider drag yank the atom. Same for a drag that
+        # is orbiting the camera: in mouse mode the pointer position IS the
+        # puller's deflection, so swinging the camera by hand would otherwise
+        # fling the controlled particle across the box.
         ui_capturing_mouse = (self.temp_slider.dragging or self.damping_slider.dragging
+                              or self._orbit_dragging
                               or any(s.dragging for s in self.extra_sliders))
         # Device I/O is split into two debug fields, since on the joystick both are
         # blocking HID traffic that belongs in neither sim nor "other": "read" is
@@ -349,8 +479,15 @@ class App:
         else:
             jx, jy = self.source.poll()
             yaw = self.source.poll_yaw()
+        self._poll_attach_button()
         read_seconds += perf_counter() - t_in
-        input_fx, input_fy = jx * spec.max_input_force, jy * spec.max_input_force
+        # A released puller is driven by nothing, so the input force IS zero --
+        # here, not just inside the mode. Everything downstream reads this: the
+        # green input arrow, the header readout, and the joystick's cancellation
+        # term all go quiet together, instead of drawing a force on a particle
+        # that is not receiving it.
+        drive = spec.max_input_force if self.system.puller_attached() else 0.0
+        input_fx, input_fy = jx * drive, jy * drive
         # Joystick is a force-feedback loop: the puller is driven mainly by the
         # stick's input force, with the MD interaction force reaching it partly
         # *indirectly* -- it's rendered on the stick (force feedback, below), the
@@ -368,22 +505,60 @@ class App:
         else:
             self.system.set_input_force(input_fx, input_fy)
         # Yaw (joystick twist axis, or Q/E in mouse mode) steers the puller's
-        # in-plane orientation -- a no-op for systems whose puller is a lone
-        # atom, used by the lipid system to rotate the control lipid's director.
+        # orientation -- a no-op for a system whose puller is a lone atom, and
+        # what twists a membrane bead's director against the tilt term.
         self.system.steer_orientation(yaw, dt)
 
-        t_sim_start = perf_counter()
+        # ---- 3. read everything this frame needs, while LAMMPS is idle -------
+        # Every readout below hands back a copy, so the worker started in step 4
+        # cannot move the data out from under the drawing in step 5.
+        pos, vel = self.system.get_puller_state()
+        interaction_force = self.system.get_interaction_force()
+        temp, press, ke, pe, etotal = self.system.get_thermo_state()
+        puller_ke, puller_pe = self.system.get_puller_energy()
+        rdf = self.system.get_rdf()
+        sim_time_ps = self.system.get_sim_time()
+        ids, positions, is_puller, species = self.system.get_all_positions()
+        hud_lines = self.system.get_hud_lines()
+        # Explicit bonds and the hydrogen-bond overlay are drawn only by the 2D
+        # path, so a 3D system was previously paying for two whole-system gathers
+        # per frame whose results it then discarded.
+        bond_pairs = hbond_pairs = None
+        if not spec.render_3d:
+            bond_pairs = self.system.get_bond_pairs()
+            hbond_pairs = self.system.get_hbond_pairs()
+        scene_3d = None
+        if spec.render_3d:
+            ids3d, pos3d, is_puller3d = self.system.get_positions_3d()
+            scene_3d = {
+                "positions3d": pos3d,
+                "dipoles3d": self.system.get_dipoles_3d(),
+                "is_puller": is_puller3d,
+                "bonds": self.system.get_bonds_3d(),
+                "camera": self.camera3d,
+                "control_grid": self.system.get_control_grid(),
+                "potential_terms": self.system.get_potential_terms(),
+                "total_potential_terms": self.system.get_total_potential_terms(),
+                "torque_signals": self.system.get_torque_signals(),
+                "brightness": self.system.get_bead_brightness(),
+                # Only gathered when the colouring is on: it is a whole-system
+                # readout, and paying for it to be thrown away every frame is
+                # exactly what the 3D path was cleaned up to stop doing.
+                "bead_energies": (self.system.get_bead_energies()
+                                  if self.renderer.bead_color_energy else None),
+                "box_bounds": self.system.get_box_bounds_3d(),
+                "box_periodic": self.system.get_box_periodic(),
+            }
+
+        # ---- 4. hand the next step to the worker -----------------------------
+        # From here to the next frame's wait(), the simulation is off limits.
         # Playback systems (Play/Pause/Reset) step only while playing; every
         # interactive puller system always steps.
         should_step = self.sim_playing if spec.playback_controls else True
         if should_step:
-            self.system.step(self.steps_per_frame)
-            self.total_steps += self.steps_per_frame
-        sim_seconds = perf_counter() - t_sim_start
+            self.stepper.start(self.system, self.steps_per_frame)
 
-        pos, vel = self.system.get_puller_state()
-        interaction_force = self.system.get_interaction_force()
-
+        # ---- 5. force-feedback shaping and drawing, over the running step ----
         shaped_fx, shaped_fy = shape_interaction_force(*interaction_force, ff_profile)
         vel_damp_fx, vel_damp_fy = (
             shape_velocity_damping(*vel, ff_profile, spec.puller_speed_cap, CP_OFFSET_MAX)
@@ -406,8 +581,6 @@ class App:
         )
         ff_seconds += perf_counter() - t_in
 
-        temp, press, ke, pe, etotal = self.system.get_thermo_state()
-        puller_ke, puller_pe = self.system.get_puller_energy()
         if self.energy_baseline is None:
             self.energy_baseline = (ke, pe, etotal)
         ke0, pe0, etotal0 = self.energy_baseline
@@ -419,40 +592,14 @@ class App:
         t_in = perf_counter()
         self.source.update_jitter(heat_fraction)
         ff_seconds += perf_counter() - t_in
-        rdf = self.system.get_rdf()
 
-        sim_time_ps = self.system.get_sim_time()
         puller_speed_m_s = units.speed_to_m_per_s(math.hypot(*vel)) if vel is not None else None
-
-        ids, positions, is_puller, species = self.system.get_all_positions()
-        hud_lines = self.system.get_hud_lines()
-        # Explicit bonds, the hydrogen-bond overlay and the motion trails are drawn
-        # only by the 2D path, so a 3D system was previously paying for three
-        # whole-system gathers per frame whose results it then discarded.
-        bond_pairs = hbond_pairs = None
+        # Motion trails are a 2D-path overlay, and pure Python over the positions
+        # already gathered, so they cost the running step nothing.
         if not spec.render_3d:
-            bond_pairs = self.system.get_bond_pairs()
-            hbond_pairs = self.system.get_hbond_pairs()
             self._trail_frame_counter += 1
             if self._trail_frame_counter % config.TRAIL_SAMPLE_EVERY_N_FRAMES == 0:
                 self.atom_trails.add(self.sim_wall_time, ids, positions, is_puller)
-
-        scene_3d = None
-        if spec.render_3d:
-            ids3d, pos3d, is_puller3d = self.system.get_positions_3d()
-            scene_3d = {
-                "positions3d": pos3d,
-                "dipoles3d": self.system.get_dipoles_3d(),
-                "is_puller": is_puller3d,
-                "bonds": self.system.get_bonds_3d(),
-                "camera": self.camera3d,
-                "control_grid": self.system.get_control_grid(),
-                "potential_terms": self.system.get_potential_terms(),
-                "total_potential_terms": self.system.get_total_potential_terms(),
-                "torque_signals": self.system.get_torque_signals(),
-                "brightness": self.system.get_bead_brightness(),
-                "box_bounds": self.system.get_box_bounds_3d(),
-            }
 
         t_render_start = perf_counter()
         self.renderer.show_advanced = self.show_advanced
@@ -469,6 +616,7 @@ class App:
             total_steps=self.total_steps, steps_per_frame=self.steps_per_frame,
             debug_line=self._debug_line,
             playback_playing=(self.sim_playing if spec.playback_controls else None),
+            puller_attached=self.system.puller_attached(),
         )
         if self.debug:
             render_seconds = perf_counter() - t_render_start
@@ -493,7 +641,13 @@ class App:
         on the joystick they are blocking HID traffic; 'analysis' is the
         playground layer's energy decomposition and observables, carved out of the
         step so it can be budgeted; 'other' is the remainder after sim, render,
-        read and ff -- force shaping and the per-frame readouts."""
+        read and ff -- force shaping and the per-frame readouts.
+
+        With the sim/render overlap on (config.OVERLAP_SIM_AND_RENDER), 'sim' is
+        no longer the cost of the step: it is how long the frame had to WAIT for
+        a step that has been running under the previous frame's drawing. It goes
+        to zero whenever the simulation fits entirely under the render, which is
+        the point -- what it measures is the part that did not fit."""
         # analysis_seconds is measured INSIDE step(), so it is already part of
         # sim_seconds; subtract it out to keep the parts summing to the frame.
         sim_only = max(0.0, sim_seconds - analysis_seconds)

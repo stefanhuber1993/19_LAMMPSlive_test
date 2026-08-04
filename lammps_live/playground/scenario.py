@@ -188,12 +188,25 @@ class Scenario(ABC):
         place."""
         return []
 
-    def housekeeping(self, positions, params, controlled=None):
+    def housekeeping(self, positions, params, controlled=None, box=None):
         """Per-frame soft correction forces (N, 3), or None.
 
         `controlled` is the index of the interactively-controlled particle (or
         None), which must be excluded: its position IS the user's input, and a
-        correction force would fight it.
+        correction force would fight it. `box` is the live cell, which a periodic
+        scenario needs to know where "the middle" is.
+        """
+        return None
+
+    def director_housekeeping(self, positions, directors, params, controlled=None,
+                              box=None):
+        """Per-frame soft correction ANGULAR velocities (N, 3) on the particles'
+        directors, or None.
+
+        The counterpart of `housekeeping` for orientation. It exists separately
+        because in a periodic cell it is the only one of the two that can steer
+        which way a structure faces: translating everything is fine on a torus,
+        rotating everything is not.
         """
         return None
 
@@ -204,7 +217,7 @@ class Scenario(ABC):
         return dict(eye=(0.0, -0.9 * span, 0.6 * span), target=(0.0, 0.0, 0.0),
                     up=(0.0, 0.0, 1.0), fov_deg=34.0)
 
-    def fit_points(self, box):
+    def fit_points(self, params, box):
         """World points the camera should frame. The box corners keep the drawn
         box outline in view at any aspect ratio."""
         return box.corners()
@@ -213,6 +226,14 @@ class Scenario(ABC):
 # --- housekeeping building blocks ---------------------------------------------
 # Shared by the patch and the sheet, which independently derived the same
 # "rotate the smallest principal axis to +z" correction.
+
+def _ramp(x, lo, hi):
+    """Smoothstep gate: 0 below lo, 1 above hi, no kink in between. Every
+    whole-system correction here is gated by one, so it fades in with the
+    structure it is correcting instead of switching on."""
+    t = min(max((x - lo) / max(hi - lo, 1e-9), 0.0), 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
 
 def align_normal_rate(points, strength):
     """Rigid-rotation rate turning the cloud's best-fit plane normal toward +z,
@@ -269,6 +290,12 @@ class HexPatch(Scenario):
         structural("k_center", 7.0, "centre-of-mass centering stiffness"),
         structural("k_align", 7.0, "normal-up alignment torque strength"),
         structural("k_home", 0.5, "per-particle homing stiffness toward the origin"),
+        # What the camera looks at and frames -- a rectangle in the control
+        # plane, centred a little above the patch (see camera / fit_points).
+        # Smaller half-extents = closer in.
+        structural("view_center_z", 0.7, "camera framing: centre height, in z"),
+        structural("view_half_width", 2.0, "camera framing: half-width, in x"),
+        structural("view_half_height", 1.6, "camera framing: half-height, in z"),
     )
 
     def build(self, params, rng):
@@ -289,7 +316,7 @@ class HexPatch(Scenario):
     def post_control_settle(self, params):
         return [f"run {int(params['settle_steps'])}"]
 
-    def housekeeping(self, positions, params, controlled=None):
+    def housekeeping(self, positions, params, controlled=None, box=None):
         """Centring + normal-up alignment + homing on every particle except the
         controlled one, as per-frame momentum kicks the Langevin bath then damps
         (so the patch settles flat and centred instead of oscillating)."""
@@ -304,11 +331,39 @@ class HexPatch(Scenario):
         f[sel] -= params["k_home"] * p
         return f
 
-    def fit_points(self, box):
-        # Box corners plus headroom above/below for the controlled particle and
-        # its director spike, which can rise past the net's top edge.
-        return np.vstack([box.corners(),
-                          [(0.0, 0.0, box.hi[2] + 0.6), (0.0, 0.0, box.lo[2] - 0.2)]])
+    def camera(self, box):
+        """Aimed a little ABOVE the patch, not at it.
+
+        Everything interesting here happens upward: the controlled particle is
+        pulled out of the plane and the ring domes after it. Aiming at the patch
+        itself spends half the frame on the empty space below it, so the target
+        is lifted by `view_center_z` and the vertical framing budget goes where
+        the motion is."""
+        span = max(box.lengths)
+        return dict(eye=(0.0, -0.9 * span, 0.6 * span),
+                    target=(0.0, 0.0, self.new_params()["view_center_z"]),
+                    up=(0.0, 0.0, 1.0), fov_deg=34.0)
+
+    def fit_points(self, params, box):
+        """Frame a rectangle in the CONTROL PLANE, not the container.
+
+        Framing the box corners -- the obvious thing, and what this did -- puts
+        the camera far too far back: the box's near face sits several units
+        closer to the eye than the patch does, subtends a much larger angle, and
+        the fit backs off until THAT fits. On the default 6-sigma box the seven
+        beads came out filling about a fifth of the frame width, adrift in an
+        empty cell.
+
+        Framing a rectangle at y = 0 instead -- the plane the beads and the
+        control net live in -- puts the patch where it belongs, at a bit over
+        half the frame width. What that costs is the outer corners of the net and
+        the box outline, which now fall outside the view; both are context for a
+        scene whose subject is seven beads, and the beads win.
+        """
+        w, h = params["view_half_width"], params["view_half_height"]
+        z = params["view_center_z"]
+        return np.array([(-w, 0.0, z - h), (w, 0.0, z - h),
+                         (-w, 0.0, z + h), (w, 0.0, z + h)])
 
 
 class HexSheet(Scenario):
@@ -335,6 +390,18 @@ class HexSheet(Scenario):
         # sheet, so the membrane's own attraction recaptures it.
         structural("z_half", 4.0, "out-of-plane half-height of the container"),
         structural("settle_steps", 1000, "barostat relaxation to zero lateral tension"),
+        # How much of the (possibly tiled) membrane the camera frames, as a
+        # multiple of the cell's in-plane half-extent. Pair it with
+        # RenderStyle.periodic_images: framing 1.0 with a 3x3 tiling wastes the
+        # tiling off-screen, framing 1.8 with no tiling wastes the frame.
+        structural("view_span", 1.0, "camera framing: multiples of the cell half-width"),
+        # How far past the cell's centre the camera aims, in multiples of its
+        # in-plane half-width. 0 looks straight at the middle of the cell, which
+        # leaves the near edge floating in the middle of the frame; aiming
+        # further in drops that edge toward the bottom, which is what you want
+        # when the cell is the FRONT of a tiled block and the images recede
+        # behind it (see RenderStyle.periodic_images).
+        structural("view_aim_ahead", 0.0, "camera framing: aim this far past the centre"),
         structural("baro_press", 0.0, "target lateral pressure (tension-free)"),
         structural("baro_damp", 2.0, "barostat relaxation time"),
         structural("k_plane", 0.1, "pull toward the central z-plane"),
@@ -397,7 +464,7 @@ class HexSheet(Scenario):
     def settle_cleanup_commands(self):
         return ["unfix settle_baro", "unfix settle_bath"]
 
-    def housekeeping(self, positions, params, controlled=None):
+    def housekeeping(self, positions, params, controlled=None, box=None):
         """Plane centring toward z = 0, plus a rigid normal-up rotation of the
         whole sheet -- the same "smallest principal component upward" idea as the
         patch's ring torque, made size-independent by applying it as a rotation
@@ -413,12 +480,29 @@ class HexSheet(Scenario):
         return f
 
     def camera(self, box):
-        span = max(box.lengths[0], box.lengths[1])
-        return dict(eye=(0.0, -0.85 * span, 0.6 * span), target=(0.0, 0.0, 0.0),
-                    up=(0.0, 0.0, 1.0), fov_deg=34.0)
+        """The eye pulls back with `view_span`, not just the zoom.
 
-    def fit_points(self, box):
-        return np.vstack([box.corners(), [(0.0, 0.0, 2.6), (0.0, 0.0, -2.2)]])
+        Re-framing alone cannot show a wider membrane: at 1.7x the cell the
+        sheet's near edge reaches the camera's own position, and fitting THAT in
+        sends the zoom to infinity. Scaling the distance keeps the geometry
+        similar, so the picture is the same one seen from further away."""
+        params = self.new_params()
+        span = max(box.lengths[0], box.lengths[1]) * params["view_span"]
+        aim = params["view_aim_ahead"] * 0.5 * box.lengths[1]
+        return dict(eye=(0.0, -0.85 * span + aim, 0.6 * span),
+                    target=(0.0, aim, 0.0), up=(0.0, 0.0, 1.0), fov_deg=34.0)
+
+    def fit_points(self, params, box):
+        """Frame the cell, or more of it when the renderer is drawing periodic
+        images: `view_span` multiplies the in-plane extent the camera pulls back
+        to cover, so a 3x3 tiling can actually be seen rather than sitting mostly
+        off the edges of the frame. 1.0 frames the real cell exactly."""
+        span = params["view_span"]
+        aim = params["view_aim_ahead"] * 0.5 * box.lengths[1]
+        corners = box.corners().astype(float)
+        corners[:, :2] *= span
+        corners[:, 1] += aim
+        return np.vstack([corners, [(0.0, aim, 2.6), (0.0, aim, -2.2)]])
 
 
 class RandomFill(Scenario):
@@ -450,7 +534,108 @@ class RandomFill(Scenario):
         # inside each other's hard core and blow up the first step.
         structural("overlap", 0.9, "minimum centre-to-centre separation when seeding"),
         structural("maxtry", 200, "placement attempts per particle"),
+        # --- two corrections that keep the run watchable, both OFF at 0 ------
+        # Neither is part of the paper's experiment. Measured over 40k steps
+        # against unforced controls: the field takes the membranes' common normal
+        # to within 4-8 degrees of vertical (unforced, it wanders 35-64) while
+        # the nematic order rises just as it does without it, so what is being
+        # steered is the orientation, not the assembly. The centring only acts on
+        # an axis the particles are actually concentrated along, so it does
+        # nothing at all until something has formed.
+        structural("k_upright", 0.6,
+                   "field aligning directors with z, so sheets form flat (0 = off)"),
+        structural("center_accel", 0.05,
+                   "drift acceleration re-centring the aggregate (0 = off)"),
+        structural("center_softness", 2.0,
+                   "distance over which the centring eases off near the middle, sigma"),
+        structural("center_concentration_min", 0.15,
+                   "circular concentration below which an axis reads as uniform"),
+        structural("center_concentration_full", 0.35,
+                   "circular concentration at which centring reaches full strength"),
     )
+
+    def housekeeping(self, positions, params, controlled=None, box=None):
+        """Nudge whatever has assembled back to the middle of the cell.
+
+        "The middle" needs care on a torus: an ordinary mean is meaningless
+        there (a blob straddling the seam averages to the far side of the box).
+        The circular mean is not -- map each coordinate onto the unit circle,
+        theta = 2*pi*x/L, average the unit vectors, and read the angle back. That
+        answer is translation-covariant, exactly as a centre of mass should be.
+        The length R of the averaged vector comes free and is the useful part: it
+        is the CONCENTRATION of the distribution along that axis, 1 for a tight
+        blob and ~1/sqrt(N) for a uniform spread. So the correction is applied
+        per axis and gated on R, which gives the right behaviour for free:
+        a droplet is concentrated on all three axes and gets centred in all
+        three, while a lamella is concentrated only along its normal and gets
+        centred only in that direction -- exactly right, since it is uniform
+        along the other two and has no centre there to find.
+        Uniform on every particle, so it translates the system without shearing
+        it, and eased off (tanh) near the target so it settles instead of
+        oscillating. The Langevin bath turns the sustained acceleration into a
+        slow terminal drift.
+        """
+        accel = params["center_accel"]
+        if accel <= 0.0 or box is None:
+            return None
+        lo = np.asarray(box.lo, dtype=float)
+        L = np.asarray(box.lengths, dtype=float)
+        theta = 2.0 * np.pi * (positions - lo) / L
+        c, sn = np.cos(theta).mean(axis=0), np.sin(theta).mean(axis=0)
+        concentration = np.hypot(c, sn)
+        mean = lo + L * (np.arctan2(sn, c) % (2.0 * np.pi)) / (2.0 * np.pi)
+        d = np.asarray(box.center, dtype=float) - mean
+        d -= L * np.round(d / L)                       # minimum image
+        gate = np.array([_ramp(r, params["center_concentration_min"],
+                               params["center_concentration_full"])
+                         for r in concentration])
+        a = accel * gate * np.tanh(d / max(params["center_softness"], 1e-6))
+        if not np.any(a):
+            return None
+        f = np.tile(a, (len(positions), 1))
+        if controlled is not None:
+            f[controlled] = 0.0
+        return f
+
+    def director_housekeeping(self, positions, directors, params, controlled=None,
+                              box=None):
+        """A weak field that prefers membranes lying flat, normal along z.
+
+        WHY A FIELD ON EACH DIRECTOR, AND NOT A TORQUE ON THE WHOLE SYSTEM.
+        The obvious construction -- read the common normal off the directors as a
+        tensor, and apply the one rigid rotation that brings it upright -- was
+        tried first and is worse than useless. It rotates every director away
+        from ITS OWN local membrane normal, which is precisely what the force
+        field's tilt term exists to punish, so the membrane wins and the only
+        result is energy pumped into the aggregates: measured over 60k steps
+        against an unforced control, it did not flatten anything and pulled the
+        nematic order back down from 0.52 to 0.11 as the sheets it was wrestling
+        came apart.
+        And that is the honest answer for a PERIODIC cell, not a bug. A membrane
+        spanning one has to be commensurate with it -- it lies parallel to a pair
+        of box faces -- so its available orientations are three discrete choices,
+        not a continuum to be rotated through. Getting from one to another means
+        dissolving and re-forming, which no gentle torque can drive.
+        What CAN be biased is which one it forms in. Each director is pulled
+        toward the nearer of +/-z, exactly as an external field aligns a nematic:
+        in the disordered gas, where the particles are free to turn, that tilts
+        the odds toward horizontal patches nucleating, and they then grow the way
+        they always would. It is self-extinguishing -- the torque is proportional
+        to sin(angle to z), so a membrane that IS flat feels nothing at all --
+        which is why it needs no gate and never fights a finished sheet.
+        """
+        k = params["k_upright"]
+        if k <= 0.0 or not len(directors):
+            return None
+        # Toward the NEARER pole: +n and -n are the same physical orientation, so
+        # a director in the lower half turns toward -z, not the long way round.
+        sense = np.where(directors[:, 2] < 0.0, -1.0, 1.0)
+        up = np.zeros_like(directors)
+        up[:, 2] = sense
+        w = k * np.cross(directors, up)
+        if controlled is not None:
+            w[controlled] = 0.0
+        return w
 
     def build(self, params, rng):
         """Positions are placed by LAMMPS (`create_atoms random` does the overlap

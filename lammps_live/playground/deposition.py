@@ -184,13 +184,99 @@ class Deposition2D(Scenario):
     def camera(self, box):
         return None      # 2D scenario: the renderer's top-down path is used
 
-    def fit_points(self, box):
+    def fit_points(self, params, box):
         return None
+
+
+class IonicSlab2D(Deposition2D):
+    """The deposition slab, on a bipartite CHECKERBOARD lattice of two species.
+
+    Everything structural about the deposition setup carries over -- the frozen
+    floor, the mobile crystal the thermostat acts on, the vacuum above it, the
+    reflecting walls, the free puller. Two things do not, and both follow from
+    the bonding being ionic rather than neutral:
+
+    WHY A SQUARE LATTICE, NOT HEXAGONAL. The neutral crystals sit on a 2D
+    close-packed triangular lattice because their bonding just maximises
+    neighbour count. Ionic bonding does the opposite: every ion wants its
+    NEAREST neighbours to be the opposite charge and its like-charge neighbours
+    pushed out to the next shell, which needs a lattice you can two-colour --
+    a bipartite one. The square lattice is bipartite: colour it like a
+    checkerboard and every ion has 4 nearest neighbours of opposite sign
+    (attraction) with the 4 like-charge ones held further out on the diagonal.
+    That is the 2D analogue of rock-salt and a genuine Madelung minimum. A
+    triangular lattice is NOT bipartite -- its 3-membered rings are
+    geometrically frustrated, so no alternating assignment exists and any
+    arrangement leaves like charges in contact. The alternation is built into
+    the lattice itself (a 4-site custom cell, two sublattices per species)
+    rather than painted on afterwards, so it -- and the exact charge neutrality
+    the Coulomb sum needs -- holds from frame 0.
+
+    WHY THE VACUUM GAP BELOW. A bare ionic (001) surface relaxes outward
+    strongly. With the bottom row sitting exactly on the non-periodic y = 0
+    boundary it relaxes straight out of the box (observed: an immediate "Lost
+    atoms"). A couple of empty rows give it room to relax in place.
+    """
+
+    name = "ionic_slab_2d"
+
+    params = Deposition2D.params + (
+        structural("gap_rows", 2, "empty rows between the box floor and the crystal"),
+        # Must clear the pair cutoff plus the neighbour skin at the WIDEST the
+        # Coulomb cutoff slider can reach, or LAMMPS refuses the run mid-drag.
+        structural("comm_cutoff", 16.0, "ghost-atom communication cutoff, Angstrom"),
+    )
+
+    def _geometry(self, params):
+        """Rows are one nearest-neighbour distance apart here, not the
+        sqrt(3)/2 of a close-packed row, and the crystal starts above the gap."""
+        a = params["a"]
+        row_h = a
+        row_eps = 0.1 * row_h
+        box_size = params["n_cols"] * a
+        crystal_bot = params["gap_rows"] * row_h + row_eps
+        crystal_top = crystal_bot + params["crystal_rows"] * row_h + row_eps
+        return a, row_h, row_eps, box_size, crystal_top
+
+    def atom_creation_commands(self, params, seed):
+        a, row_h, row_eps, box_size, crystal_top = self._geometry(params)
+        crystal_bot = params["gap_rows"] * row_h + row_eps
+        return [
+            # A 2x2-spacing cell whose two even-parity sites become type 1 and
+            # whose two odd-parity sites become type 2. Coordinates are in units
+            # of the nearest-neighbour distance.
+            f"lattice custom {a} a1 2 0 0 a2 0 2 0 "
+            f"basis 0 0 0 basis 0.5 0.5 0 basis 0.5 0 0 basis 0 0.5 0",
+            f"region crystal block 0 {box_size} {crystal_bot} {crystal_top} "
+            f"-0.25 0.25 units box",
+            "create_atoms 1 region crystal basis 1 1 basis 2 1 basis 3 2 basis 4 2",
+            # The puller last, so it holds the highest id and "last" finds it. A
+            # cation, like one sublattice, so the lattice pulls it onto an anion
+            # site electrostatically -- the ionic analogue of Cu-on-Cu.
+            f"create_atoms 1 single {box_size / 2.0} "
+            f"{crystal_top + params['puller_gap'] * a} 0.0 units box",
+        ]
+
+    def extra_setup_commands(self, params):
+        """As Deposition2D, but the ghost cutoff has to clear the COULOMB reach,
+        which is much longer than the RDF's and grows with the cutoff slider."""
+        return [
+            "variable vcmx equal vcm(crystal_mobile,x)",
+            "variable vcmy equal vcm(crystal_mobile,y)",
+            f"comm_modify cutoff {params['comm_cutoff']}",
+        ]
 
 
 def deposition_2d(at=None, **overrides):
     scenario = Deposition2D(**overrides)
     # The wall inset tracks the actual spacing rather than the class default.
+    params = scenario.new_params()
+    scenario._wall_inset = 0.5 * params["a"]
+    return (scenario, at) if at is not None else scenario
+
+
+def ionic_slab_2d(at=None, **overrides):
+    scenario = IonicSlab2D(**overrides)
     params = scenario.new_params()
     scenario._wall_inset = 0.5 * params["a"]
     return (scenario, at) if at is not None else scenario

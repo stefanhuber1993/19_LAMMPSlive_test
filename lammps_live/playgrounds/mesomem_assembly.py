@@ -20,13 +20,58 @@ assembled.
 Units are the paper's LJ-reduced units (sigma = eps = m = 1).
 """
 from ..playground import Playground, random_fill
+from ..render_style import DEFAULT_STYLE, CameraOrbit
+
+# A dense, roughly cubic cloud of beads seen from outside is the scene the look
+# was tuned on, so this takes the defaults -- but they are written out here, at
+# their default values, because these are the dials worth reaching for first.
+# Every field and what it does is in lammps_live/render_style.py; the two
+# playgrounds next door show what changing them buys.
+STYLE = DEFAULT_STYLE.varied(
+    # The cell is periodic in all three axes, so its images could be drawn too
+    # (as the sheet does): (1, 1, 1) would tile 3x3x3 around it, and
+    # (0.5, 0.5, 0.5) would put a half-cell fringe of surrounding material round
+    # it for a quarter of the instances. Left at the single real cell for now.
+    periodic_images=(0, 0, 0),
+    image_fade_start=0.0,
+    image_fade_end=1.0,
+    dof_focus=0.15,
+    dof_range=0.40,
+    dof_bokeh_px=5.0,
+    # Fade into the background: complete by 55% of the depth span, and go 75% of
+    # the way to the background colour when it does.
+    cue_end=0.55,
+    cue_strength=0.75,
+    # Contact darkening between packed beads. An exponent, so higher = deeper
+    # crevices with open surfaces left at full brightness.
+    ao_strength=5.83,
+    # The dark line around each bead: how black, and how far out from a bead's
+    # centre (as a fraction of its radius) it starts. 0.94 gives a hairline,
+    # 0.85 a heavy ink outline.
+    outline_strength=12.0,
+    outline_edge_fraction=0.90,
+)
 
 PLAYGROUND = Playground(
     name="MesoMem self-assembly (3D)",
     description="Paper's spontaneous-assembly run: 1500 random beads in a periodic "
                 "20-sigma box coarsen into membranes. Play / Pause / Reset.",
     force_field="mesomem",
-    scenario=random_fill(n=1500, box=20.0, overlap=0.9, maxtry=200),
+    scenario=random_fill(
+        n=1500, box=20.0, overlap=0.9, maxtry=200,
+        # Two nudges that keep a long run watchable, neither part of the paper's
+        # experiment; 0 turns either off. `k_upright` is a weak field pulling
+        # each director toward the nearest of +/-z, so the membranes that
+        # nucleate tend to lie flat instead of at whatever angle they happen to
+        # pick (measured: 4-8 degrees off vertical with it, 35-64 without, and
+        # the assembly itself proceeds the same either way). `center_accel`
+        # drifts whatever has assembled back to the middle of the cell, and only
+        # along axes it is actually concentrated on -- so a droplet gets centred
+        # in all three, a lamella only across its own thickness, and a gas not at
+        # all. See RandomFill in playground/scenario.py for both.
+        k_upright=0.6,
+        center_accel=0.05,
+    ),
     mode="sim",
     observables=["nematic_S", "coordination", "thickness"],
     param_ranges={"k_splay": (0.0, 40.0)},
@@ -46,4 +91,10 @@ PLAYGROUND = Playground(
     melt_temp=0.3,
     particle_radius=0.5,
     reduced_units=True,
+    render_style=STYLE,
+    # Nothing here is steered, and what forms is a 3D morphology -- whether the
+    # aggregates are compact droplets or flat lamellae is exactly the thing one
+    # fixed angle hides. So the camera turns: drag to orbit it by hand, wheel to
+    # dolly, C to hand it back to the automatic turn.
+    camera_orbit=CameraOrbit(autostart=True, speed=0.16),
 )

@@ -102,6 +102,7 @@ class JoystickInput(InputSource):
         self.jitter = self.ff.sine(magnitude=0, period_ms=JITTER_PERIOD_MS)
         self._last_xy = (0.0, 0.0)
         self._last_yaw = 0.0
+        self._last_buttons = frozenset()
         self._twist_center = None  # captured from the first reading (see _process_twist)
         # Last force-feedback conditions actually written to the device, so a
         # redundant re-write is skipped. Each set_condition is a blocking HID
@@ -161,9 +162,11 @@ class JoystickInput(InputSource):
             return
         xy = (state.x, -state.y)             # device convention -> sim (+y up)
         yaw = self._process_twist(state.twist)
+        buttons = frozenset(int(b) for b in state.pressed)
         with self._lock:
             self._last_xy = xy
             self._last_yaw = yaw
+            self._last_buttons = buttons
 
     def _io_loop(self):
         """Daemon loop: sample the stick, then flush the latest requested force-
@@ -203,6 +206,15 @@ class JoystickInput(InputSource):
     def poll_yaw(self):
         with self._lock:
             return self._last_yaw
+
+    def poll_buttons(self):
+        # Held state, not an event: the caller edge-detects. The device only
+        # emits on change, so this is the last reported set and stays correct
+        # for as long as nothing moves.
+        if self._worker is None:
+            self._read_once(timeout_ms=0)
+        with self._lock:
+            return self._last_buttons
 
     def calibrate(self, n=200):
         """Print live decoded stick state -- a sanity check that the device is

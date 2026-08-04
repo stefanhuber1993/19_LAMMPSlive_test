@@ -70,6 +70,10 @@ PULLER_RADIUS = 8
 # fill uses, so it always contrasts) plus a small size boost. This keeps the
 # picture chemically honest while still making the controlled atom pop.
 PULLER_RING_COLOR = (95, 230, 255)
+# ...and how it reads once released (B / joystick trigger): still marked, because
+# it is still the particle the ring will grab again, but dim and cool so "you are
+# not holding this" is legible at a glance rather than only in the HUD line.
+PULLER_RING_FREE_COLOR = (95, 110, 130)
 PULLER_RING_WIDTH = 3
 PULLER_RADIUS_BOOST = 3   # extra px on the controlled atom over its species size
 # Per-atom energy readout stamped under the controlled atom.
@@ -152,6 +156,14 @@ BOND_3D_COLOR = (150, 96, 92)
 # cueing like everything else so far edges recede into the background.
 BOX_3D_COLOR = (240, 240, 245)
 BOX_3D_ALPHA = 150   # out of 255; the box is a subtle frame, not a hard cage
+# The corner of the box nearest the eye hangs in front of everything and streaks
+# across the scene, so it is faded out. FADE_DEPTH is how much of the box's own
+# depth span the fade covers, measured back from its nearest corner: 0 disables
+# it, 0.3 dissolves roughly the near third of the three edges meeting that
+# corner. SUBDIVISIONS is how many pieces each edge is cut into to carry the
+# gradient -- enough that it reads as smooth, few enough to stay 12*n lines.
+BOX_EDGE_FADE_DEPTH = 0.30
+BOX_EDGE_SUBDIVISIONS = 12
 # Paper (MesoMem) bead coloring: each bead is a little sphere whose POLES (along
 # its director n_i) are hydrophilic -> blue, and whose EQUATOR (perpendicular to
 # n_i) is hydrophobic -> yellow. The yellow band therefore tilts with the
@@ -173,6 +185,29 @@ BEAD_BAND_SOFT = 0.07
 BEAD_WHITE_POLE_COLOR = (245, 246, 250)
 BEAD_WHITE_POLE_MIN = 0.954
 BEAD_WHITE_POLE_SOFT = 0.03
+
+# --- the other bead colouring: potential energy -------------------------------
+# Instead of the director banding, paint each bead by ITS OWN potential energy in
+# the force field (LAMMPS' per-atom pe). The banding answers "which way is this
+# bead pointing"; this answers "how bound is it" -- so a bead pulled out of the
+# membrane brightens as its bonds stretch, a well-packed one stays dark, and on
+# the assembly box the ordered patches read as dark against the loose gas. The
+# +director pole keeps its white cap in both modes, so orientation is never lost.
+#
+# Matplotlib's `inferno`, sampled at 32 points and interpolated in the shader:
+# perceptually uniform (equal steps in the number look like equal steps in the
+# colour) and dark-to-bright, which is the right direction for "more energy".
+# Baked in rather than imported so matplotlib is not a runtime dependency.
+INFERNO = (
+    (0.0015, 0.0005, 0.0139), (0.0140, 0.0112, 0.0719), (0.0423, 0.0281, 0.1411), (0.0820, 0.0433, 0.2153),
+    (0.1358, 0.0469, 0.2998), (0.1904, 0.0393, 0.3614), (0.2450, 0.0371, 0.4000), (0.2972, 0.0475, 0.4205),
+    (0.3540, 0.0669, 0.4309), (0.4039, 0.0856, 0.4332), (0.4537, 0.1038, 0.4305), (0.5035, 0.1216, 0.4234),
+    (0.5596, 0.1413, 0.4101), (0.6093, 0.1595, 0.3936), (0.6585, 0.1790, 0.3727), (0.7065, 0.2007, 0.3478),
+    (0.7584, 0.2291, 0.3153), (0.8019, 0.2587, 0.2831), (0.8420, 0.2929, 0.2486), (0.8780, 0.3321, 0.2123),
+    (0.9130, 0.3816, 0.1698), (0.9387, 0.4301, 0.1304), (0.9591, 0.4820, 0.0895), (0.9742, 0.5368, 0.0484),
+    (0.9846, 0.6011, 0.0236), (0.9879, 0.6603, 0.0517), (0.9856, 0.7208, 0.1122), (0.9775, 0.7823, 0.1859),
+    (0.9625, 0.8515, 0.2855), (0.9487, 0.9105, 0.3953), (0.9517, 0.9606, 0.5242), (0.9884, 0.9984, 0.6449),
+)
 
 # Play / Pause / Reset playback buttons (self-assembly system), drawn along the
 # bottom of the sim view. The button matching the current state (e.g. Play while

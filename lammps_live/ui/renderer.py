@@ -18,6 +18,7 @@ from .theme import (
     BEAD_WHITE_POLE_COLOR, BEAD_WHITE_POLE_MIN, BEAD_WHITE_POLE_SOFT, DEPTH_FADE_START,
     BOND_3D_COLOR, BOND_COLOR, BOND_FALLOFF, BOND_LINES_ENABLED, BOND_MIN_ALPHA,
     BOND_PEAK_ALPHA, BOND_STICK_COLOR, BOND_WIDTH, BOX_3D_ALPHA, BOX_3D_COLOR,
+    BOX_EDGE_FADE_DEPTH, BOX_EDGE_SUBDIVISIONS,
     BOX_OUTLINE, CRYSTAL_COLOR,
     CRYSTAL_RADIUS, DIM_TEXT_COLOR, DIRECTOR_ARROW_COLOR, EDGE_VIGNETTE_STRENGTH,
     HAZE_COLOR, HAZE_STRENGTH, HBOND_COLOR, HBOND_DASH,
@@ -26,7 +27,8 @@ from .theme import (
     NET_LINE_ALPHA, PANEL_BG, PANEL_DIVIDER, PANEL_PAD, PANEL_WIDTH, PLOT_COLORS,
     POTENTIAL_COLORS, POTENTIAL_PANEL_BG, POTENTIAL_TOTAL_COLOR, POTENTIAL_TRACK_COLOR,
     PULLER_BOND_COLOR, PULLER_LABEL_BG, PULLER_LABEL_COLOR, PULLER_RADIUS_BOOST,
-    PULLER_RING_COLOR, PULLER_RING_WIDTH, REACTION_VEC_COLOR, SPHERE_AMBIENT,
+    PULLER_RING_COLOR, PULLER_RING_FREE_COLOR, PULLER_RING_WIDTH,
+    REACTION_VEC_COLOR, SPHERE_AMBIENT,
     SPHERE_LIGHT_DIR, TEXT_COLOR, TORQUE_ARC_APPLIED_RADIUS,
     TORQUE_ARC_HEAD_LEN, TORQUE_ARC_REACTION_RADIUS, TORQUE_ARC_WIDTH,
     VECTOR_MAX_PX,
@@ -52,6 +54,8 @@ KEY_HINTS = (
     "1-9: system   Tab: next   WASD/mouse: move   Q/E or L/R click: rotate   "
     "Up/Down or wheel: temperature   F11/green button: fullscreen   Esc: exit fullscreen / quit"
 )
+# Appended for systems with a turntable camera (SystemSpec.camera_orbit).
+ORBIT_KEY_HINTS = "   drag: orbit camera   wheel: zoom   C: auto-orbit"
 
 
 class Renderer:
@@ -85,6 +89,16 @@ class Renderer:
                                  Button("reset", "Reset")]
         self._playback_visible = False
 
+        # Bead-colouring toggle for the 3D scenes: director bands (which way each
+        # bead points) or potential energy (how bound it is). A basic control, not
+        # an "Advanced" one -- it changes what you are looking at, not how the
+        # model behaves -- so it sits in the panel above the sliders. The app owns
+        # the state (self.bead_color_energy, pushed in before each draw) and reads
+        # the rect back through bead_color_hit.
+        self.bead_color_button = Button("bead_color", "")
+        self.bead_color_energy = False
+        self._bead_color_visible = False
+
         # Per-species glyphs (e.g. "+"/"-" on ions) are stamped on a few
         # hundred atoms every frame, so each label string is rendered once and
         # cached rather than re-rasterized per atom.
@@ -109,6 +123,10 @@ class Renderer:
         hn = math.sqrt(hx * hx + hy * hy + hz * hz)
         self._half = (hx / hn, hy / hn, hz / hn)
         self._banded_cache = {}
+
+        # Depth-cue strength of the 3D scene currently being drawn (see _fog).
+        # Set per frame by draw_sim_3d; the theme default covers the CPU path.
+        self._fog_strength = HAZE_STRENGTH
 
     def _apply_layout(self, size):
         """Recompute everything sized to the window: the sim viewport width, the
@@ -679,10 +697,23 @@ class Renderer:
         self._banded_cache[key] = surf
         return surf
 
+    def _puller_ring_color(self, attached):
+        """Colour of the ring marking the controlled particle. Dim once released
+        (B / joystick trigger): still marked, because it is still the particle
+        the ring will grab again, but plainly not being steered."""
+        return PULLER_RING_COLOR if attached else PULLER_RING_FREE_COLOR
+
     def _fog(self, depth, near, far):
+        """How far a thing at `depth` has receded into the background, 0..1.
+
+        The strength is per-frame state (`self._fog_strength`) rather than the
+        theme constant, because the GL path's depth cue is a per-system
+        RenderStyle setting and the overlays drawn on top of it -- director
+        spikes, bond spokes, the box outline -- have to recede on the SAME ramp
+        as the beads or they float in front of a scene that has faded away."""
         if far <= near:
             return 0.0
-        return HAZE_STRENGTH * max(0.0, min(1.0, (depth - near) / (far - near)))
+        return self._fog_strength * max(0.0, min(1.0, (depth - near) / (far - near)))
 
     def _net_world_segments(self, grid):
         """World-space (start, end) point pairs for every line of the control-
@@ -711,10 +742,20 @@ class Renderer:
         return segs
 
     def _box_edge_segments(self, box_bounds, camera):
-        """World-space (start, end) pairs for the simulation box's edges, with the
-        single edge nearest the camera dropped so it doesn't streak across the
-        front of the scene (it would otherwise be drawn on top of the beads it
-        should sit behind). box_bounds is (xlo, xhi, ylo, yhi, zlo, zhi)."""
+        """World-space (start, end) pairs for the simulation box's edges, cut into
+        short sub-segments so the near corner can be DISSOLVED rather than
+        dropped. box_bounds is (xlo, xhi, ylo, yhi, zlo, zhi).
+
+        The problem this solves: the corner of the box nearest the eye hangs in
+        empty space in front of everything, and its three edges streak across the
+        scene. Dropping the single nearest edge outright (what this used to do)
+        fixes that but pops -- swing the camera and a whole edge blinks out as the
+        argmin changes, which on the orbiting assembly box happens every few
+        seconds. Fading by DEPTH instead is continuous in the camera angle, since
+        each vertex's depth is; see _box_edge_alpha. Sub-dividing is what lets the
+        fade run along an edge, so an edge that starts near the eye and ends deep
+        in the scene comes in gradually instead of taking one alpha for its whole
+        length."""
         xlo, xhi, ylo, yhi, zlo, zhi = box_bounds
         xs, ys, zs = (xlo, xhi), (ylo, yhi), (zlo, zhi)
         corner = {(i, j, k): np.array([xs[i], ys[j], zs[k]], dtype=float)
@@ -729,11 +770,39 @@ class Renderer:
                         edges.append(((i, 0, k), (i, 1, k)))
                     if k == 0:
                         edges.append(((i, j, 0), (i, j, 1)))
-        segs = [(corner[a], corner[b]) for a, b in edges]   # 12 unique edges
-        eye = np.asarray(camera.eye, dtype=float)
-        nearest = min(range(len(segs)),
-                      key=lambda m: np.linalg.norm(0.5 * (segs[m][0] + segs[m][1]) - eye))
-        return [s for m, s in enumerate(segs) if m != nearest]
+        segs = []
+        n = BOX_EDGE_SUBDIVISIONS
+        for a, b in edges:                       # 12 unique edges
+            pa, pb = corner[a], corner[b]
+            for m in range(n):
+                segs.append((pa + (pb - pa) * (m / n),
+                             pa + (pb - pa) * ((m + 1) / n)))
+        return segs
+
+    def _box_edge_alpha(self, box_bounds, camera):
+        """A function mapping a point's view depth to the box outline's opacity
+        there: 0 at the box's nearest corner, rising to 1 over the front
+        BOX_EDGE_FADE_DEPTH of its depth span.
+
+        Anchored to the BOX's own depth extent, not the beads': the box is what is
+        being faded, its span is what the fade has to cover, and both are computed
+        from the same eight corners whatever the camera is doing."""
+        xlo, xhi, ylo, yhi, zlo, zhi = box_bounds
+        corners = np.array([[x, y, z] for x in (xlo, xhi)
+                            for y in (ylo, yhi) for z in (zlo, zhi)])
+        _, depths, _ = camera.project(corners)
+        finite = depths[np.isfinite(depths)]
+        if not len(finite):
+            return lambda d: 1.0
+        d_near, d_far = float(finite.min()), float(finite.max())
+        width = max(BOX_EDGE_FADE_DEPTH * (d_far - d_near), 1e-6)
+
+        def alpha(d):
+            if not np.isfinite(d):
+                return 0.0
+            t = min(max((d - d_near) / width, 0.0), 1.0)
+            return t * t * (3.0 - 2.0 * t)       # smoothstep: no visible seam
+        return alpha
 
     def _build_bead_zbuffer(self, screen, depth, radii, phys_r, region=None):
         """A per-pixel depth buffer of the beads' front surfaces over the sim
@@ -809,13 +878,15 @@ class Renderer:
                 pygame.draw.aalines(surf, col, False, run)
         self.screen.blit(surf, (0, 0))
 
-    def _draw_box_occluded(self, camera, box_segs, zbuf, near, far):
+    def _draw_box_occluded(self, camera, box_segs, zbuf, near, far, near_alpha):
         """Draw the simulation-box edges with the same bead-z-buffer occlusion as
         the net, but in depth-cued white: each edge is sampled in 3D, projected,
         and only the runs in front of the nearest bead surface (or over empty
         background) are drawn, so the box reads as a frame the beads sit inside.
-        Fog is applied per edge (from its midpoint depth) -- a per-pixel gradient
-        isn't worth it on this rare CPU fallback (the GL path fogs per vertex)."""
+        Fog and the near-corner dissolve are applied per sub-segment (from its
+        midpoint depth) -- a per-pixel gradient isn't worth it on this rare CPU
+        fallback, and _box_edge_segments hands back short enough pieces that the
+        difference does not show."""
         W, H = self.sim_width, self.window_size[1]
         surf = self.bond_surface   # reused scratch (already blitted above)
         surf.fill((0, 0, 0, 0))
@@ -823,7 +894,10 @@ class Renderer:
         for pa, pb in box_segs:
             _, dmid, _ = camera.project_point(0.5 * (pa + pb))
             fog = self._fog(dmid, near, far) if np.isfinite(dmid) else 0.0
-            col = (*_lerp_color(BOX_3D_COLOR, HAZE_COLOR, fog), BOX_3D_ALPHA)
+            alpha = int(BOX_3D_ALPHA * near_alpha(dmid))
+            if alpha <= 1:
+                continue
+            col = (*_lerp_color(BOX_3D_COLOR, HAZE_COLOR, fog), alpha)
             sa, _, _ = camera.project_point(pa)
             sb, _, _ = camera.project_point(pb)
             n = max(2, int(math.hypot(sb[0] - sa[0], sb[1] - sa[1]) / 3.0))
@@ -1023,21 +1097,30 @@ class Renderer:
                     sim_time_ps=0.0, puller_energy=None, hud_lines=None,
                     potential_terms=None, torque_signals=None,
                     total_steps=0, steps_per_frame=1, debug_line=None,
-                    brightness=None, total_potential_terms=None, box_bounds=None):
+                    brightness=None, total_potential_terms=None, box_bounds=None,
+                    puller_attached=True, bead_energies=None,
+                    box_periodic=None):
         pts = np.asarray(positions3d, dtype=float)
         screen, depth, scale = camera.project(pts)
-        # Depth cueing anchored to the scene's own near->far extent: no haze over
-        # the front DEPTH_FADE_START of that span, then a linear ramp to a full
-        # wash-out at the farthest bead (see theme.DEPTH_FADE_START /
-        # HAZE_STRENGTH). Normalizing to the scene span (not absolute camera
-        # distance) keeps the cue consistent whether the whole scene sits close
-        # (the 7-bead patch) or far (the big sheet). near/far here are the fog
-        # range, shared by the beads, bond spokes and director spikes so they all
-        # recede together.
+        # Depth cueing anchored to the scene's own near->far extent, not to an
+        # absolute camera distance, so the cue reads the same whether the whole
+        # scene sits close (the 7-bead patch) or far (the big sheet). near/far
+        # here are the ramp, shared by the beads, bond spokes and director spikes
+        # so they all recede together.
+        #
+        # The GL path takes the ramp from the system's RenderStyle (where the
+        # rest of the look lives, and where it can be tuned per system); the CPU
+        # fallback, which has none of that machinery, keeps the theme constants.
         finite = np.isfinite(depth)
         dmin = float(np.min(depth[finite])) if np.any(finite) else 0.0
         dmax = float(np.max(depth[finite])) if np.any(finite) else 1.0
-        near, far = dmin + DEPTH_FADE_START * (dmax - dmin), dmax
+        style = spec.render_style
+        if self.gl_enabled:
+            near, far = style.cue_range(dmin, dmax)
+            self._fog_strength = style.cue_strength if style.depth_cue else 0.0
+        else:
+            near, far = dmin + DEPTH_FADE_START * (dmax - dmin), dmax
+            self._fog_strength = HAZE_STRENGTH
 
         # Physical bead radius (Angstrom/sigma) -> px at each bead's depth. The
         # bead-sized overlays (puller ring, torque arcs, director spikes) key off
@@ -1056,7 +1139,8 @@ class Renderer:
             radii = np.maximum(phys_r * scale, 2.0)   # unclamped: matches GL beads
             self.screen.fill((0, 0, 0, 0))
             self._render_gl_3d(camera, pts, dipoles3d, spec, bonds, control_grid,
-                               depth, near, far, brightness, box_bounds)
+                               depth, near, far, (dmin, dmax), brightness,
+                               box_bounds, bead_energies, box_periodic)
             # Director spikes and the puller ring stay 2D overlays (they poke out
             # the near pole, so drawing on top without depth occlusion reads fine).
             # The spikes are batch-projected -- per-bead projection would be a few
@@ -1067,13 +1151,15 @@ class Renderer:
             for i in order:
                 if np.isfinite(depth[i]) and is_puller[i]:
                     cx, cy = int(screen[i][0]), int(screen[i][1])
-                    pygame.draw.circle(self.screen, PULLER_RING_COLOR, (cx, cy),
-                                       int(radii[i]) + 2, PULLER_RING_WIDTH)
+                    pygame.draw.circle(self.screen,
+                                       self._puller_ring_color(puller_attached),
+                                       (cx, cy), int(radii[i]) + 2, PULLER_RING_WIDTH)
         else:
             radii = np.clip(phys_r * scale, 3, 90)   # capped: matches CPU sprites
             self._draw_sim_3d_cpu(pts, dipoles3d, is_puller, spec, camera, bonds,
                                   control_grid, screen, depth, near, far, phys_r,
-                                  radii, order, brightness, box_bounds)
+                                  radii, order, brightness, box_bounds,
+                                  puller_attached)
 
         self._draw_3d_overlays(camera, pts, screen, depth, radii, is_puller, spec,
                                input_force, reaction_force, fps, sim_time_ps,
@@ -1084,19 +1170,60 @@ class Renderer:
     # ---- GPU scene: hand the beads + occluded lines to the GL pipeline ------
 
     def _render_gl_3d(self, camera, pts, dipoles3d, spec, bonds, control_grid,
-                      depth, near, far, brightness=None, box_bounds=None):
+                      depth, near, far, depth_range, brightness=None,
+                      box_bounds=None, energies=None, box_periodic=None):
         """Render the beads (and depth-occluded bond/net lines) with the GL scene
         and blit the result into the on-screen sim viewport. `near`/`far` are the
-        padded fog range; the projection near/far are taken a touch wider than the
-        actual bead extent so no front cap is clipped."""
+        depth-cue ramp used for the LINES; `depth_range` is the scene's raw
+        (nearest, farthest) bead distance, from which the GL scene places its own
+        cue ramp and focus plane. The projection near/far are taken a touch wider
+        than the actual bead extent so no front cap is clipped."""
         W, H = self.sim_width, self.window_size[1]
         view = view_matrix(camera.eye, camera.right, camera.true_up, camera.forward)
         fx = camera.focal / (camera.viewport_w / 2.0)
         fy = camera.focal / (camera.viewport_h / 2.0)
         phys_r = spec.atom_radius_A or 0.5
-        finite = np.isfinite(depth)
-        dmin = float(np.min(depth[finite])) if np.any(finite) else 1.0
-        dmax = float(np.max(depth[finite])) if np.any(finite) else 10.0
+
+        # Beads to draw = the real beads plus opaque wrapped ghost copies near
+        # periodic seams; brightness spotlights any tagged cluster. For a periodic
+        # scene the shader clips beads to the box faces (all opaque), so a bead
+        # crossing a seam slides across continuously with no transparency; the soft
+        # edge is a screen-space vignette in the composite, not a per-bead fade.
+        style = spec.render_style
+        tiling = (box_bounds is not None and box_periodic is not None
+                  and any(float(n) > 0.0 and per
+                          for n, per in zip(style.periodic_images, box_periodic)))
+        if tiling:
+            # The images ARE the seam handling: no clipping to the cell faces and
+            # no wrapped ghosts, because every neighbouring cell is drawn whole.
+            bfade = None
+            bpts, bdips, bbright, benergy, bfade = self._periodic_image_instances(
+                np.asarray(pts, dtype=float), np.asarray(dipoles3d, dtype=float),
+                np.ones(len(pts)) if brightness is None
+                else np.asarray(brightness, dtype=float),
+                np.zeros(len(pts)) if energies is None
+                else np.asarray(energies, dtype=float),
+                style, box_bounds, box_periodic)
+            box_half, edge_fade_on = None, False
+        else:
+            bpts, bdips, bbright, benergy = self._wrap_ghost_instances(
+                pts, dipoles3d, brightness, spec, energies)
+            bfade = None
+            periodic = bool(spec.wrap_fade_fraction) and self.box_x is not None
+            box_half = (self.box_x / 2.0, self.box_y / 2.0) if periodic else None
+            edge_fade_on = periodic
+        radii = np.full(len(bpts), phys_r, dtype=np.float32)
+
+        # The frustum and the depth span are measured over what is ACTUALLY
+        # drawn, not over the real cell alone. With periodic images that is the
+        # difference between an infinite-looking membrane and one whose front and
+        # back rows are sliced off by the near and far planes -- the images
+        # nearest the eye sit well in front of anything in the real cell.
+        _, bdepth, _ = camera.project(bpts)
+        bfinite = np.isfinite(bdepth)
+        dmin = float(np.min(bdepth[bfinite])) if np.any(bfinite) else 1.0
+        dmax = float(np.max(bdepth[bfinite])) if np.any(bfinite) else 10.0
+        depth_range = (dmin, dmax)
         near_clip = dmin - phys_r - 1.0
         far_clip = dmax + phys_r + 1.0
         # The box outline can extend nearer/farther than any bead; widen the clip
@@ -1111,34 +1238,119 @@ class Renderer:
                 near_clip = min(near_clip, float(cfin.min()) - 1.0)
                 far_clip = max(far_clip, float(cfin.max()) + 1.0)
         proj = proj_matrix(fx, fy, max(0.05, near_clip), far_clip)
-
-        # Beads to draw = the real beads plus opaque wrapped ghost copies near
-        # periodic seams; brightness spotlights any tagged cluster. For a periodic
-        # scene the shader clips beads to the box faces (all opaque), so a bead
-        # crossing a seam slides across continuously with no transparency; the soft
-        # edge is a screen-space vignette in the composite, not a per-bead fade.
-        bpts, bdips, bbright = self._wrap_ghost_instances(pts, dipoles3d,
-                                                          brightness, spec)
-        radii = np.full(len(bpts), phys_r, dtype=np.float32)
-        periodic = bool(spec.wrap_fade_fraction) and self.box_x is not None
-        box_half = (self.box_x / 2.0, self.box_y / 2.0) if periodic else None
-        verts, cols = self._build_gl_lines(camera, pts, spec, bonds, control_grid,
-                                           depth, near, far, box_bounds)
-        # Screen-space edge vignette on periodic scenes (the sheet): softens the
+        verts, cols, ov_verts, ov_cols = self._build_gl_lines(
+            camera, pts, spec, bonds, control_grid, depth, near, far, box_bounds,
+            box_on_top=tiling)
+        # Screen-space edge fade on periodic scenes (the sheet): softens the
         # frame edge / clip seam uniformly across the whole depth column, instead
         # of the old per-bead world-face fade. The white box outline is drawn
         # after the composite, so it stays bright.
-        vignette = EDGE_VIGNETTE_STRENGTH if periodic else 0.0
-        self.gl_scene.render(view, proj, bpts, radii, bdips, near, far, verts, cols,
-                             brights=bbright, box_half=box_half, vignette=vignette)
+        edge_fade = EDGE_VIGNETTE_STRENGTH if edge_fade_on else 0.0
+        self.gl_scene.render(view, proj, bpts, radii, bdips, depth_range,
+                             verts, cols, brights=bbright, box_half=box_half,
+                             edge_fade=edge_fade, style=style,
+                             bead_radius=phys_r, focal_px=camera.focal,
+                             energies=benergy if energies is not None else None,
+                             fades=bfade, overlay_verts=ov_verts,
+                             overlay_cols=ov_cols)
         # Sim viewport is the left sim_width columns, full height (GL origin is
         # bottom-left, so its y origin is 0).
         self.gl_scene.blit_to_viewport(0, 0, W, H)
 
-    def _wrap_ghost_instances(self, pts, dips, brightness, spec):
+    def _periodic_image_instances(self, pts, dips, bright, energy, style,
+                                  box_bounds, box_periodic):
+        """Every bead, repeated over the cell's periodic images, with a per-bead
+        strength that trails off with distance from the real cell.
+
+        A periodic cell is a window onto an infinite system; drawing one copy of
+        it says otherwise. This draws `style.periodic_images` copies along each
+        periodic axis, so the sheet reads as a piece of an endless membrane
+        rather than a small square raft, and fades them with distance so the
+        tiling has no outer edge of its own.
+
+        Counts are per axis, and may be given per SIDE and FRACTIONALLY: 0.5 is
+        half of the neighbouring cell, and (0.5, 3) reaches half a cell one way
+        and three cells the other. That is what puts the real cell -- the one
+        carrying the controlled particle, its control net and the box outline --
+        near the front of the block, with a little in front of it and a long tail
+        of copies receding behind, rather than buried in the middle of its own
+        copies or hanging off the front edge of them. Declared rather than
+        derived from the camera on purpose: worked out per frame it would flip
+        from one side to the other as the view swung past a right angle, and the
+        whole block would jump.
+
+        Returns (positions, directors, brightness, energies, fades). No clipping
+        and no seam ghosts are needed alongside this: a bead poking out of the
+        real cell is exactly the neighbouring copy's bead poking in, which is
+        what the true infinite tiling looks like."""
+        def sides(entry, periodic):
+            """(before, after) copies along one axis. A single number means the
+            same either side; a pair says how far the block reaches in each
+            direction, which is what lets the real cell sit near the front of a
+            long tail of copies without there being NOTHING in front of it."""
+            if not periodic:
+                return 0.0, 0.0
+            if isinstance(entry, (tuple, list, np.ndarray)):
+                return float(entry[0]), float(entry[1])
+            return float(entry), float(entry)
+
+        reach = np.ones((3, 2))                # per axis, per side, in half-widths
+        whole = [[0, 0], [0, 0], [0, 0]]
+        for axis, (entry, per) in enumerate(zip(style.periodic_images, box_periodic)):
+            before, after = sides(entry, per)
+            # In half-widths, with the real cell spanning [-1, 1]: n copies out
+            # from a boundary reach 1 + 2n. Fractions are allowed and are what
+            # make a partial copy mean something -- 0.5 is half a neighbouring
+            # cell -- so whole copies are generated and then clipped to this.
+            reach[axis] = (1.0 + 2.0 * before, 1.0 + 2.0 * after)
+            whole[axis] = [int(math.ceil(before)), int(math.ceil(after))]
+
+        lo = np.array(box_bounds[0::2], dtype=float)
+        hi = np.array(box_bounds[1::2], dtype=float)
+        lengths, centre = hi - lo, 0.5 * (lo + hi)
+        half = 0.5 * lengths
+
+        offsets = [np.array([i, j, k], dtype=float) * lengths
+                   for i in range(-whole[0][0], whole[0][1] + 1)
+                   for j in range(-whole[1][0], whole[1][1] + 1)
+                   for k in range(-whole[2][0], whole[2][1] + 1)]
+        P = np.concatenate([pts + o for o in offsets])
+        n_img = len(offsets)
+        D = np.tile(dips, (n_img, 1))
+        B = np.tile(bright, n_img)
+        E = np.tile(energy, n_img)
+
+        # How far out each bead is, as a FRACTION of the copies drawn in that
+        # direction: 0 anywhere in the real cell, 1 at the outer edge of the
+        # block. Per axis and per side, because the two sides can reach
+        # different distances, and the furthest-out axis wins.
+        #
+        # Expressed as a fraction rather than in half-widths so the fade cannot
+        # be left promising range that is not drawn: at 1.0 it reaches the
+        # background exactly where the copies are cut, whatever the counts, and
+        # there is no straight edge to see. That is the one thing this has to get
+        # right -- an abrupt boundary is worse than no images at all.
+        signed = (P - centre) / half
+        side = (signed > 0.0).astype(int)
+        limit = np.take_along_axis(reach[None, :, :].repeat(len(P), 0),
+                                   side[:, :, None], axis=2)[:, :, 0]
+        out = np.clip((np.abs(signed) - 1.0) / np.maximum(limit - 1.0, 1e-9),
+                      0.0, None)
+        u = np.max(np.where(limit > 1.0, out, 0.0), axis=1)
+        span = max(style.image_fade_end - style.image_fade_start, 1e-6)
+        F = np.clip(1.0 - (u - style.image_fade_start) / span, 0.0, 1.0)
+
+        # Clip to the extent asked for, one axis and side at a time, and drop
+        # anything that has faded out entirely: a fully faded copy is
+        # background-coloured but still writes depth, so it would punch a hole in
+        # whatever is behind it.
+        keep = (F > 0.01) & np.all(np.abs(signed) <= limit + 1e-9, axis=1)
+        return P[keep], D[keep], B[keep], E[keep], F[keep]
+
+    def _wrap_ghost_instances(self, pts, dips, brightness, spec, energies=None):
         """Real beads + OPAQUE wrapped ghost copies near the periodic x/y seams.
 
-        Returns (positions, directors, brightness), one entry per real bead
+        Returns (positions, directors, brightness, energies), one entry per real bead
         followed by ghost entries for beads near a seam. A bead within about a
         bead-radius of a seam also gets an opaque copy at the wrapped position;
         the renderer clips every bead to the box faces (GL) / darkens the box edge
@@ -1151,9 +1363,13 @@ class Renderer:
         dips = np.asarray(dips, dtype=float)
         n = len(pts)
         bright = np.ones(n) if brightness is None else np.asarray(brightness, dtype=float)
+        # A ghost is the same bead seen through the periodic boundary, so it
+        # carries the same per-bead quantities -- brightness and energy ride
+        # along by construction.
+        energy = np.zeros(n) if energies is None else np.asarray(energies, dtype=float)
         frac = spec.wrap_fade_fraction
         if not frac or frac <= 0 or self.box_x is None:
-            return pts, dips, bright
+            return pts, dips, bright, energy
 
         # A bead within `band` of a seam is copied to the wrapped position. The
         # band is a bit over one bead radius so the ghost already exists by the
@@ -1172,7 +1388,7 @@ class Renderer:
         sx, near_x = axis_ghost(pts[:, 0], self.box_x / 2.0)
         sy, near_y = axis_ghost(pts[:, 1], self.box_y / 2.0)
 
-        groups = [(pts, dips, bright)]   # the real beads
+        groups = [(pts, dips, bright, energy)]   # the real beads
 
         def add_ghost(mask, dx, dy):
             if not np.any(mask):
@@ -1180,25 +1396,29 @@ class Renderer:
             p = pts[mask].copy()
             p[:, 0] += dx[mask]
             p[:, 1] += dy[mask]
-            groups.append((p, dips[mask], bright[mask]))
+            groups.append((p, dips[mask], bright[mask], energy[mask]))
 
         zero = np.zeros(n)
         add_ghost(near_x, sx, zero)
         add_ghost(near_y, zero, sy)
         add_ghost(near_x & near_y, sx, sy)
 
-        P = np.concatenate([g[0] for g in groups])
-        D = np.concatenate([g[1] for g in groups])
-        B = np.concatenate([g[2] for g in groups])
-        return P, D, B
+        return tuple(np.concatenate([g[k] for g in groups]) for k in range(4))
 
     def _build_gl_lines(self, camera, pts, spec, bonds, control_grid, depth, near,
-                        far, box_bounds=None):
+                        far, box_bounds=None, box_on_top=False):
         """World-space line vertices (M,3) and per-vertex rgba (M,4, 0..1) for the
         bond spokes, the control-plane net, and the simulation-box outline, fogged
         like the CPU path. Returned as GL line-list pairs; the depth test against
-        the beads does the occlusion (replacing the CPU z-buffer)."""
+        the beads does the occlusion (replacing the CPU z-buffer).
+
+        Returns (verts, cols, overlay_verts, overlay_cols). `box_on_top` moves the
+        box outline into the second, un-depth-tested set: once the cell is drawn
+        surrounded by its own periodic images, the images bury the outline, and
+        the one line that says WHERE THE REAL CELL IS is the one that must not be
+        hidden by copies of it."""
         verts, cols = [], []
+        box_verts, box_cols = [], []
         d_opt = spec.lattice_spacing
         lam = BOND_FALLOFF * d_opt
         max_offset = lam * math.log(max(BOND_PEAK_ALPHA / BOND_MIN_ALPHA, 1.0001))
@@ -1223,22 +1443,36 @@ class Renderer:
                     verts.append(np.asarray(p, dtype=float))
                     cols.append((r / 255.0, g / 255.0, bb / 255.0, NET_LINE_ALPHA / 255.0))
         if box_bounds is not None:
+            near_alpha = self._box_edge_alpha(box_bounds, camera)
+            bv, bc = (box_verts, box_cols) if box_on_top else (verts, cols)
             for pa, pb in self._box_edge_segments(box_bounds, camera):
                 for p in (pa, pb):
                     _, dp, _ = camera.project_point(p)
-                    fog = self._fog(dp, near, far) if np.isfinite(dp) else 0.0
+                    # Un-fogged when it is on top: the depth cue exists to push
+                    # SCENERY into the distance, and once the outline is the only
+                    # thing saying where the real cell is among its images, it is
+                    # annotation rather than scenery. Fogged against a tiled
+                    # scene's depth span it all but vanished.
+                    fog = (0.0 if box_on_top else
+                           (self._fog(dp, near, far) if np.isfinite(dp) else 0.0))
                     r, g, bb = _lerp_color(BOX_3D_COLOR, HAZE_COLOR, fog)
-                    verts.append(np.asarray(p, dtype=float))
-                    cols.append((r / 255.0, g / 255.0, bb / 255.0, BOX_3D_ALPHA / 255.0))
-        if not verts:
-            return None, None
-        return np.array(verts, dtype=np.float32), np.array(cols, dtype=np.float32)
+                    bv.append(np.asarray(p, dtype=float))
+                    # Per-VERTEX alpha, so the near corner dissolves along the
+                    # edges rather than the whole edge switching off.
+                    bc.append((r / 255.0, g / 255.0, bb / 255.0,
+                               BOX_3D_ALPHA / 255.0 * near_alpha(dp)))
+
+        def arrays(v, c):
+            if not v:
+                return None, None
+            return np.array(v, dtype=np.float32), np.array(c, dtype=np.float32)
+        return arrays(verts, cols) + arrays(box_verts, box_cols)
 
     # ---- CPU scene (fallback when no GL context is available) ---------------
 
     def _draw_sim_3d_cpu(self, pts, dipoles3d, is_puller, spec, camera, bonds,
                          control_grid, screen, depth, near, far, phys_r, radii, order,
-                         brightness=None, box_bounds=None):
+                         brightness=None, box_bounds=None, puller_attached=True):
         """Numpy-shaded sphere sprites (painter-sorted), bond lines, and the
         z-buffer-occluded net + box outline -- the original CPU renderer, kept as
         the fallback for machines without an OpenGL 3.3 context. Draws onto
@@ -1269,9 +1503,10 @@ class Renderer:
         # Beads to draw = the real beads plus opaque wrapped ghost copies near
         # periodic seams; real beads come first, so is_puller applies to the
         # leading n and ghosts carry no ring. brightness spotlights any tagged
-        # cluster.
-        bpts, bdips, bbright = self._wrap_ghost_instances(pts, dipoles3d,
-                                                          brightness, spec)
+        # cluster. (This fallback always draws the director banding -- the energy
+        # colouring is a shader path, and this exists for machines with no GL.)
+        bpts, bdips, bbright, _ = self._wrap_ghost_instances(pts, dipoles3d,
+                                                            brightness, spec)
         m = len(bpts)
         aug_pull = np.zeros(m, dtype=bool)
         aug_pull[:len(pts)] = np.asarray(is_puller, dtype=bool)
@@ -1308,7 +1543,8 @@ class Renderer:
             sprite = self._banded_sphere_sprite(r, dv[i], total_fade, float(bbright[i]))
             self.screen.blit(sprite, (cx - r, cy - r))
             if aug_pull[i]:
-                pygame.draw.circle(self.screen, PULLER_RING_COLOR, (cx, cy), r + 2, PULLER_RING_WIDTH)
+                pygame.draw.circle(self.screen, self._puller_ring_color(puller_attached),
+                                   (cx, cy), r + 2, PULLER_RING_WIDTH)
 
         # Director spikes on top (batch-projected -- see the GL path), so the
         # 900-bead sheet's arrows don't cost thousands of per-bead projections.
@@ -1321,6 +1557,8 @@ class Renderer:
         # sphere silhouette. The z-buffer is built once over the combined screen
         # region of both so a single pass serves both draws.
         box_segs = self._box_edge_segments(box_bounds, camera) if box_bounds is not None else None
+        box_alpha = (self._box_edge_alpha(box_bounds, camera)
+                     if box_bounds is not None else None)
         occ_segs = list(net_segs or []) + list(box_segs or [])
         if occ_segs:
             opts = np.array([p for seg in occ_segs for p in seg], dtype=float)
@@ -1335,7 +1573,8 @@ class Renderer:
             if net_segs is not None:
                 self._draw_net_occluded(camera, net_segs, zbuf)
             if box_segs is not None:
-                self._draw_box_occluded(camera, box_segs, zbuf, near, far)
+                self._draw_box_occluded(camera, box_segs, zbuf, near, far,
+                                        box_alpha)
 
     # ---- shared 2D overlays over the 3D scene (both GL and CPU paths) --------
 
@@ -1371,7 +1610,7 @@ class Renderer:
 
         ix, iy = input_force
         rx, ry = reaction_force
-        sim_time_str = units.format_sim_time(sim_time_ps)
+        sim_time_str = units.format_sim_time(sim_time_ps, spec.reduced_units)
         # Input/reaction torque (director twist about the control-plane normal),
         # shown alongside the forces. torque_signals are the fractions [-1, 1] the
         # torque arcs use (green = your twist, red = membrane restoring twist).
@@ -1382,7 +1621,7 @@ class Renderer:
                           f"membrane torque: {reaction:+.2f}   ")
         label = self.font.render(
             f"{spec.name}  |  sim time: {sim_time_str}   steps: {total_steps:,} ({steps_per_frame}/frame)   "
-            f"input force: ({ix:4.1f}, {iy:4.1f})   "
+            f"input force: ({ix:4.1f}, {iy:4.1f}){units.force_unit(spec.reduced_units)}   "
             f"membrane force: ({rx:5.1f}, {ry:5.1f})   "
             f"{torque_str}fps: {fps:4.0f}",
             True, (200, 200, 200),
@@ -1404,7 +1643,8 @@ class Renderer:
     def draw_sim(self, positions, is_puller, puller_pos, input_force, reaction_force,
                  fps, spec, heat_fraction=0.0, sim_time_ps=0.0, atom_trails=None,
                  species=None, bond_pairs=None, puller_energy=None, hbond_pairs=None,
-                 hud_lines=None, total_steps=0, steps_per_frame=1, debug_line=None):
+                 hud_lines=None, total_steps=0, steps_per_frame=1, debug_line=None,
+                 puller_attached=True):
         self.screen.fill(BG)
 
         top_left = self.sim_to_screen(0, self.box_y)
@@ -1495,8 +1735,8 @@ class Renderer:
                 is_head = (sp == 0)
                 r = self._atom_radius_px(spec, sp) + (PULLER_RADIUS_BOOST if is_head else 1)
                 pygame.draw.circle(self.screen, self._species_color(spec, sp), (sx, sy), r)
-                pygame.draw.circle(self.screen, PULLER_RING_COLOR, (sx, sy), r,
-                                   PULLER_RING_WIDTH if is_head else 1)
+                pygame.draw.circle(self.screen, self._puller_ring_color(puller_attached),
+                                   (sx, sy), r, PULLER_RING_WIDTH if is_head else 1)
             label_r = self._atom_radius_px(spec, 0) + PULLER_RADIUS_BOOST
         else:
             # Single-atom puller (Cu, Ar, NaCl), drawn in its true species/
@@ -1508,7 +1748,8 @@ class Renderer:
             sp0 = puller_species[0] if puller_species else None
             r = self._atom_radius_px(spec, sp0) + PULLER_RADIUS_BOOST
             pygame.draw.circle(self.screen, self._species_color(spec, sp0), puller_xy, r)
-            pygame.draw.circle(self.screen, PULLER_RING_COLOR, puller_xy, r, PULLER_RING_WIDTH)
+            pygame.draw.circle(self.screen, self._puller_ring_color(puller_attached),
+                               puller_xy, r, PULLER_RING_WIDTH)
             # In a species system the puller is also (e.g.) an ion -- stamp its
             # glyph so its role is legible.
             if labels is not None and sp0 is not None:
@@ -1521,8 +1762,9 @@ class Renderer:
         # over a faint backdrop so they stay legible on top of atoms and bonds.
         if (puller_xy is not None and puller_energy is not None
                 and puller_energy[0] is not None):
-            e_lines = [f"KE = {units.format_energy(puller_energy[0])}",
-                       f"PE = {units.format_energy(puller_energy[1])}"]
+            red = spec.reduced_units
+            e_lines = [f"KE = {units.format_energy(puller_energy[0], red)}",
+                       f"PE = {units.format_energy(puller_energy[1], red)}"]
             surfs = [self.small_font.render(t, True, PULLER_LABEL_COLOR) for t in e_lines]
             ey = int(puller_xy[1]) + label_r + 10
             for surf in surfs:
@@ -1536,11 +1778,12 @@ class Renderer:
 
         ix, iy = input_force
         rx, ry = reaction_force
-        sim_time_str = units.format_sim_time(sim_time_ps)
+        sim_time_str = units.format_sim_time(sim_time_ps, spec.reduced_units)
+        fu = units.force_unit(spec.reduced_units)
         label = self.font.render(
             f"{spec.name}  |  sim time: {sim_time_str}   steps: {total_steps:,} ({steps_per_frame}/frame)   "
-            f"input force: ({ix:4.1f}, {iy:4.1f}) eV/A   "
-            f"interaction force: ({rx:5.1f}, {ry:5.1f}) eV/A   fps: {fps:4.0f}",
+            f"input force: ({ix:4.1f}, {iy:4.1f}){fu}   "
+            f"interaction force: ({rx:5.1f}, {ry:5.1f}){fu}   fps: {fps:4.0f}",
             True, (200, 200, 200),
         )
         self.screen.blit(label, (10, 10))
@@ -1580,6 +1823,37 @@ class Renderer:
                 return btn.name
         return None
 
+    def _draw_bead_color_toggle(self, x, y, w, spec):
+        """The bead-colouring toggle plus a line saying what the colours mean.
+        Returns the y to carry on from. Only for the 3D bead scenes -- the 2D
+        crystals colour by species, which is not a choice."""
+        self._bead_color_visible = False
+        if not spec.render_3d:
+            return y
+        self._bead_color_visible = True
+        energy = self.bead_color_energy
+        self.bead_color_button.rect = pygame.Rect(x, y, 210, 26)
+        self.bead_color_button.label = ("bead colour: ENERGY" if energy
+                                        else "bead colour: DIRECTOR")
+        self.bead_color_button.draw(self.screen, self.font, active=energy)
+        # What the colours mean, on its own line under the button: a colour scale
+        # nobody can read is decoration.
+        lo, hi = spec.render_style.energy_range
+        caption = ([f"each bead's potential energy, inferno {lo:g} to {hi:g} eps",
+                    "dark = tightly bound, bright = strained or free"] if energy else
+                   ["director bands: yellow hydrophobic equator, blue poles",
+                    "the band tilts with the director, so tilt and splay show"])
+        cy = y + 29
+        for line in caption + ["white cap marks the +director pole, either way"]:
+            self.screen.blit(self.small_font.render(line, True, DIM_TEXT_COLOR),
+                             (x, cy))
+            cy += 14
+        return cy + 6
+
+    def bead_color_hit(self, pos):
+        """True if `pos` is on the bead-colouring toggle (and it is on screen)."""
+        return self._bead_color_visible and self.bead_color_button.hit(pos)
+
     def draw_panel(self, systems, current_key, sliders, thermo_now, puller_energy,
                     history, rdf, spec, puller_speed_m_s=None):
         pygame.draw.rect(self.screen, PANEL_BG, self.panel_rect)
@@ -1608,9 +1882,14 @@ class Renderer:
         self.screen.blit(desc_surf, (x, y))
         y += 16
 
-        hint_surf = self.small_font.render(KEY_HINTS, True, DIM_TEXT_COLOR)
+        # The turntable keys are only listed for the systems that have one --
+        # a hint for a key that does nothing is worse than no hint.
+        hints = KEY_HINTS + (ORBIT_KEY_HINTS if spec.camera_orbit else "")
+        hint_surf = self.small_font.render(hints, True, DIM_TEXT_COLOR)
         self.screen.blit(hint_surf, (x, y))
         y += 20
+
+        y = self._draw_bead_color_toggle(x, y, w, spec)
 
         pygame.draw.line(self.screen, PANEL_DIVIDER, (x, y), (x + w, y), 1)
         y += 12
@@ -1757,7 +2036,7 @@ class Renderer:
               history, rdf, heat_fraction=0.0, sim_time_ps=0.0, puller_speed_m_s=None,
               atom_trails=None, species=None, bond_pairs=None, hbond_pairs=None,
               hud_lines=None, scene_3d=None, total_steps=0, steps_per_frame=1,
-              debug_line=None, playback_playing=None):
+              debug_line=None, playback_playing=None, puller_attached=True):
         # In GL mode the default framebuffer is cleared to BG first; the 3D scene
         # (if any) is drawn straight into its sim viewport, and every 2D surface
         # is composited over it at the end. In CPU mode self.screen IS the display
@@ -1778,13 +2057,17 @@ class Renderer:
                 debug_line=debug_line, brightness=scene_3d.get("brightness"),
                 total_potential_terms=scene_3d.get("total_potential_terms"),
                 box_bounds=scene_3d.get("box_bounds"),
+                puller_attached=puller_attached,
+                bead_energies=scene_3d.get("bead_energies"),
+                box_periodic=scene_3d.get("box_periodic"),
             )
         else:
             self.draw_sim(positions, is_puller, puller_pos, input_force, reaction_force,
                            fps, spec, heat_fraction, sim_time_ps, atom_trails, species, bond_pairs,
                            puller_energy, hbond_pairs, hud_lines,
                            total_steps=total_steps, steps_per_frame=steps_per_frame,
-                           debug_line=debug_line)
+                           debug_line=debug_line,
+                           puller_attached=puller_attached)
         self.draw_panel(systems, current_key, sliders, thermo_now, puller_energy,
                          history, rdf, spec, puller_speed_m_s)
         # Play / Pause / Reset controls for playback systems, over the sim view.

@@ -107,6 +107,14 @@ class Mode:
     def steer_orientation(self, rate, dt):
         pass
 
+    # Whether the input device is holding a particle. A mode with no controlled
+    # particle is permanently "not holding one", and toggling is a no-op, so the
+    # app can offer the key on every system without asking what mode it is in.
+    attached = False
+
+    def toggle_attached(self):
+        return self.attached
+
     def controlled_index(self):
         return None
 
@@ -160,6 +168,12 @@ class GameMode(Mode):
         self._damping = control.damping_default
         self._pin_value = 0.0
         self._has_group_force = False
+        # Whether the input device is currently holding this particle. Released,
+        # it is an ordinary particle of the simulation: no drive, no steering, no
+        # leash -- it falls back into the membrane, or drifts, under the force
+        # field alone. It keeps its control plane (so it stays where the net says
+        # it is, ready to be grabbed again without a jump) and its speed cap.
+        self.attached = True
 
     # --- deck ----------------------------------------------------------------
 
@@ -218,8 +232,20 @@ class GameMode(Mode):
 
     # --- inputs --------------------------------------------------------------
 
+    def toggle_attached(self):
+        """Grab or release the controlled particle. Returns the new state."""
+        self.attached = not self.attached
+        if not self.attached:
+            # Drop the drive and the steering immediately, rather than leaving
+            # the last frame's values latched on a particle nobody is holding.
+            self._yaw = 0.0
+            self.set_input_force(0.0, 0.0)
+        return self.attached
+
     def set_input_force(self, fx, fy):
         """Input axis 1 -> the plane's u axis, axis 2 -> its v axis."""
+        if not self.attached:
+            fx = fy = 0.0
         self._input_u = fx
         self._input_v = fy
         if self.runtime.controlled_id is None:
@@ -243,7 +269,7 @@ class GameMode(Mode):
     def steer_orientation(self, rate, dt):
         # Sign flipped so the twist turns the director the way the hand expects
         # on screen. Applied in the next constrain().
-        self._yaw = -rate
+        self._yaw = -rate if self.attached else 0.0
 
     # --- per-frame constraint ------------------------------------------------
 
@@ -274,16 +300,20 @@ class GameMode(Mode):
         # Exact plane constraint (belt-and-braces with the setforce fix).
         x[ic][self.pin_axis] = self._pin_value
         v[ic][self.pin_axis] = 0.0
-        for axis, (lo, hi) in ((self.u_axis, self.control.u_range),
-                               (self.v_axis, self.control.v_range)):
-            if x[ic][axis] < lo:
-                x[ic][axis] = lo
-                if v[ic][axis] < 0.0:
-                    v[ic][axis] = 0.0
-            elif x[ic][axis] > hi:
-                x[ic][axis] = hi
-                if v[ic][axis] > 0.0:
-                    v[ic][axis] = 0.0
+        # The leash only exists while the particle is being steered: a released
+        # one is part of the simulation and free to go where the physics takes it
+        # (the walls still catch it -- see Scenario.wall_commands).
+        if self.attached:
+            for axis, (lo, hi) in ((self.u_axis, self.control.u_range),
+                                   (self.v_axis, self.control.v_range)):
+                if x[ic][axis] < lo:
+                    x[ic][axis] = lo
+                    if v[ic][axis] < 0.0:
+                        v[ic][axis] = 0.0
+                elif x[ic][axis] > hi:
+                    x[ic][axis] = hi
+                    if v[ic][axis] > 0.0:
+                        v[ic][axis] = 0.0
         speed = math.sqrt(v[ic][0] ** 2 + v[ic][1] ** 2 + v[ic][2] ** 2)
         cap = self.control.speed_cap
         if speed > cap:
@@ -329,7 +359,7 @@ class GameMode(Mode):
 
     def interaction_force(self):
         """The force field's reaction force on the controlled particle, projected
-        onto the control plane.
+        onto the control plane -- what the arrow draws and the stick renders.
 
         Recovered as total force minus the two forces we apply ourselves: the
         input drive (addforce) and the viscous damping (-gamma*v). The setforce on
@@ -342,21 +372,56 @@ class GameMode(Mode):
         plane, (b) _input_u/_input_v mirror the last addforce issued, and (c) the
         particle is excluded from the thermostat. All three are enforced above,
         and a regression test pins the arithmetic.
+
+        Two things then shape it, and both are about what the user's HAND should
+        feel rather than about the physics, which is untouched either way:
+        releasing the particle reports nothing (you are not holding it), and the
+        leash boundary is faded out (see Control.leash_release).
         """
+        if not self.attached:
+            return np.array([0.0, 0.0])
         if self._has_group_force:
             vec = self.runtime.lmp.extract_compute("pairforce", 0, 1)
-            return np.array([vec[self.u_axis], vec[self.v_axis]])
+            f_uv = np.array([vec[self.u_axis], vec[self.v_axis]])
+        else:
+            ic = self.runtime.controlled_local()
+            if ic is None:
+                return np.array([0.0, 0.0])
+            n = self.runtime.natoms
+            f = self.runtime.lmp.numpy.extract_atom("f")[:n]
+            v = self.runtime.lmp.numpy.extract_atom("v")[:n]
+            g = self._damping
+            f_uv = np.array([
+                f[ic][self.u_axis] - self._input_u + g * v[ic][self.u_axis],
+                f[ic][self.v_axis] - self._input_v + g * v[ic][self.v_axis],
+            ])
+        return f_uv * self._leash_release()
+
+    def _leash_release(self):
+        """Per-axis 1 -> 0 fade of the reported force as the particle nears its
+        leash, so arriving at the limit is silent instead of a sustained shove.
+
+        Position-based, so it is smooth in time however fast the particle is
+        moving, and symmetric in the force's direction -- gating only the outward
+        component would make the signal jump the moment the membrane's pull
+        changed sign. Returns (gain_u, gain_v); all ones when there is no leash to
+        approach.
+        """
+        release = self.control.leash_release
+        if not self.control.confine or release <= 0.0:
+            return np.array([1.0, 1.0])
         ic = self.runtime.controlled_local()
         if ic is None:
-            return np.array([0.0, 0.0])
-        n = self.runtime.natoms
-        f = self.runtime.lmp.numpy.extract_atom("f")[:n]
-        v = self.runtime.lmp.numpy.extract_atom("v")[:n]
-        g = self._damping
-        return np.array([
-            f[ic][self.u_axis] - self._input_u + g * v[ic][self.u_axis],
-            f[ic][self.v_axis] - self._input_v + g * v[ic][self.v_axis],
-        ])
+            return np.array([1.0, 1.0])
+        x = self.runtime.lmp.numpy.extract_atom("x")
+        gains = []
+        for axis, (lo, hi) in ((self.u_axis, self.control.u_range),
+                               (self.v_axis, self.control.v_range)):
+            width = max(release * 0.5 * (hi - lo), 1e-9)
+            # Distance to the nearer of the two limits, in units of that width.
+            t = min(max(min(hi - x[ic][axis], x[ic][axis] - lo) / width, 0.0), 1.0)
+            gains.append(t * t * (3.0 - 2.0 * t))       # smoothstep
+        return np.array(gains)
 
     def torque_signals(self):
         """(applied, reaction) torques about the control plane's normal,
@@ -367,8 +432,12 @@ class GameMode(Mode):
         read straight off the pair style's per-atom torque -- the component about
         the pinned axis is the part that rotates the director within the plane.
         """
+        # Both arcs describe a hand on the particle: your twist, and what the
+        # membrane twists back with. Released, there is no hand, so there are no
+        # arcs -- rather than a live restoring torque drawn around a particle
+        # nobody is steering.
         ic = self.runtime.controlled_local()
-        if ic is None or not self.runtime.has_directors:
+        if ic is None or not self.runtime.has_directors or not self.attached:
             return None
         applied = max(-1.0, min(1.0, self._yaw))
         tau = self.runtime.lmp.numpy.extract_atom("torque")

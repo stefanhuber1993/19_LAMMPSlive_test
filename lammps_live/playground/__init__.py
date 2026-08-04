@@ -41,15 +41,15 @@ from .scenario import (
     Composite, HexPatch, HexSheet, RandomFill, Scenario, ScenarioBuild, compose,
     hex_patch, hex_sheet, random_fill,
 )
-from ..systems.base import ForceFeedbackProfile
-from .deposition import Deposition2D, deposition_2d
+from ..mdsystem import ForceFeedbackProfile
+from .deposition import Deposition2D, IonicSlab2D, deposition_2d, ionic_slab_2d
 from .spec import Control, Playground
 from .state import Box, FrameState, PairData, build_pairs
 from .thermostat import CSVR, Langevin, Thermostat
 
 __all__ = [
     "Playground", "Control", "ForceFeedbackProfile",
-    "Deposition2D", "deposition_2d",
+    "Deposition2D", "deposition_2d", "IonicSlab2D", "ionic_slab_2d",
     "Thermostat", "Langevin", "CSVR",
     "Scenario", "ScenarioBuild", "HexPatch", "HexSheet", "RandomFill", "Composite",
     "hex_patch", "hex_sheet", "random_fill", "compose",

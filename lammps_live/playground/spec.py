@@ -19,7 +19,8 @@ metadata header of an 800-line class.
 """
 from dataclasses import dataclass, field
 
-from ..systems.base import ForceFeedbackProfile
+from ..render_style import DEFAULT_STYLE, RenderStyle
+from ..mdsystem import ForceFeedbackProfile
 
 
 # Force-feedback tuning scaled to reduced-unit mesoscale forces, which run
@@ -52,6 +53,17 @@ class Control:
     atom: str = "nearest_center"
     plane: str = "xz"
     leash: tuple = (3.0, 3.0)
+    # How much of each leash half-extent the REPORTED force fades out over as the
+    # particle approaches that boundary, as a fraction. The leash is the app's
+    # constraint, not the model's: nothing in the force field says there is a wall
+    # there, so holding the particle against one and rendering the resulting load
+    # on the stick makes the user push against a wall that does not exist -- and
+    # it is a sustained push, since the particle cannot move away from it. Fading
+    # the force out over the last 20% instead means the resistance melts away as
+    # you reach the limit, the particle simply stops, and nothing pushes back.
+    # The interesting physics is untouched: on the patch the membrane's pull peaks
+    # around a third of the way out and is well past its peak by here.
+    leash_release: float = 0.20
     speed_cap: float = 6.0
     # Whether to hold the particle on the control plane inside the leash at all.
     # False gives a genuinely free particle -- the deposition setups, where the
@@ -130,6 +142,17 @@ class Playground:
     # Whether to draw as a 3D scene (perspective spheres and directors) or the
     # top-down 2D box. The membrane playgrounds are 3D; a 2D crystal slab is not.
     render_3d: bool = True
+    # How the 3D scene is lit and post-processed -- a RenderStyle (see
+    # lammps_live/render_style.py). The default is the showreel look, tuned on a
+    # dense bead box; `DEFAULT_STYLE.varied(dof_bokeh_px=4.0, ...)` adjusts it
+    # for a scene of a different shape.
+    render_style: RenderStyle = DEFAULT_STYLE
+    # A turntable camera instead of the scenario's fixed one: mouse-drag to
+    # orbit, wheel to dolly, C to start/stop the automatic orbit. Worth it for a
+    # scene that is watched rather than driven -- the self-assembly box, where
+    # what is forming is a 3D morphology and one fixed angle hides it. A
+    # render_style.CameraOrbit, or None.
+    camera_orbit: object = None
     element_label: str = ""            # legend text, e.g. "Ar (LJ)"
     lattice_spacing: float = 1.0       # informational, and the bond-overlay optimum
     # Flat draw colour for a single-species 2D system, so different materials read

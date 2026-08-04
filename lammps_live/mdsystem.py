@@ -9,6 +9,8 @@ physicist expects them to mean regardless of which system is active.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from .render_style import DEFAULT_STYLE, RenderStyle
+
 
 @dataclass(frozen=True)
 class SliderSpec:
@@ -149,6 +151,15 @@ class SystemSpec:
     # every interactive (puller) system leaves it False. Space toggles play/pause
     # and R resets when set.
     playback_controls: bool = False
+    # 3D only: the look of the rendered scene -- lighting, ambient occlusion,
+    # contact shadows, outline, depth cue, depth of field, tonemap. See
+    # lammps_live/render_style.py; the defaults are tuned on a dense bead box,
+    # and a flatter or much smaller scene will want a few fields varied.
+    render_style: RenderStyle = DEFAULT_STYLE
+    # 3D only: a turntable camera (mouse-drag to orbit, wheel to dolly, C to
+    # start/stop the automatic orbit), for a scene with nothing to steer. None ->
+    # the fixed camera the scenario chose. A render_style.CameraOrbit.
+    camera_orbit: object = None
 
 
 class MDSystem(ABC):
@@ -313,6 +324,27 @@ class MDSystem(ABC):
         component projected onto the 2D plane the scene depicts. None (default)
         -> no torque arrows (systems whose puller has no meaningful orientation)."""
         return None
+
+    def get_box_periodic(self):
+        """3D only: (x, y, z) periodicity of the cell. Default: not periodic."""
+        return (False, False, False)
+
+    def get_bead_energies(self):
+        """3D only: per-particle potential energy, in the same order as
+        get_positions_3d, for the energy colouring. None -> the renderer keeps the
+        director banding."""
+        return None
+
+    def toggle_puller_attached(self):
+        """Grab or release the puller: attached, the input device drives it and
+        feels the force field push back; released, it is an ordinary particle of
+        the simulation and the device holds nothing. Returns the new state.
+        Default: no puller to grab, so always False."""
+        return False
+
+    def puller_attached(self):
+        """Whether the input device is currently holding the puller."""
+        return False
 
     def puller_bead_count(self):
         """Number of LAMMPS atoms the puller is made of: 1 for a single-atom

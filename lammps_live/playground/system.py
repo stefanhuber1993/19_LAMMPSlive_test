@@ -15,7 +15,7 @@ import random
 import numpy as np
 from lammps import lammps
 
-from ..systems.base import MDSystem3D, SliderSpec, SystemSpec
+from ..mdsystem import MDSystem3D, SliderSpec, SystemSpec
 from . import forcefield as ff_registry
 from .modes import GameMode, SimMode, select_controlled
 from .observables import Analysis
@@ -78,6 +78,8 @@ def make_spec(playground, mode_name=None, preset=None):
         sim_time_per_frame=scenario.sim_time_per_frame,
         bond_overlay=playground.bond_overlay,
         render_3d=playground.render_3d,
+        render_style=playground.render_style,
+        camera_orbit=playground.camera_orbit,
         reduced_units=playground.reduced_units,
         director_arrows=scenario.director_arrows,
         wrap_fade_fraction=scenario.wrap_fade_fraction,
@@ -127,6 +129,10 @@ class PlaygroundSystem(MDSystem3D):
         # the per-frame path can skip the gather entirely.
         self._has_housekeeping = (
             type(self.scenario).housekeeping is not Scenario.housekeeping
+        )
+        self._has_director_housekeeping = (
+            type(self.scenario).director_housekeeping
+            is not Scenario.director_housekeeping
         )
 
         self.lmp = None
@@ -382,7 +388,13 @@ class PlaygroundSystem(MDSystem3D):
         if self.has_directors:
             mu = np.array(self.lmp.numpy.extract_atom("mu")[:n], dtype=float)[:, :3]
             dirs = normalize_rows(mu[order])
-        return FrameState(positions=x[order], directors=dirs,
+        # Types are only gathered for a multi-species force field, where they
+        # decide how each particle is drawn; with one type they are a constant
+        # array nobody reads.
+        types = None
+        if self.force_field.n_types > 1:
+            types = np.array(self.lmp.numpy.extract_atom("type")[:n], dtype=int)[order]
+        return FrameState(positions=x[order], directors=dirs, types=types,
                           ids=self.all_ids[:len(order)], box=self.box)
 
     # ---- controls -----------------------------------------------------------
@@ -479,7 +491,7 @@ class PlaygroundSystem(MDSystem3D):
         Skipped entirely -- including the id-order gather -- for scenarios that
         declare no housekeeping, which is most of them.
         """
-        if not self._has_housekeeping:
+        if not (self._has_housekeeping or self._has_director_housekeeping):
             return
         order = self._order()
         if not len(order):
@@ -490,11 +502,26 @@ class PlaygroundSystem(MDSystem3D):
         controlled = None
         if self.controlled_id is not None and self.controlled_id - 1 < len(order):
             controlled = self.controlled_id - 1
-        f = self.scenario.housekeeping(x[order], self.scenario_params, controlled)
-        if f is None:
-            return
-        v = self.lmp.numpy.extract_atom("v")
-        v[order] += f * dt
+        if self._has_housekeeping:
+            f = self.scenario.housekeeping(x[order], self.scenario_params,
+                                           controlled, self.box)
+            if f is not None:
+                v = self.lmp.numpy.extract_atom("v")
+                v[order] += f * dt
+        # The second channel: corrections that turn the particles' ORIENTATIONS
+        # rather than move them. A periodic cell cannot be rigidly rotated -- a
+        # membrane spanning it would have to tear -- so a scenario that wants to
+        # steer which way its structures face does it through the directors, and
+        # lets the force field's own tilt coupling carry the geometry round.
+        if self._has_director_housekeeping and self.has_directors:
+            mu = np.array(self.lmp.numpy.extract_atom("mu")[:self.natoms],
+                          dtype=float)[:, :3]
+            w = self.scenario.director_housekeeping(
+                x[order], normalize_rows(mu[order]), self.scenario_params,
+                controlled, self.box)
+            if w is not None:
+                omega = self.lmp.numpy.extract_atom("omega")
+                omega[order] += w * dt
 
     # ---- readouts -----------------------------------------------------------
 
@@ -512,6 +539,13 @@ class PlaygroundSystem(MDSystem3D):
 
     def get_interaction_force(self):
         return self.mode.interaction_force()
+
+    def toggle_puller_attached(self):
+        """Grab / release the controlled particle. Returns the new state."""
+        return self.mode.toggle_attached()
+
+    def puller_attached(self):
+        return self.mode.attached
 
     def get_torque_signals(self):
         return self.mode.torque_signals()
@@ -584,14 +618,30 @@ class PlaygroundSystem(MDSystem3D):
                 self._unstable,
                 "Dial the sliders back, then press R (or restart) to rebuild.",
             ]
-        lines = self.analysis.hud_lines()
+        lines = list(self.analysis.hud_lines() or [])
+        # Whether the input device is holding the particle, always shown for a
+        # game-mode system: it is a state the user can be in without having meant
+        # to be, and the line is also where they find out the key exists.
+        if self.mode.needs_control_particle and self.controlled_id is not None:
+            lines.append("puller: STEERED (B / trigger releases)" if self.mode.attached
+                         else "puller: RELEASED -- free in the simulation (B / trigger grabs)")
         return lines or None
 
     def get_all_positions(self):
         """2D shadow required by the interface; the 3D renderer uses
-        get_positions_3d."""
+        get_positions_3d.
+
+        `species` is the LAMMPS atom type, zero-based, for a force field with
+        more than one -- it indexes the playground's species_colors/labels/radii,
+        so an ionic lattice draws its cations and anions at their own sizes and
+        colours. A single-type force field reports None and every particle is
+        drawn the same."""
         state = self._analysis_state()
-        return (state.ids, state.positions[:, :2], self._is_controlled_mask(), None)
+        species = None
+        if self.force_field.n_types > 1 and state.types is not None:
+            species = (np.asarray(state.types) - 1).astype(int)
+        return (state.ids, state.positions[:, :2], self._is_controlled_mask(),
+                species)
 
     def _is_controlled_mask(self):
         mask = np.zeros(len(self.all_ids), dtype=bool)
@@ -601,6 +651,29 @@ class PlaygroundSystem(MDSystem3D):
 
     def get_bead_brightness(self):
         return self.brightness
+
+    def get_bead_energies(self):
+        """Per-particle potential energy, in id order -- what the energy colouring
+        paints.
+
+        THE FACTOR OF 2 IS THE POINT. LAMMPS' `pe/atom` gives each particle HALF
+        of every pair energy it takes part in, so that summing over particles
+        returns the total potential energy without double counting. That is the
+        right convention for a total, and the wrong number to colour by: it is
+        half of what it costs to pull the particle out, and half of what the
+        additive-energy panel reports for the controlled one. Colouring by it put
+        the same bead at -2.8 on the scale while the panel above said -5.8, which
+        is exactly as confusing as it sounds.
+
+        So this returns the WHOLE energy of the bonds touching each particle,
+        which for a pairwise-additive style is twice the per-atom share. A force
+        field that offers no pairwise decomposition (EAM's embedding term is
+        many-body) has no such identity, and reports the share as LAMMPS gives it.
+        """
+        order = self._order()
+        pe = np.array(self.lmp.numpy.extract_compute("pe_atom", 1, 1)[:self.natoms],
+                      dtype=float)[order]
+        return 2.0 * pe if self.force_field.energy_terms_labels else pe
 
     # ---- 3D rendering data --------------------------------------------------
 
@@ -626,18 +699,33 @@ class PlaygroundSystem(MDSystem3D):
     def get_box_bounds_3d(self):
         return self.box.bounds_3d()
 
+    def get_box_periodic(self):
+        """(x, y, z) periodicity of the cell -- which axes the renderer may
+        legitimately repeat when drawing periodic images."""
+        return tuple(bool(p) for p in self.box.periodic)
+
     def get_scene_fit_points(self):
-        pts = self.scenario.fit_points(self.box)
+        """World points the camera zooms to fit, or None to keep its fixed FOV.
+
+        A scenario that names its own points has the final say. The control net
+        is only added for one that does not: the net spans the full leash, and on
+        a small patch that is several times the size of what you are actually
+        looking at, so forcing it into frame is what pushed the camera back until
+        the beads were a fifth of the width. A scenario that has stated what
+        matters should not have that overridden by the interaction's outer limit.
+        """
+        pts = self.scenario.fit_points(self.scenario_params, self.box)
+        if pts is not None:
+            return pts
         grid = self.mode.control_grid()
         if grid is None:
-            return pts
-        # Also frame the control net, so its corners stay on screen.
+            return None
         origin = np.asarray(grid["origin"], dtype=float)
         u = np.asarray(grid["u_axis"], dtype=float)
         v = np.asarray(grid["v_axis"], dtype=float)
         (u0, u1), (v0, v1) = grid["u_range"], grid["v_range"]
-        net = [origin + uu * u + vv * v for uu in (u0, u1) for vv in (v0, v1)]
-        return np.vstack([pts, np.array(net)])
+        return np.array([origin + uu * u + vv * v
+                         for uu in (u0, u1) for vv in (v0, v1)])
 
     def get_box_size(self):
         return self.box.lengths[0], self.box.lengths[1]

@@ -70,7 +70,7 @@ class Param:
         actually needs a UI object -- which is what lets `--list-playgrounds`
         stay a cheap import.
         """
-        from ..systems.base import SliderSpec
+        from ..mdsystem import SliderSpec
         return SliderSpec(
             label=self.label or self.name,
             vmin=self.vmin, vmax=self.vmax, default=self.default,

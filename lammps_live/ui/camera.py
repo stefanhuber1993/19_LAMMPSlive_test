@@ -28,16 +28,28 @@ class Camera3D:
         self.cx = viewport_w / 2.0
         self.cy = viewport_h / 2.0
 
-        # View basis: forward toward the target, right = forward x up_hint,
-        # true up = right x forward (right-handed, orthonormal).
-        self.forward = _normalize(self.target - self.eye)
-        self.right = _normalize(np.cross(self.forward, np.asarray(up, dtype=float)))
-        self.true_up = np.cross(self.right, self.forward)
+        self.up_hint = np.asarray(up, dtype=float)
+        self._rebuild_basis()
 
         # Focal length in pixels. Default from the vertical field of view (a
         # point one focal length ahead spans the half-viewport at the frame
         # edge); fit_to_points overrides it to frame a given content extent.
         self.focal = (viewport_h / 2.0) / np.tan(np.radians(fov_deg) / 2.0)
+
+    def _rebuild_basis(self):
+        """View basis: forward toward the target, right = forward x up_hint,
+        true up = right x forward (right-handed, orthonormal)."""
+        self.forward = _normalize(self.target - self.eye)
+        self.right = _normalize(np.cross(self.forward, self.up_hint))
+        self.true_up = np.cross(self.right, self.forward)
+
+    def move_to(self, eye):
+        """Put the camera somewhere else, still looking at the same target --
+        what the orbit controller calls every frame. The focal length is left
+        alone: an orbit dollies by moving the eye, and re-fitting the zoom as it
+        went would make the scene breathe as the camera swung."""
+        self.eye = np.asarray(eye, dtype=float)
+        self._rebuild_basis()
 
     def fit_to_points(self, pts, fill_w=0.92, fill_h=0.92):
         """Set the focal length so the given world points just fit the viewport,
@@ -90,3 +102,67 @@ class Camera3D:
     def project_point(self, p):
         s, d, sc = self.project(np.asarray(p, dtype=float)[None, :])
         return s[0], float(d[0]), float(sc[0])
+
+
+class OrbitController:
+    """Turntable camera state: azimuth, elevation, distance about a target.
+
+    There is ONE camera state and two things that write it -- the automatic
+    orbit and the mouse drag -- which is what makes them compose instead of
+    fight. Grabbing the mouse stops the animation (dragging against a moving
+    target is unusable, and a drag applied as an offset ON TOP of the animation
+    slides out from under you the moment you let go), and C resumes it from
+    wherever the drag left the camera, because the animation increments the very
+    same azimuth the drag was moving.
+
+    The world here is z-up (the membrane normal), so azimuth 0 puts the eye on
+    the -y axis -- the angle the fixed scene cameras look from -- and elevation
+    lifts it toward +z.
+    """
+
+    def __init__(self, eye, target, spec):
+        self.target = np.asarray(target, dtype=float)
+        self.spec = spec
+        rel = np.asarray(eye, dtype=float) - self.target
+        self.dist0 = float(np.linalg.norm(rel)) or 1.0
+        self.dist = self.dist0
+        # Decomposed from the scenario's own camera, so switching the turntable
+        # on does not also change where the scene is first seen from.
+        self.elev = float(np.arcsin(np.clip(rel[2] / self.dist, -1.0, 1.0)))
+        self.azimuth = float(np.arctan2(rel[0], -rel[1]))
+        self.auto = bool(spec.autostart)
+
+    def eye(self):
+        ce = np.cos(self.elev)
+        return self.target + self.dist * np.array([
+            ce * np.sin(self.azimuth), -ce * np.cos(self.azimuth), np.sin(self.elev)])
+
+    def update(self, dt):
+        if self.auto:
+            self.azimuth += self.spec.speed * dt
+
+    def toggle_auto(self):
+        self.auto = not self.auto
+
+    def drag(self, dx, dy):
+        """Mouse drag, in pixels (dy positive downward, as pygame reports it).
+
+        The SCENE follows the pointer on both axes, like spinning a globe under
+        your finger: drag right and the near face goes right, drag up and the
+        near face goes up (which means the camera itself sinks). The other
+        convention -- vertical drag moving the CAMERA, so dragging up lifts you
+        into a top-down view -- is what many 3D viewers ship, and it reads as
+        inverted here."""
+        self.auto = False
+        s = self.spec.drag_sensitivity
+        limit = np.radians(self.spec.elev_limit_deg)
+        self.azimuth -= dx * s
+        self.elev = float(np.clip(self.elev + dy * s, -limit, limit))
+
+    def zoom(self, notches):
+        """Wheel dolly. MULTIPLICATIVE, so one notch is the same PROPORTIONAL
+        step wherever you are -- a fixed number of world units per notch crawls
+        when you are far out and slams through the scene when you are close."""
+        self.dist = float(np.clip(self.dist * np.exp(-notches * self.spec.zoom_step),
+                                  self.spec.dist_min * self.dist0,
+                                  self.spec.dist_max * self.dist0))

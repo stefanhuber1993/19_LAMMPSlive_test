@@ -14,6 +14,45 @@ centre.
 Units are the paper's LJ-reduced units (sigma = eps = m = 1).
 """
 from ..playground import Control, Playground, hex_sheet
+from ..render_style import DEFAULT_STYLE
+
+# A flat lattice seen at a tilt is the opposite shape of problem from the
+# assembly box: almost all of its depth is the sheet RECEDING from the camera,
+# not a solid volume, so the two depth effects want retuning rather than
+# switching off -- pointed further into the distance, and gentler, because here
+# they are describing one continuous surface rather than separating a crowd.
+#
+#   DEPTH OF FIELD  focus a quarter of the way in (the near half of the sheet,
+#     including the pulled bead, stays sharp) with a slightly smaller bokeh, so
+#     the far edge softens into a tilt-shift falloff instead of dissolving.
+#   DEPTH CUE  carried further back (0.70) and lightened, so the far rows still
+#     read as membrane rather than being swallowed before the box outline is.
+#
+# The strong outline is doing real work here: at 900 overlapping beads it is
+# what keeps the individual particles legible in the middle distance.
+STYLE = DEFAULT_STYLE.varied(
+    # The cell is periodic in-plane, i.e. this sheet is a window onto an endless
+    # membrane -- so draw the neighbouring windows too and fade them out with
+    # distance. Asymmetric on purpose: half a cell in FRONT of the real one, so
+    # the membrane runs off the bottom of the frame, and three behind it running
+    # to the horizon. The real cell -- the one carrying the controlled bead, its
+    # control net and the outline -- is the one you are looking into.
+    # `periodic_images=(0, 0, 0)` goes back to the single cell; the fade bounds
+    # are fractions of how far the copies reach, so 1.0 finishes exactly where
+    # they are cut and 0.0 starts at the real cell's own edge.
+    periodic_images=(2, (0.5, 3), 0),
+    image_fade_start=0.15,
+    image_fade_end=1.0,
+    dof_focus=0.25,         # the near quarter, incl. the pulled bead, stays sharp
+    dof_range=1.5,          # half the span to go fully out of focus
+    dof_bokeh_px=6.0,       # (8.0 by default) -- 0 switches DoF off entirely
+    cue_end=0.70,           # fade completes further back than the default 0.55
+    cue_strength=0.6,       # and stops short of the full 0.75
+    # Left at the defaults, listed because they are the next dials to reach for:
+    ao_strength=5.83,           # contact darkening between the packed beads
+    outline_strength=12.0,      # how black the line around each bead is
+    outline_edge_fraction=0.90,  # how far out it starts (0.94 = hairline)
+)
 
 PLAYGROUND = Playground(
     name="MesoMem membrane sheet (3D)",
@@ -21,7 +60,13 @@ PLAYGROUND = Playground(
                 "pull one bead out and watch tilt/splay propagate.",
     force_field="mesomem",
     scenario=hex_sheet(n_cols=30, n_rows=30, a=0.8, z_half=4.0,
-                       settle_steps=1000),
+                       settle_steps=1000,
+                       # The camera frames the REAL cell -- the images tile away
+                       # behind it, so nothing has to be pulled back for them --
+                       # but aims a little past its centre, which drops its near
+                       # edge to the bottom of the frame and puts the receding
+                       # copies where the eye expects the distance to be.
+                       view_span=1.0, view_aim_ahead=0.55),
     mode="game",
     control=Control(
         atom="nearest_center",
@@ -50,4 +95,5 @@ PLAYGROUND = Playground(
     melt_temp=0.3,
     particle_radius=0.5,
     reduced_units=True,
+    render_style=STYLE,
 )

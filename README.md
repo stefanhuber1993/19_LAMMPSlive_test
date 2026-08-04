@@ -22,31 +22,37 @@ instantaneous temperature. All of this runs on the device itself from its
 own real-time position/velocity sensing, not streamed from Python frame by
 frame.
 
-Everything is in real, physical **metal units** (eV, Angstrom, ps, amu) --
-not the reduced Lennard-Jones units common in MD tutorials -- so numbers on
-screen mean what they say regardless of which system is active: forces in
-eV/Angstrom, temperature in K, energy in eV.
+**Units follow the model, not a house style.** The three atomistic systems
+(copper, argon, salt) run in LAMMPS **metal units** -- eV, Angstrom, ps, amu --
+real physical scales, so a force reading of `1.2 eV/A` is literally `-dE/dx`
+and 84 K is argon's actual melting point. The three MesoMem membrane systems are
+a **coarse-grained** model and run in the paper's **reduced LJ units**
+(sigma = epsilon = m = 1, time in tau); there is no Angstrom or Kelvin to convert
+them to, so the readouts, the plot axes and the temperature dial switch to `T*`,
+`P*`, `eps` and `tau` rather than inventing a physical scale the model never
+fixed. Which one a system uses is a property of the system
+(`reduced_units`), and the GUI follows it.
 
 ## Systems
 
 Multiple systems (material + potential + geometry) are registered and
-switchable *while the demo is running* -- press `1`/`2`/... or `Tab`:
+switchable *while the demo is running* -- press `1`/`2`/... or `Tab`. They are
+listed in the order they build on each other, which is the order to meet them
+in: one membrane patch, then a sheet of them, then a box that assembles itself.
 
 | key | name | potential | notes |
 |---|---|---|---|
 | `mesomem_patch` | MesoMem membrane patch (**3D**) | the **real** MesoMem pair-style | 7-bead hexagonal patch (hexagon + center). Pull the **center bead** out along the on-screen **net** and feel tilt/splay resist through force feedback |
-| `mesomem_sheet` | MesoMem membrane sheet (**3D**) | same **real** MesoMem pair-style | the paper's planar-stability test at scale: a ~900-bead hexagonal sheet, periodic in-plane and barostat-relaxed to a tension-free spacing. Pull one bead out and watch tilt/splay propagate. A brightened cluster tags beads you can follow as they diffuse; beads crossfade across the periodic seam |
-| `mesomem_assembly` | MesoMem self-assembly (**3D**) | same **real** MesoMem pair-style | the paper's spontaneous-assembly run: 1500 beads at random positions and orientations in a periodic 20-sigma box coarsen into planar membranes. Play / Pause / Reset. Dial `k_tilt` through the compact-vs-planar transition (~10) and watch the morphology change |
+| `mesomem_sheet` | MesoMem membrane sheet (**3D**) | same **real** MesoMem pair-style | the paper's planar-stability test at scale: a ~900-bead hexagonal sheet, periodic in-plane and barostat-relaxed to a tension-free spacing. Pull one bead out and watch tilt/splay propagate. A brightened cluster tags beads you can follow as they diffuse. The cell's **periodic images are drawn** around it, fading out with distance, so it reads as a piece of an endless membrane rather than a small raft: half a cell in front (the membrane runs off the bottom of the frame) and three behind, running to the horizon, with the outline marking the one real cell -- the one carrying the controlled bead and its net. `RenderStyle.periodic_images` takes per-side and fractional counts |
+| `mesomem_assembly` | MesoMem self-assembly (**3D**) | same **real** MesoMem pair-style | the paper's spontaneous-assembly run: 1500 beads at random positions and orientations in a periodic 20-sigma box coarsen into planar membranes. Play / Pause / Reset. Dial `k_tilt` through the compact-vs-planar transition (~10) and watch the morphology change. Two optional nudges keep a long run watchable: a weak field so the membranes form **flat** rather than at a random angle, and a drift that re-centres whatever has assembled in the cell (`k_upright` / `center_accel`, 0 = off) |
 | `cu_deposition` | Copper deposition (EAM) | real Cu EAM (`Cu_u3.eam`) | strong metallic bonding, high melting range (dial goes to 10000 K) |
 | `lj_argon` | Argon melting (Lennard-Jones) | `lj/cut`, real argon parameters | much softer/weaker, melts near 84 K (argon's real melting point). `epsilon` is a live slider, so you can feel what the well depth does |
-| `nacl` | Salt crystal (ionic, NaCl) | Born-Mayer + damped shifted-force Coulomb (`born/coul/dsf`) | alternating Na(+)/Cl(-) ions (labeled `+`/`-`, drawn at their real size ratio) on a checkerboard square lattice -- the bipartite, 2D-stable ionic arrangement -- bound by Coulomb (Madelung) attraction |
-| `lipid` | Lipid membrane (coarse-grained) | soft repulsion + cosine-squared tail attraction (`cosine/squared`), harmonic bonds/angles, Langevin implicit solvent | a solvent-free 2D lipid bilayer of 3-bead amphiphiles (head + 2 tails); the puller is a lipid you also **orient** (joystick yaw / Q-E) to insert into the membrane. Inspired by the MesoMem model (Sillano, Marrink & Idema 2026); see the module docstring |
-| `mb_water` | Mercedes-Benz water (ice floats) | rigid 3-arm molecules (`fix rigid/small` + Langevin), directional hydrogen bond via `cosine/squared` arm-tip well | the 2D Mercedes-Benz water model (Ben-Naim 1971): each molecule is an O with three 120-degree hydrogen-bonding arms. Starts as the open hydrogen-bonded honeycomb **ice**; heat it and the network **collapses to denser liquid** -- water's freezing-expansion anomaly (why ice floats), with a live O-O spacing / density readout. The puller is a water molecule you also **orient** (joystick yaw / Q-E) to line its arms up and catch hydrogen bonds |
+| `nacl` | Salt crystal (ionic, NaCl) | Born-Mayer + damped shifted-force Coulomb (`born/coul/dsf`) | alternating Na(+)/Cl(-) ions (labeled `+`/`-`, drawn at their real size ratio) on a checkerboard square lattice -- the bipartite, 2D-stable ionic arrangement -- bound by Coulomb (Madelung) attraction. The **ion charge is a live slider**: take it to zero and the bonding holding the lattice together simply switches off |
 
 Run `lammps-live --list` to print this from the code (and
-`--list-presets` for each playground's named parameter sets). The first five
-are **playgrounds** -- declarative ~40-line files; the last three are older
-hand-written systems. See "Writing a playground" below.
+`--list-presets` for each playground's named parameter sets). Every one is a
+**playground** -- a declarative ~50-line file naming a force field, a scenario
+and a mode. See "Writing a playground" below.
 
 ### The MesoMem force field (3D systems)
 
@@ -65,15 +71,19 @@ only if the `mpi.h` auto-detection ever misses.
 
 The three general problems this system solves -- **compiling a custom LAMMPS
 force field into a stock build, rendering 3D fast (GPU sphere impostors with
-per-pixel intersections, Blinn-Phong + ambient occlusion, depth-cued haze), and
-driving a 3D scene with a 2-axis stick** -- are all reusable for the richer
-MesoMem systems to come.
+per-pixel intersections and a deferred shading chain), and driving a 3D scene
+with a 2-axis stick** -- are all reusable for the richer MesoMem systems to
+come.
 
-**3D rendering (OpenGL).** The 3D bead systems (`mesomem`, `membrane`) are drawn
-on the GPU via `moderngl`: each bead is an instanced sphere impostor ray-cast in
-the fragment shader (so overlapping beads intersect exactly, per-pixel, with no
-sorting artifacts), lit with Blinn-Phong, darkened in the crevices by SSAO, and
-the control-plane net is occluded by the real depth buffer. This needs an OpenGL
+**3D rendering (OpenGL).** The three `mesomem_*` systems are drawn on the GPU via
+`moderngl`, through a deferred pipeline: each bead is an instanced sphere impostor
+ray-cast in the fragment shader (so overlapping beads intersect exactly,
+per-pixel, with no sorting artifacts), then a half-resolution pass computes
+ambient occlusion and screen-space contact shadows together, and a composite adds
+the lighting, a depth-discontinuity outline, a depth cue and a filmic tonemap,
+followed by depth of field and FXAA. The control-plane net is occluded by the
+real depth buffer. Every knob is per-system and documented in
+`lammps_live/render_style.py`. This needs an OpenGL
 **3.3+ core** context (macOS 4.1 core, or Linux via EGL/GLX); the window is a GL
 context and the pygame instrumentation panel is composited over the scene as a
 texture. If no GL context can be created, the app automatically falls back to the
@@ -81,18 +91,22 @@ original CPU (numpy sphere-sprite) renderer for the whole session.
 
 Each bead is colored the MesoMem way -- a yellow hydrophobic equator between blue
 hydrophilic poles, tilting with the director -- with the `+`director pole capped
-**white** so its sense reads at a glance. Depth is cued by fading the far half of
-the scene toward the background.
+**white** so its sense reads at a glance.
 
 **Controls.** The two joystick (or mouse) axes slide the center bead in the
 world *xz*-plane -- a plane perpendicular to the membrane and facing the camera,
 drawn as the faint net. Axis x -> along the sheet; axis y -> out of the sheet.
 Pulling out tents the patch; the directors tilt and splay to follow, and the red
-arrow / force feedback report the membrane's restoring force. Both MesoMem
-systems add three live sliders -- **k_tilt**, **k_splay**, and **eta**
-(interaction range) -- to the panel, so you can retune the force field and watch
-the membrane stiffen, soften, or change cohesion range in real time. Units are
-the paper's LJ-reduced units (so the temperature dial reads `T*`, not Kelvin).
+arrow / force feedback report the membrane's restoring force. The net's edge is
+where the particle stops, and the reported force fades to nothing as you reach it
+(`Control.leash_release`): the leash is the app's constraint, not the model's, so
+pushing against it should not feel like pushing against a wall the physics does
+not contain. Every MesoMem
+system adds live sliders -- **k_tilt**, **k_splay**, and **zeta** (plus **rc** /
+**wc** / splay symmetry under "Advanced") -- to the panel, so you can retune the
+force field and watch the membrane stiffen, soften, or change cohesion range in
+real time. Units are the paper's LJ-reduced ones throughout: the temperature dial
+reads `T*`, the clock reads `tau`.
 
 ## Setup
 
@@ -155,10 +169,10 @@ If you'd rather not install the package, `pip install -r requirements.txt`
 and run `python3 -m lammps_live` instead -- both work identically.
 
 Nothing else has to be downloaded by hand. The copper EAM potential
-(`Cu_u3.eam`) is bundled in this repo (`lammps_live/systems/data/`), and the
+(`Cu_u3.eam`) is bundled in this repo (`lammps_live/forcefields/data/`), and the
 MesoMem C++ force field is vendored here
-and **compiled automatically the first time you open a 3D system** (`mesomem` /
-`membrane`) -- a one-time ~10 s build, cached next to its sources and rebuilt
+and **compiled automatically the first time you open a 3D system**
+(any `mesomem_*`) -- a one-time ~10 s build, cached next to its sources and rebuilt
 only when they change. The Sidewinder joystick driver is the one thing fetched
 over the network: pip pulls it from GitHub during install.
 
@@ -229,11 +243,25 @@ lammps-live --verify                               # check the force fields agai
   keyboard`), or the **joystick** (`--input joystick`). The three input modes are
   separate -- mouse mode does not read WASD, keyboard mode does not read the
   pointer
-- **Orientation** (`lipid` and `mb_water` systems): rotate the control molecule's
-  in-plane angle with the joystick's **yaw (twist) axis**, the **`Q`/`E`** keys
-  (keyboard mode), or the **left/right mouse buttons** (mouse mode) -- so you can
-  turn a lipid head-out to insert it into the bilayer, or line a water molecule's
-  arms up to catch hydrogen bonds
+- **`B`**, or the joystick's **trigger**, grabs and releases the puller. Released,
+  it is an ordinary particle of the simulation -- nothing drives it and the stick
+  feels nothing -- so you can let a bead you have pulled out fall back into the
+  membrane and watch it, then grab it again. The HUD line and the ring around the
+  particle say which state you are in
+- **Orientation** (the MesoMem systems): rotate the controlled bead's director
+  with the joystick's **yaw (twist) axis**, the **`Q`/`E`** keys (keyboard mode),
+  or the **left/right mouse buttons** (mouse mode) -- twist hard enough and the
+  director flips to the opposite normal, because the tilt term is bistable
+- **Camera** (`mesomem_assembly`): **drag** to orbit, **wheel** to zoom, **`C`**
+  to start/stop the automatic turntable
+- **Bead colour** (the 3D systems): the toggle at the top of the panel switches
+  between the director banding (which way each bead points) and each bead's
+  **potential energy** on an inferno ramp (how bound it is -- dark is tightly
+  bound, bright is strained or free). The number is the whole energy of the
+  bonds touching that bead, the same one the additive-energy panel reports for
+  the controlled one. The white cap marks the +director pole in both, so
+  orientation never gets lost, and a caption under the toggle says what the
+  colours mean
 - Mouse-drag the **Temperature** / **Puller damping** sliders in the
   right-hand panel (works regardless of `--input` mode). Below them sits one
   slider **per live force-field parameter**, generated automatically from the
@@ -274,15 +302,17 @@ lammps_live/
   config.py         global constants that don't vary by system (window size, smoothing, ...)
   forcefeedback.py  force -> device-feedback signal shaping, parameterized by each
                      system's ForceFeedbackProfile
-  units.py          metal-units -> SI display conversions (sim time, puller speed)
-  catalog.py        one listing of everything runnable: playgrounds + legacy systems
+  units.py          display formatting for both unit systems (metal and reduced LJ)
+  mdsystem.py       the app-facing contract: MDSystem/MDSystem3D + SystemSpec,
+                     SliderSpec, ForceFeedbackProfile
+  stepper.py        runs the simulation on a worker thread, overlapping the render
   playground/       the declarative layer (see "Writing a playground")
     spec.py           Playground + Control -- what a playground file declares
     params.py         Param/ParamSet + the STRUCTURAL / HOT / HOT_RESTYLE tiers
                        that decide file-time vs slider-time
     forcefield.py     ForceField interface + registry
     scenario.py       Scenario interface, the membrane geometries, housekeeping forces
-    deposition.py     the 2D crystal-slab + free-puller scenario
+    deposition.py     the 2D crystal-slab + free-puller scenarios (neutral and ionic)
     thermostat.py     Langevin (implicit solvent) and CSVR (velocity rescaling)
     modes.py          game (controlled particle, leash, haptics) vs sim (Play/Pause/Reset)
     observables.py    declared observables + the throttled analysis scheduler
@@ -297,17 +327,13 @@ lammps_live/
     mesomem_assembly.py  1500-bead MesoMem self-assembly (sim mode)
     lj_argon.py          2D Lennard-Jones argon deposition
     cu_deposition.py     2D copper EAM deposition
+    nacl.py              2D ionic NaCl checkerboard
   forcefields/
     mesomem.py        the real MesoMem pair-style + its one vectorized energy expression
-    stock.py          LennardJones and EAM, on stock LAMMPS styles (no C++)
+    stock.py          LennardJones, EAM and Born-Mayer/DSF Coulomb, on stock
+                       LAMMPS styles (no C++)
     mesomem_ff/       vendored MesoMem C++ sources, compiled on demand
     data/             bundled potential files (Cu_u3.eam)
-  systems/            the older hand-written systems
-    base.py           MDSystem / MDSystem3D interfaces + SystemSpec/SliderSpec/
-                       ForceFeedbackProfile
-    nacl.py           ionic NaCl (Born-Mayer + DSF Coulomb)
-    lipid_membrane.py coarse-grained lipid bilayer
-    mb_water.py       2D Mercedes-Benz water (rigid 3-arm, hydrogen bonds)
   input/
     base.py     InputSource interface
     mouse.py    mouse control
@@ -317,13 +343,16 @@ lammps_live/
                 driver itself is the external `sidewinder` package
                 (https://github.com/stefanhuber1993/sidewinder), a
                 dependency rather than a vendored copy.
+  render_style.py   the 3D look, per system: lighting, occlusion, outline,
+                     depth cue, depth of field, tonemap -- all tunable
   ui/
     theme.py        colors/sizes
     widgets.py      Slider
     plotting.py     RollingHistory + generic line-plot drawer
     trail.py        rolling per-atom position snapshots behind every atom's fading motion trail
-    camera.py       perspective camera for the 3D scenes
-    gl3d.py         GPU bead pipeline (sphere impostors + SSAO + fog)
+    camera.py       perspective camera + the turntable orbit controller
+    gl3d.py         GPU bead pipeline (impostors, SSAO, contact shadows, outline,
+                     depth cue, depth of field, tonemap, FXAA)
     glcompositor.py composites the 2D panel over the GL scene
     renderer.py     the sim box + instrumentation panel (2D and 3D paths)
 ```
@@ -417,19 +446,18 @@ pairwise-additive (EAM) declare no terms and are correctly skipped.
   live. They run on a declared cadence with a shared pair list, so adding them
   does not cost the frame budget.
 
-### The older hand-written systems
-
-`nacl`, `lipid` and `mb_water` are still monolithic `MDSystem` subclasses (see
-`lammps_live/systems/base.py`). They work unchanged and are listed alongside the
-playgrounds, but new work should be a playground. Nothing in `app.py`,
-`forcefeedback.py` or `ui/` depends on which kind it is.
-
 ## Units and physics notes, for readers who know physics but not MD
 
-- Everything is LAMMPS "metal" units: eV, Angstrom, ps, amu -- real
-  physical scales the whole way through, not reduced/dimensionless LJ
-  units. A force reading of `1.2 eV/A` is literally `-dE/dx` in those
-  units, the same as in any other physics context.
+- **Two unit systems, one per model.** The atomistic systems (`cu_deposition`,
+  `lj_argon`, `nacl`) are LAMMPS "metal" units -- eV, Angstrom, ps, amu -- real
+  physical scales the whole way through: a force reading of `1.2 eV/A` is
+  literally `-dE/dx`, as in any other physics context. The three `mesomem_*`
+  systems are the paper's coarse-grained membrane model in **reduced LJ units**
+  (sigma = epsilon = m = 1, time in tau). Reduced units are not a simplification
+  of the metal ones -- there is no conversion, because the model never fixed a
+  physical length or energy scale to convert from. So those systems' readouts,
+  axis labels and dials read `T*`, `P*`, `eps`, `eps/sigma` and `tau`, and the
+  notes below about Kelvin, eV and picoseconds apply only to the atomistic three.
 - **Sim time** (top-left of the sim view) is elapsed *simulated* MD time --
   nsteps x timestep -- not wall-clock time, and not counted during each
   system's silent pre-roll settle. It's shown auto-scaled (fs / ps / ns,
@@ -440,16 +468,18 @@ playgrounds, but new work should be a playground. Nothing in `app.py`,
   1 ps = 1e-12 s) -- both units are shown side by side. Typical values land
   in the hundreds of m/s, the same range as real atomic thermal speeds at
   room temperature; that's not a coincidence, it's the same physics.
-- The non-membrane systems are 2D (a one-atom-thick cross-section); the two
-  MesoMem membrane systems (`mesomem`, `membrane`) are genuinely 3D and run in
-  the paper's reduced LJ units rather than metal units. The 2D systems change
-  some physics from the 3D case you might expect:
-  - The equilibrium lattice is a 2D close-packed **hexagonal/triangular**
-    lattice (6 in-plane neighbors), not a square cross-section of a 3D FCC
-    lattice -- there's no out-of-plane bonding to brace a square
+- The atomistic systems are 2D (a one-atom-thick cross-section); the three
+  MesoMem membrane systems are genuinely 3D. Being 2D changes some physics from
+  the 3D case you might expect:
+  - For the *neutral* crystals the equilibrium lattice is 2D close-packed
+    **hexagonal/triangular** (6 in-plane neighbors), not a square cross-section
+    of a 3D FCC lattice -- there's no out-of-plane bonding to brace a square
     arrangement, so the true 2D energy minimum is hexagonal. See
     `cu_deposition.py`'s module docstring for the empirical lattice-spacing
-    sweep that confirmed this.
+    sweep that confirmed this. **Ionic** bonding wants the opposite, and `nacl`
+    is a square checkerboard for it: an alternating +/- assignment needs a
+    bipartite lattice, which the frustrated triangular one is not (see
+    `IonicSlab2D` in `playground/deposition.py`).
   - 2D crystals don't have a sharp melting transition the way 3D ones do
     (long-wavelength Mermin-Wagner fluctuations smear it out), so each
     system's `T_MELT` dial mark is an approximate reference point, not a
@@ -496,14 +526,17 @@ playgrounds, but new work should be a playground. Nothing in `app.py`,
 
 ## Tuning knobs
 
-- `lammps_live/systems/*.py`: lattice spacing, timestep, box/region sizes,
+- `lammps_live/playgrounds/*.py`: lattice spacing, timestep, box/region sizes,
   the puller's `nve/limit` displacement cap, damping slider range, thermostat
-  target range and dial marks, RDF resolution/averaging window, and the
-  `ForceFeedbackProfile` -- each module's docstring explains which
-  constants were empirically measured (and how) vs. chosen as reasonable,
-  clearly-labeled approximations.
+  target range and dial marks, and the `ForceFeedbackProfile` -- each file's
+  docstring explains which constants were empirically measured (and how) vs.
+  chosen as reasonable, clearly-labeled approximations. The 3D ones also carry a
+  `RenderStyle` (`lammps_live/render_style.py`) holding the look of the scene:
+  lighting, ambient occlusion, contact shadows, outline weight, depth cue, depth
+  of field, tonemap.
 - `lammps_live/config.py`: window size, sim-time-advanced-per-frame,
   temperature key/wheel nudge rates, plot history window, force-feedback
-  smoothing time constant.
+  smoothing time constant, and whether the simulation overlaps the render
+  (`OVERLAP_SIM_AND_RENDER`, see `stepper.py`).
 - `lammps_live/input/joystick.py`: SDK-level spring/damper/jitter ranges
   (hardware-fixed, not per-system).

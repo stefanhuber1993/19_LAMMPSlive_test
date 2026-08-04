@@ -228,3 +228,96 @@ def test_touching_selects_a_particles_pairs():
     assert pairs.touching(0).sum() == 1     # only (0,1)
     assert pairs.touching(1).sum() == 2     # (0,1) and (1,2)
     assert pairs.touching(3).sum() == 0     # isolated
+
+
+# --- the assembly box's whole-system corrections -------------------------------
+# Both are gated on the structure being there, and both have to survive the
+# periodic wrap -- which is exactly the part that silently goes wrong.
+
+def _random_fill():
+    return RandomFill(), RandomFill().new_params()
+
+
+def test_centring_finds_a_blob_straddling_the_periodic_seam():
+    """The whole point of the circular mean: a cluster sitting ON the seam has
+    its parts at both ends of the axis, and an ordinary mean would put its
+    "centre" at the far side of the box and push it the wrong way."""
+    scen, params = _random_fill()
+    box = Box((-10.0, -10.0, -10.0), (10.0, 10.0, 10.0), (True, True, True))
+    rng = np.random.default_rng(0)
+    # A tight blob centred on x = +10 == -10, i.e. split across the seam.
+    blob = rng.normal(scale=0.8, size=(400, 3))
+    pts = blob.copy()
+    pts[:, 0] = (blob[:, 0] + 10.0 + 10.0) % 20.0 - 10.0
+    f = scen.housekeeping(pts, params, box=box)
+    assert f is not None
+    # It is already at the box's x-seam, which is as far from the centre as an
+    # axis goes, so the push must be along x and must be the LARGEST component.
+    assert abs(f[0][0]) > abs(f[0][1]) and abs(f[0][0]) > abs(f[0][2])
+    # And every particle gets the same push: a translation, not a shear.
+    assert np.allclose(f, f[0])
+
+
+def test_centring_pushes_toward_the_middle_and_eases_off_at_it():
+    scen, params = _random_fill()
+    box = Box((-10.0,) * 3, (10.0,) * 3, (True, True, True))
+    rng = np.random.default_rng(1)
+    blob = rng.normal(scale=0.8, size=(400, 3))
+    off = scen.housekeeping(blob + np.array([5.0, 0.0, 0.0]), params, box=box)
+    assert off[0][0] < 0.0                      # sitting at +x, pushed back to -x
+    centred = scen.housekeeping(blob, params, box=box)
+    assert abs(centred[0][0]) < 0.1 * abs(off[0][0])
+
+
+def test_centring_ignores_an_axis_the_particles_fill_uniformly():
+    """A lamella is concentrated along its normal and uniform in-plane; there is
+    no centre to find in-plane, and trying to invent one would shove the sheet
+    around forever."""
+    scen, params = _random_fill()
+    box = Box((-10.0,) * 3, (10.0,) * 3, (True, True, True))
+    rng = np.random.default_rng(2)
+    pts = np.column_stack([rng.uniform(-10, 10, 800),
+                           rng.uniform(-10, 10, 800),
+                           rng.normal(scale=0.5, size=800) + 4.0])
+    f = scen.housekeeping(pts, params, box=box)
+    assert abs(f[0][2]) > 0.0                   # centred along the normal
+    assert abs(f[0][0]) < 1e-3 and abs(f[0][1]) < 1e-3   # left alone in-plane
+
+
+def test_centring_is_off_for_a_gas():
+    scen, params = _random_fill()
+    box = Box((-10.0,) * 3, (10.0,) * 3, (True, True, True))
+    rng = np.random.default_rng(3)
+    pts = rng.uniform(-10, 10, size=(1500, 3))
+    assert scen.housekeeping(pts, params, box=box) is None
+
+
+def test_upright_field_turns_every_director_toward_the_nearer_pole():
+    """+n and -n are one orientation, so a director in the lower half must turn
+    toward -z rather than the long way round to +z."""
+    scen, params = _random_fill()
+    n = np.array([[0.0, 0.6, 0.8], [0.0, 0.6, -0.8], [1.0, 0.0, 0.0]])
+    n /= np.linalg.norm(n, axis=1, keepdims=True)
+    w = scen.director_housekeeping(np.zeros_like(n), n, params)
+    for ni, wi in zip(n, w):
+        turned = ni + np.cross(wi, ni) * 0.01
+        turned /= np.linalg.norm(turned)
+        assert abs(turned[2]) > abs(ni[2])       # closer to vertical, either sign
+
+
+def test_upright_field_is_self_extinguishing():
+    """A membrane that is already flat has its directors along z and must feel
+    nothing -- that is what lets the field run without a gate."""
+    scen, params = _random_fill()
+    n = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+    w = scen.director_housekeeping(np.zeros_like(n), n, params)
+    assert np.allclose(w, 0.0, atol=1e-12)
+
+
+def test_upright_field_off_at_zero():
+    scen = RandomFill()
+    params = scen.new_params({"k_upright": 0.0})
+    rng = np.random.default_rng(5)
+    n = rng.normal(size=(64, 3))
+    n /= np.linalg.norm(n, axis=1, keepdims=True)
+    assert scen.director_housekeeping(np.zeros_like(n), n, params) is None

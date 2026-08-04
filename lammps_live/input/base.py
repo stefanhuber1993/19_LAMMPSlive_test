@@ -13,6 +13,13 @@ class InputSource:
         mode). 0 = no rotation. Default: no yaw input."""
         return 0.0
 
+    def poll_buttons(self):
+        """Return the set of device buttons currently held, as ints. Used for
+        edge-triggered actions (grab / release the puller). Default: none -- a
+        device with no buttons simply never fires them, and the keyboard binding
+        for the same action still works."""
+        return frozenset()
+
     def send_force(self, fx, fy, stiffness=None):
         """Feed back a force (sim units) the device should resist with, and
         optionally how stiffly (device-specific range; None = default/max).

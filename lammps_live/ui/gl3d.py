@@ -1,20 +1,39 @@
-"""GPU rendering of the 3D bead scenes (the MesoMem patch and sheet) with
-moderngl.
+"""GPU rendering of the 3D bead scenes (the MesoMem patch, sheet and assembly
+box) with moderngl.
 
 The CPU path in renderer.py drew each bead as a numpy-shaded sphere sprite,
 painter-sorted back to front -- which has no per-pixel depth, so beads close in z
 "jump" in front of / behind each other instead of intersecting, and the ~900-bead
 sheet regenerates sprites almost every frame. This module replaces that with the
-standard molecular-viz technique:
+standard molecular-viz technique, and then with the deferred post-processing
+chain the standalone showreel (21_LearnModernGL/showreel.py) was tuned on.
 
-  * Instanced sphere IMPOSTORS. Each bead is one camera-facing quad; the fragment
-    shader ray-casts the sphere and writes gl_FragDepth, so the hardware depth
-    buffer resolves intersections exactly (no sorting, no z-jumps).
-  * A deferred G-buffer (albedo / view-normal / view-position) feeds an SSAO pass
-    so crevices between beads darken -- a real depth cue.
-  * A final pass does Blinn-Phong shading + AO + the same depth fog the CPU path
-    used, then bond/net lines are drawn as real depth-tested GL lines (occluded by
-    the beads for free -- no hand-rolled z-buffer).
+  PASS 1  G-BUFFER      instanced sphere IMPOSTORS, one draw call. Each bead is
+                        one camera-facing quad; the fragment shader ray-casts the
+                        sphere and writes gl_FragDepth, so the hardware depth
+                        buffer resolves intersections exactly (no sorting, no
+                        z-jumps). Out: albedo, view normal, view position.
+  PASS 2  OCCLUSION     half-res, two terms in one pass: ambient occlusion from
+                        hemisphere sampling, and sun visibility from a march
+                        toward the light through the depth buffer
+  PASS 3  BLUR          foreground-masked box blur of both, which is what turns
+                        their sampling noise into soft gradients
+  PASS 4  COMPOSITE     lighting, outline, depth cue, tonemap
+                        -> an offscreen colour texture
+  PASS 5  DEPTH OF FIELD
+  PASS 6  LINES         bonds / control net / box outline, as real depth-tested
+                        GL lines (occluded by the beads for free), drawn AFTER
+                        the blur so they stay crisp and un-tonemapped.
+  PASS 7  FXAA          -> the final texture. Deferred rendering rules MSAA out,
+                        and every edge here is a hard one, so the antialiasing
+                        is a screen-space pass over the finished image.
+
+Every pass after the first is screen-space: its cost depends on how many PIXELS
+there are, not how many beads, so the 1500-bead assembly box post-processes for
+the same price as the 7-bead patch.
+
+What the picture looks like is not decided here -- see `lammps_live/render_style.py`
+for the knobs and each playground file for its overrides.
 
 The pipeline is context-agnostic: it takes a moderngl context (from the pygame GL
 window, or a headless standalone context for benchmarking/tests) and renders into
@@ -27,13 +46,17 @@ via EGL/GLX.
 """
 import numpy as np
 
+from ..render_style import DEFAULT_STYLE
 from .theme import (
     BEAD_BAND_HALFWIDTH, BEAD_BAND_SOFT, BEAD_EQUATOR_COLOR, BEAD_POLE_COLOR,
-    BEAD_WHITE_POLE_COLOR, BEAD_WHITE_POLE_MIN, BEAD_WHITE_POLE_SOFT,
-    BG, HAZE_COLOR, HAZE_STRENGTH, SPHERE_AMBIENT, SPHERE_LIGHT_DIR,
+    BEAD_WHITE_POLE_COLOR, BEAD_WHITE_POLE_MIN, BEAD_WHITE_POLE_SOFT, BG,
+    INFERNO,
 )
 
-SSAO_KERNEL_SIZE = 24
+# The circle-of-confusion radius in RenderStyle is quoted at this viewport
+# height, and scaled from it, so fullscreen gets the same *picture* rather than
+# the same pixel count of blur.
+DOF_REFERENCE_HEIGHT = 900.0
 
 
 # ---- small matrix helpers (row-major math; transposed on upload to GL) --------
@@ -71,6 +94,12 @@ def _gl(m):
     return np.ascontiguousarray(m.T, dtype="f4").tobytes()
 
 
+def to_linear(color255, gamma):
+    """A display-space 0..255 theme colour -> linear light, which is the space
+    all the shading below works in (see render_style's module docstring)."""
+    return tuple(float(c / 255.0) ** gamma for c in color255)
+
+
 # ---- shader sources -----------------------------------------------------------
 
 _GEOM_VS = """
@@ -82,20 +111,50 @@ in vec3 in_center;      // per-instance world center
 in float in_radius;     // per-instance world radius
 in vec3 in_dir;         // per-instance unit director (world)
 in float in_bright;     // per-instance albedo brightness multiplier (1 = normal)
+in float in_energy;     // per-instance potential energy, for the energy colouring
+in float in_fade;       // per-instance 1 = full strength, 0 = fully faded to the background
 out vec3 v_centerView;
 out float v_radius;
 out vec3 v_dirView;
 out vec3 v_rayView;
 out float v_bright;
+out float v_energy;
+out float v_fade;
 void main() {
     vec4 cv = view * vec4(in_center, 1.0);
-    v_centerView = cv.xyz;
-    v_radius = in_radius;
+    vec3 C = cv.xyz;
+    float r = in_radius;
+    v_centerView = C;
+    v_radius = r;
     v_dirView = mat3(view) * in_dir;
     v_bright = in_bright;
-    // Camera-facing billboard, enlarged a touch so the perspective silhouette
-    // (slightly bigger than the radius) is fully covered.
-    vec3 corner = cv.xyz + vec3(in_corner * in_radius * 1.15, 0.0);
+    v_energy = in_energy;
+    v_fade = in_fade;
+
+    // ---- THE EXACT SILHOUETTE BILLBOARD ---------------------------------
+    // A sphere's silhouette is a disc perpendicular to the direction TO THE
+    // SPHERE, not to the screen, so off-axis it projects to an ELLIPSE that a
+    // screen-parallel quad of radius r is too small to contain (8% short at 20
+    // degrees off-axis, 36% at 40 -- and the corners of a wide viewport are out
+    // past 30, which is where beads used to get visibly sliced by the edge of
+    // their own quad; the old fix was a blanket 1.15x enlargement, which was
+    // both too small out there and wasted fragments in the middle).
+    //
+    // Build the quad in the plane of the true silhouette instead: with
+    // t = sqrt(d^2 - r^2) the distance to a tangent point, the tangent circle
+    // has radius r*t/d and sits at t^2/d along the view direction. The quad
+    // corners circumscribe the unit circle, so this covers it exactly from
+    // every angle.
+    float d = length(C);
+    vec3 fwd = C / d;
+    float t = sqrt(max(d * d - r * r, 1e-6));
+    float rc = r * t / d;              // silhouette circle radius
+    vec3 Cc = fwd * (t * t / d);       // silhouette circle centre
+    vec3 hint = abs(fwd.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 right = normalize(cross(hint, fwd));
+    vec3 up = cross(fwd, right);
+    vec3 corner = Cc + (in_corner.x * right + in_corner.y * up) * rc;
+
     v_rayView = corner;
     gl_Position = proj * vec4(corner, 1.0);
 }
@@ -104,7 +163,7 @@ void main() {
 _GEOM_FS = """
 #version 330 core
 uniform mat4 proj;
-uniform mat4 viewInv;     // view->world, to clip/vignette against the periodic box
+uniform mat4 viewInv;     // view->world, to clip the beads against the periodic box
 uniform float band_half;
 uniform float band_soft;
 uniform vec3 equator_col;
@@ -114,14 +173,19 @@ uniform float white_min;
 uniform float white_soft;
 uniform vec2 boxHalf;     // periodic-box half-extents in world x,y (centered at origin)
 uniform float clipEnable; // 1 for periodic scenes (clip beads to the box), 0 otherwise
+uniform float energyMode; // 0 = director bands, 1 = per-bead energy colormap
+uniform vec2 energyRange; // (lo, hi) of the colormap, in the model's energy units
+uniform vec3 ramp[32];    // the colormap, sampled (see theme.INFERNO)
 in vec3 v_centerView;
 in float v_radius;
 in vec3 v_dirView;
 in vec3 v_rayView;
 in float v_bright;
+in float v_energy;
+in float v_fade;
 layout(location=0) out vec4 o_albedo;
 layout(location=1) out vec3 o_normal;
-layout(location=2) out vec3 o_viewpos;
+layout(location=2) out vec4 o_viewpos;
 void main() {
     vec3 dir = normalize(v_rayView);          // ray from the eye (origin) out
     vec3 c = v_centerView;
@@ -136,7 +200,7 @@ void main() {
     // to the wrapped ghost on the opposite face -- and beyond-box fragments are
     // discarded (no depth/color written), so they never falsely occlude what is
     // behind. The soft edge fade is done in screen space in the composite pass
-    // (see its `vignette`), not per-bead here, so it no longer depends on which
+    // (see its `edgeFade`), not per-bead here, so it no longer depends on which
     // world face a bead sits near.
     if (clipEnable > 0.5) {
         vec3 wp = (viewInv * vec4(hit, 1.0)).xyz;
@@ -148,17 +212,35 @@ void main() {
     vec4 clip = proj * vec4(hit, 1.0);
     gl_FragDepth = 0.5 * (clip.z / clip.w) + 0.5;
     // Banded MesoMem albedo: yellow equator (perp to the director) -> blue poles
-    // (along it), same blend as the old CPU _banded_sphere_sprite.
+    // (along it), same blend as the old CPU _banded_sphere_sprite. The colours
+    // arrive already converted to linear light (see to_linear).
     float s = dot(N, normalize(v_dirView));   // signed cos-latitude (+ = +n pole)
-    float cosl = abs(s);
-    float tt = clamp((cosl - (band_half - band_soft)) / (2.0 * band_soft), 0.0, 1.0);
-    vec3 albedo = mix(equator_col, pole_col, tt);
-    // Over-paint the +n pole white (down to ~80% latitude) so director sense reads.
+    vec3 albedo;
+    if (energyMode > 0.5) {
+        // One flat colour per bead, from its own potential energy. Flat on
+        // purpose: the number belongs to the WHOLE bead, so shading it like a
+        // band would invite reading a gradient across a sphere that has none.
+        float t = clamp((v_energy - energyRange.x)
+                        / max(energyRange.y - energyRange.x, 1e-6), 0.0, 1.0);
+        float f = t * 31.0;
+        int i = int(floor(f));
+        albedo = mix(ramp[i], ramp[min(i + 1, 31)], f - float(i));
+    } else {
+        float cosl = abs(s);
+        float tt = clamp((cosl - (band_half - band_soft)) / (2.0 * band_soft), 0.0, 1.0);
+        albedo = mix(equator_col, pole_col, tt);
+    }
+    // Over-paint the +n pole white (down to ~80% latitude) so director sense
+    // reads. Kept in BOTH colourings: the energy tells you how bound a bead is,
+    // and without this cap it would cost you which way it points.
     float w = smoothstep(white_min - white_soft, white_min + white_soft, s);
     albedo = mix(albedo, white_col, w);
-    o_albedo = vec4(albedo * v_bright, 1.0);
+    // The alpha channel is spare, and this is what it is for: a per-bead
+    // strength the composite blends toward the background, which is how a
+    // periodic image fades out with distance.
+    o_albedo = vec4(albedo * v_bright, v_fade);
     o_normal = N;
-    o_viewpos = hit;
+    o_viewpos = vec4(hit, 1.0);
 }
 """
 
@@ -173,41 +255,122 @@ void main() {
 }
 """
 
+# Shared by every screen-space pass below. `projScale` is (P[0][0], P[1][1]) of
+# the projection: forward, ndc.x = P00 * x / dist, so a view-space point projects
+# back to a texture coordinate with two multiplies. Assumes a SYMMETRIC frustum,
+# which proj_matrix above always builds.
+_COMMON = """
+uniform vec2 projScale;
+
+vec2 view_to_uv(vec3 p) {
+    vec2 ndc = projScale * p.xy / max(-p.z, 1e-6);
+    return ndc * 0.5 + 0.5;
+}
+
+// Cheap per-pixel hash. Used to decorrelate the sampling patterns below between
+// neighbouring pixels: it trades structured error (banding, terracing) for
+// unstructured error of the same size, which reads as texture instead.
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+"""
+
 _SSAO_FS = """
 #version 330 core
 uniform sampler2D posTex;
 uniform sampler2D normalTex;
-uniform sampler2D noiseTex;
-uniform sampler2D depthTex;
-uniform vec3 samples[%d];
-uniform mat4 proj;
-uniform vec2 noiseScale;
+uniform int nSamples;
 uniform float radius;
 uniform float bias;
+uniform vec3 lightDirView;   // FROM the surface TOWARD the sun, in view space
+uniform float shadowOn;
+uniform float shadowLen;
+uniform float shadowBias;
+uniform float shadowThick;
 in vec2 uv;
-out float frag;
+out vec2 frag;               // (ambient occlusion, sun visibility)
+""" + _COMMON + """
+// ---- screen-space contact shadows ------------------------------------------
+// March toward the light through the depth buffer: if anything the depth buffer
+// knows about is standing in the way, this point is in shadow. Cost is per-pixel
+// and independent of the bead count, the same bargain as the occlusion above --
+// and it rides in this pass, at half resolution, so that the AO blur downstream
+// smooths BOTH terms. That matters more here than for the AO: the march below
+// is a binary hit, jittered per pixel, so on its own it comes out as dithered
+// noise along every shadow edge, and blurring is what turns that noise back
+// into a soft penumbra.
+//
+// What screen space cannot do is what the words mean: an occluder hidden behind
+// something else, or off the edge of the frame, cannot cast, and how THICK an
+// occluder is has to be guessed (shadowThick). That costs missing shadows, not
+// ugly ones, which is the right way round.
+float sun_visibility(vec3 P, vec3 N, vec3 L) {
+    if (shadowOn < 0.5 || dot(N, L) <= 0.0) return 1.0;
+    const int STEPS = 16;
+    // Start along the NORMAL, not along the light: near a silhouette the light
+    // can graze back across this very bead and the ray then reports the surface
+    // shadowing itself (classic acne).
+    vec3 origin = P + N * shadowBias;
+    float jit = hash12(gl_FragCoord.xy);        // kills the terracing
+    for (int i = 0; i < STEPS; ++i) {
+        // QUADRATIC spacing: contact shadows need precision within a fraction
+        // of a radius, a shadow four radii out does not.
+        float f = (float(i) + jit) / float(STEPS);
+        vec3 sp = origin + L * (shadowLen * f * f);
+        vec2 suv = view_to_uv(sp);
+        if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) break;
+        float sz = texture(posTex, suv).z;
+        if (sz >= -1e-4) continue;              // background occludes nothing
+        float dz = -sp.z - (-sz);
+        // Occluder in front of the sample, but not so far in front that it is
+        // unrelated foreground.
+        if (dz > shadowBias && dz < shadowThick) return 0.0;
+    }
+    return 1.0;
+}
+
 void main() {
-    if (texture(depthTex, uv).r >= 1.0) { frag = 1.0; return; }  // background
     vec3 P = texture(posTex, uv).xyz;
+    if (P.z >= -1e-4) { frag = vec2(1.0); return; }              // background
     vec3 N = normalize(texture(normalTex, uv).xyz);
-    vec3 rvec = normalize(texture(noiseTex, uv * noiseScale).xyz);
-    vec3 T = normalize(rvec - N * dot(rvec, N));
+    frag.y = sun_visibility(P, N, normalize(lightDirView));
+    if (nSamples <= 0) { frag.x = 1.0; return; }
+
+    float rot = hash12(gl_FragCoord.xy);
+    // Tangent frame about the normal, so samples land in the hemisphere ABOVE
+    // the surface and never inside it.
+    vec3 rv = normalize(vec3(cos(rot * 6.283), sin(rot * 6.283), 0.0));
+    vec3 T = normalize(rv - N * dot(rv, N));
     vec3 B = cross(N, T);
     mat3 TBN = mat3(T, B, N);
+
     float occ = 0.0;
-    for (int i = 0; i < %d; ++i) {
-        vec3 samplePos = P + TBN * samples[i] * radius;
-        vec4 off = proj * vec4(samplePos, 1.0);
-        off.xyz /= off.w;
-        off.xyz = off.xyz * 0.5 + 0.5;
-        if (off.x < 0.0 || off.x > 1.0 || off.y < 0.0 || off.y > 1.0) continue;
-        float sampleDepth = texture(posTex, off.xy).z;   // view z (front = -)
-        float rangeCheck = smoothstep(0.0, 1.0, radius / max(abs(P.z - sampleDepth), 1e-4));
-        occ += (sampleDepth >= samplePos.z + bias ? 1.0 : 0.0) * rangeCheck;
+    for (int i = 0; i < nSamples; ++i) {
+        // R2 low-discrepancy sequence: better coverage than white noise, and no
+        // bit operations, so it works in GLSL 330.
+        vec2 xi = fract(vec2(float(i) * 0.7548776662,
+                             float(i) * 0.5698402909) + rot);
+        float r = sqrt(xi.x);                        // cosine-weighted hemisphere
+        float phi = 6.2831853 * xi.y;
+        vec3 h = vec3(r * cos(phi), r * sin(phi), sqrt(max(1.0 - xi.x, 0.0)));
+
+        vec3 sp = P + TBN * h * radius;
+        vec2 suv = view_to_uv(sp);
+        if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) continue;
+        float sz = texture(posTex, suv).z;
+        if (sz >= -1e-4) continue;                   // background: occludes nothing
+        float sd = -sz, sampleDist = -sp.z;
+        // Is the stored surface in FRONT of our sample point? Then the sample is
+        // buried, i.e. occluded. The range check keeps a distant foreground
+        // object from darkening this pixel, which would ring every silhouette.
+        if (sd < sampleDist - bias)
+            occ += smoothstep(0.0, 1.0, radius / max(abs(sampleDist - sd), 1e-4));
     }
-    frag = 1.0 - occ / float(%d);
+    frag.x = clamp(1.0 - occ / float(nSamples), 0.0, 1.0);
 }
-""" % (SSAO_KERNEL_SIZE, SSAO_KERNEL_SIZE, SSAO_KERNEL_SIZE)
+"""
 
 _BLUR_FS = """
 #version 330 core
@@ -215,23 +378,29 @@ uniform sampler2D aoTex;
 uniform sampler2D posTex;
 uniform vec2 texel;
 in vec2 uv;
-out float frag;
+out vec2 frag;
 void main() {
-    // Foreground-only 4x4 box blur. The background's AO is 1.0 (fully open); a
-    // naive blur bleeds that into a bead's silhouette pixels, un-darkening them
-    // into a bright halo around the cluster. Weighting each tap by whether it is
-    // a bead fragment (view-space z < 0; the background G-buffer z is cleared to
-    // 0) keeps the blur inside the geometry, so no halo forms.
-    float sum = 0.0;
+    // Foreground-only 4x4 box blur of BOTH half-res terms: ambient occlusion in
+    // x, sun visibility in y. Both are noisy by construction -- the AO from its
+    // sample pattern, the shadow from its per-pixel jittered binary hit -- and
+    // both are low-frequency signals, so a box blur is all either needs.
+    //
+    // The mask is what keeps it honest. The BACKGROUND's values are 1.0 (fully
+    // open, fully lit), and a naive blur bleeds that into a bead's silhouette
+    // pixels, un-darkening them into a bright halo around the cluster.
+    // Weighting each tap by whether it is a bead fragment (view-space z < 0;
+    // the background G-buffer z is cleared to 0) keeps the blur inside the
+    // geometry, so no halo forms.
+    vec2 sum = vec2(0.0);
     float wsum = 0.0;
     for (int x = -2; x < 2; ++x)
         for (int y = -2; y < 2; ++y) {
             vec2 o = uv + vec2(x, y) * texel;
             float fg = texture(posTex, o).z < -1e-4 ? 1.0 : 0.0;
-            sum += texture(aoTex, o).r * fg;
+            sum += texture(aoTex, o).rg * fg;
             wsum += fg;
         }
-    frag = wsum > 0.0 ? sum / wsum : texture(aoTex, uv).r;
+    frag = wsum > 0.0 ? sum / wsum : texture(aoTex, uv).rg;
 }
 """
 
@@ -241,60 +410,270 @@ uniform sampler2D albedoTex;
 uniform sampler2D normalTex;
 uniform sampler2D posTex;
 uniform sampler2D aoTex;
-uniform vec3 lightDir;
-uniform float ambient;
-uniform vec3 bgColor;
-uniform vec3 hazeColor;
-uniform float fogNear;
-uniform float fogFar;
-uniform float fogStrength;
+uniform vec2 texel;
+uniform vec3 lightDirView;   // FROM the surface TOWARD the sun, in view space
+uniform vec3 sunColor;
+uniform float sunGain;
+uniform vec3 skyAmbient;
+uniform float specPower;
+uniform float specGain;
+uniform vec3 fresnelColor;
+uniform float fresnelGain;
+uniform vec3 bgColor;        // linear-light background
 uniform float aoStrength;
-uniform float aoPower;
-uniform float vignette;   // screen-space edge-darken strength (0 = off)
+uniform float curvAO;
+uniform float outlineOn;
+uniform float outlineStrength;
+uniform float outlineThresh;
+uniform vec3 outlineColor;
+uniform float cueOn;
+uniform float cueNear;
+uniform float cueFar;
+uniform float cueStrength;
+uniform float edgeFade;      // periodic scenes: screen-edge fade strength (0 = off)
+uniform float tonemapOn;
+uniform float exposure;
+uniform float tonemapMix;
+uniform float vignette;
+uniform float invGamma;
 in vec2 uv;
 out vec4 frag;
+
+vec3 aces(vec3 x) {
+    // Narkowicz's cheap ACES fit: filmic highlight rolloff for one mad + div.
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14),
+                 0.0, 1.0);
+}
+
 void main() {
-    // Background test off the G-buffer view-position (z < 0 on any bead, cleared
-    // to 0 on the background) instead of sampling the depth texture. The depth
-    // texture is this framebuffer's own depth attachment, and sampling it here
-    // would be a framebuffer feedback loop -- undefined in GL, and on a tile-based
-    // GPU (Apple Silicon) it surfaced as intermittent black tiles/squares.
+    // The sky and the beads BOTH fall through to the tonemap at the bottom.
+    // That matters: anything faded toward the background has to pass through
+    // the same transfer curve as the background, or a "fully cued" bead lands
+    // several times brighter than the void it was supposed to disappear into.
+    //
+    // Background test off the G-buffer view-position (z < 0 on any bead,
+    // cleared to 0 on the background) rather than the depth texture -- that is
+    // this framebuffer's own depth attachment, and sampling it here would be a
+    // framebuffer feedback loop (undefined in GL; on a tile-based GPU like
+    // Apple Silicon it surfaced as intermittent black tiles).
+    vec3 sky = bgColor * (1.0 + 0.35 * (1.0 - uv.y));
     vec3 P = texture(posTex, uv).xyz;
-    if (P.z >= -1e-4) { frag = vec4(bgColor, 1.0); return; }
-    vec4 albedoSample = texture(albedoTex, uv);
-    vec3 alb = albedoSample.rgb;
-    vec3 N = normalize(texture(normalTex, uv).xyz);
-    float ao = texture(aoTex, uv).r;
-    vec3 L = normalize(lightDir);
-    float diff = max(dot(N, L), 0.0);
-    vec3 V = normalize(-P);
-    vec3 H = normalize(L + V);
-    float spec = 0.5 * pow(max(dot(N, H), 0.0), 32.0);
-    float shade = ambient + (1.0 - ambient) * diff + spec;
-    vec3 col = alb * shade;
-    // Contact darkening: multiply the whole lit color by the ambient-occlusion
-    // term (ao=1 open -> ao=0 fully occluded), so crevices where beads pack
-    // together read as shadowed. Deepened (aoPower) and scaled (aoStrength) so
-    // it is clearly visible, not just a nudge on the ambient floor.
-    float occ = pow(clamp(ao, 0.0, 1.0), aoPower);
-    col *= mix(1.0, occ, aoStrength);
-    float depth = -P.z;                        // distance along the view axis
-    float fog = fogStrength * clamp((depth - fogNear) / max(fogFar - fogNear, 1e-4), 0.0, 1.0);
-    col = mix(col, hazeColor, fog);
-    // Screen-space edge vignette: darken beads toward the frame edges, uniformly
-    // in screen space rather than per-bead by world position. This is applied
-    // only to bead fragments (the background already returned above, and the
-    // white box outline is drawn in a LATER line pass so it stays bright), so a
-    // whole depth-column of beads near the frame edge fades together -- no more
-    // "front bead gone, the one behind it still bright". `vignette` is the
-    // strength (0 disables); it also softens the periodic clip seam, which for
-    // the sheet sits near the frame edge.
-    if (vignette > 0.0) {
-        vec2 dc = abs(uv - 0.5) * 2.0;         // 0 at center -> 1 at each edge
-        float e = max(dc.x, dc.y);
-        col = mix(col, bgColor, vignette * smoothstep(0.55, 1.0, e));
+    vec3 col = sky;
+
+    if (P.z < -1e-4) {
+        float dist = -P.z;                     // distance along the view axis
+        vec4 albedoSample = texture(albedoTex, uv);
+        vec3 alb = albedoSample.rgb;
+        float strength = albedoSample.a;
+        vec3 N = normalize(texture(normalTex, uv).xyz);
+        vec3 L = normalize(lightDirView);
+        vec3 V = normalize(-P);                // eye is the origin in view space
+
+        // Both terms come from the half-res pass, already blurred: x is the
+        // ambient occlusion, y how much of the sun reaches this point.
+        vec2 occlusion = texture(aoTex, uv).rg;
+        float ao = occlusion.x;
+        float shadow = occlusion.y;
+        // Curvature AO, free: the rim of a curved surface is partly occluded by
+        // its own body, and N.z falls to 0 exactly at the silhouette.
+        if (curvAO > 0.5) ao *= 0.55 + 0.45 * smoothstep(0.0, 0.55, N.z);
+        // pow(), not a multiply: this pins ao = 1 (fully open stays fully lit)
+        // and bends everything below it down, so crevices deepen while open
+        // surfaces keep their brightness.
+        ao = pow(clamp(ao, 0.0, 1.0), aoStrength);
+
+        float diff = max(dot(N, L), 0.0);
+
+        vec3 H = normalize(L + V);
+        float spec = pow(max(dot(N, H), 0.0), specPower);
+        float fres = pow(1.0 - max(dot(N, V), 0.0), 5.0);
+
+        // AO darkens the AMBIENT term only -- that is what it models. Scaling
+        // the sun by it too would just be a second, wrong shadow.
+        col = alb * (skyAmbient * ao + sunColor * diff * shadow * sunGain);
+        col += vec3(1.0) * spec * shadow * specGain;
+        col = mix(col, fresnelColor, fres * fresnelGain * ao);
+
+        // ---- outline: depth-discontinuity edge detect --------------------
+        if (outlineOn > 0.5) {
+            float dl = -texture(posTex, uv + vec2(-texel.x, 0.0)).z;
+            float dr = -texture(posTex, uv + vec2( texel.x, 0.0)).z;
+            float dd = -texture(posTex, uv + vec2(0.0, -texel.y)).z;
+            float du = -texture(posTex, uv + vec2(0.0,  texel.y)).z;
+            float g = max(abs(dl - dr), abs(dd - du));
+            // The threshold scales with distance, or ordinary perspective
+            // foreshortening would outline everything far away.
+            float t0 = outlineThresh * dist;
+            float edge = smoothstep(t0, t0 * 4.0, g);
+            col = mix(col, outlineColor, clamp(edge * outlineStrength, 0.0, 1.0));
+        }
+
+        // ---- depth cue ---------------------------------------------------
+        // A straight linear ramp to the background across the scene's own depth
+        // span. Distinct from physical fog (exponential extinction): this is a
+        // depth-perception aid from technical illustration, and in a dense bead
+        // cloud it does more for legibility because the ramp spans exactly the
+        // depth range that actually contains beads.
+        if (cueOn > 0.5) {
+            float c = clamp((dist - cueNear) / max(cueFar - cueNear, 1e-4), 0.0, 1.0);
+            col = mix(col, sky, c * cueStrength);
+        }
+
+        // Periodic images: the further a copy is from the real cell, the more
+        // of the background shows through it, so the tiling has no outer edge.
+        // After the depth cue, because it is the same kind of statement -- this
+        // is further away, let go of it -- and before the screen vignette, which
+        // is about the frame rather than the scene.
+        if (strength < 1.0) col = mix(sky, col, clamp(strength, 0.0, 1.0));
+
+        // Periodic scenes: fade the beads toward the background over the outer
+        // frame margin, uniformly in screen space, softening both the frame
+        // edge and the periodic clip seam. Applied only to bead fragments, and
+        // the box outline is drawn later, so it stays bright.
+        if (edgeFade > 0.0) {
+            vec2 dc = abs(uv - 0.5) * 2.0;         // 0 at center -> 1 at each edge
+            col = mix(col, sky, edgeFade * smoothstep(0.55, 1.0, max(dc.x, dc.y)));
+        }
+    }
+
+    if (tonemapOn > 0.5) {
+        // HALF-STRENGTH ACES: the full filmic S lifts the shadows and pulls
+        // saturated colour toward grey, which on a near-monochrome scene reads
+        // as washed out. Blending it half-and-half with the linear colour keeps
+        // the rolloff at half slope and gives the colour back. The cost is that
+        // the linear half is unbounded, so a very bright specular clips instead
+        // of rolling off -- hence the clamp.
+        col = mix(col, aces(col * exposure), tonemapMix);
+        col = pow(clamp(col, 0.0, 1.0), vec3(invGamma));
+        // dot(q,q) peaks at 0.5 in the corners, so 1.1 takes them to 45%.
+        vec2 q = uv - 0.5;
+        col *= 1.0 - vignette * dot(q, q);
     }
     frag = vec4(col, 1.0);
+}
+"""
+
+_DOF_FS = """
+#version 330 core
+uniform sampler2D colorTex;
+uniform sampler2D posTex;
+uniform vec2 texel;
+uniform float focus;
+uniform float range;
+uniform float maxCoc;
+uniform float enabled;
+in vec2 uv;
+out vec4 frag;
+
+// Circle of confusion: 0 in focus, 1 maximally blurred. A real lens focuses
+// exactly one distance onto the sensor; a point at any other distance projects
+// as a disc, and the whole effect is the size of that disc.
+float coc_of(vec3 P) {
+    if (P.z >= -1e-4) return 1.0;                   // background: fully blurred
+    return clamp(abs(-P.z - focus) / range, 0.0, 1.0);
+}
+
+void main() {
+    vec4 c0 = texture(colorTex, uv);
+    if (enabled < 0.5) { frag = c0; return; }
+    float coc = coc_of(texture(posTex, uv).xyz);
+    if (coc < 0.02) { frag = c0; return; }          // already sharp
+
+    // 24 taps on a golden-angle spiral: even coverage of the disc with no
+    // precomputed table and no visible sampling pattern.
+    const int TAPS = 24;
+    const float GA = 2.39996323;
+    float radius = coc * maxCoc;
+
+    vec3 sum = c0.rgb;
+    float wsum = 1.0;
+    for (int i = 1; i <= TAPS; ++i) {
+        float t = float(i) / float(TAPS);
+        float a = float(i) * GA;
+        // sqrt(t) keeps the samples uniform over the AREA of the disc rather
+        // than clustering them at the centre.
+        vec2 off = vec2(cos(a), sin(a)) * sqrt(t) * radius * texel;
+        // Weight each tap by its OWN circle of confusion, so a blurry
+        // foreground bleeds outward instead of being clipped off by a sharp
+        // background pixel. Not exact -- physically an out-of-focus foreground
+        // SCATTERS over the background, and a gather filter like this one can
+        // only pull inward -- but it removes the tell-tale hard edge around
+        // near objects, which is the 90%-for-5% version of the fix.
+        float w = max(coc_of(texture(posTex, uv + off).xyz), 0.05);
+        sum += texture(colorTex, uv + off).rgb * w;
+        wsum += w;
+    }
+    frag = vec4(sum / wsum, c0.a);
+}
+"""
+
+# =============================================================================
+# ANTI-ALIASING
+# =============================================================================
+# Every silhouette in this renderer is a hard edge. The impostor either hits its
+# sphere or `discard`s, the outline is a smoothstep over a depth gradient that
+# saturates within a pixel, and the periodic clip is a flat `discard` -- so all
+# three come out stair-stepped, and on the sheet, where hundreds of small beads
+# each contribute two or three arcs of edge, the whole image crawls.
+#
+# The usual answer, MSAA, is not available: a deferred renderer would have to
+# keep and shade every G-buffer sample (4x the memory and the shading), and the
+# impostors write gl_FragDepth, which disables early-z and makes per-sample depth
+# resolve worse still. So this is FXAA (Lottes) instead -- one full-screen pass,
+# no extra geometry cost, no interaction with the G-buffer at all.
+#
+# It works on LUMA, so it has to run after the tonemap and gamma encode (an edge
+# in linear light is not where the eye sees one), and after the lines, so they
+# get antialiased too. That is exactly the last thing this pipeline does.
+_FXAA_FS = """
+#version 330 core
+uniform sampler2D srcTex;
+uniform vec2 texel;
+uniform float aaOn;
+in vec2 uv;
+out vec4 frag;
+
+// Rec. 601 luma. The green weight dominates because the eye does; an edge that
+// is invisible in luma is one FXAA is right to leave alone.
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+void main() {
+    vec3 rgbM = texture(srcTex, uv).rgb;
+    if (aaOn < 0.5) { frag = vec4(rgbM, 1.0); return; }
+
+    float lM = luma(rgbM);
+    float lNW = luma(texture(srcTex, uv + vec2(-1.0,  1.0) * texel).rgb);
+    float lNE = luma(texture(srcTex, uv + vec2( 1.0,  1.0) * texel).rgb);
+    float lSW = luma(texture(srcTex, uv + vec2(-1.0, -1.0) * texel).rgb);
+    float lSE = luma(texture(srcTex, uv + vec2( 1.0, -1.0) * texel).rgb);
+
+    // Local contrast. Below it, this is smooth shading rather than an edge, and
+    // blurring it would only cost sharpness -- which is most of the screen, so
+    // this early-out is also where the speed comes from.
+    float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+    float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+    float range = lMax - lMin;
+    if (range < max(0.0625, lMax * 0.125)) { frag = vec4(rgbM, 1.0); return; }
+
+    // The edge's direction, from the diagonal luma gradients: blur ALONG it,
+    // never across it, which is what separates this from a plain blur.
+    vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)),
+                     ((lNW + lSW) - (lNE + lSE)));
+    // Bias the normalisation on dark pixels, where the gradients are small and
+    // the direction estimate is mostly noise.
+    float reduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
+    float rcpMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * rcpMin, -8.0, 8.0) * texel;
+
+    // Two taps near the centre, plus two out at the ends of the span. If the
+    // wider pair strays outside the neighbourhood's luma range it has walked off
+    // this edge onto something else, so fall back to the narrow pair.
+    vec3 rgbA = 0.5 * (texture(srcTex, uv + dir * (1.0 / 3.0 - 0.5)).rgb +
+                       texture(srcTex, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
+    vec3 rgbB = rgbA * 0.5 + 0.25 * (texture(srcTex, uv - dir * 0.5).rgb +
+                                     texture(srcTex, uv + dir * 0.5).rgb);
+    float lB = luma(rgbB);
+    frag = vec4((lB < lMin || lB > lMax) ? rgbA : rgbB, 1.0);
 }
 """
 
@@ -327,29 +706,6 @@ void main() { frag = texture(srcTex, uv); }
 """
 
 
-def _ssao_kernel(n):
-    """Hemisphere sample kernel (points in the +z hemisphere, weighted toward
-    the origin so nearby occluders dominate)."""
-    rng = np.random.default_rng(1234)
-    k = np.empty((n, 3), dtype=np.float32)
-    for i in range(n):
-        v = np.array([rng.uniform(-1, 1), rng.uniform(-1, 1), rng.uniform(0, 1)])
-        v = _normalize(v) * rng.uniform(0.0, 1.0)
-        scale = i / n
-        v *= 0.1 + 0.9 * scale * scale         # accelerate toward the origin
-        k[i] = v
-    return k
-
-
-def _ssao_noise(size=4):
-    """A small tiled texture of random in-plane rotations for the SSAO kernel."""
-    rng = np.random.default_rng(5678)
-    noise = np.zeros((size * size, 3), dtype=np.float32)
-    noise[:, 0] = rng.uniform(-1, 1, size * size)
-    noise[:, 1] = rng.uniform(-1, 1, size * size)
-    return noise
-
-
 class GLScene:
     """The GPU bead pipeline for one moderngl context, sized to a sim viewport."""
 
@@ -360,9 +716,13 @@ class GLScene:
         self._inst_capacity = 0
         self._inst_vbo = None
         self._geom_vao = None
-        self._line_vbo = None
-        self._line_cap = 0
-        self._line_vao = None
+        self._line_vbo = [None, None]
+        self._line_cap = [0, 0]
+        self._line_vao = [None, None]
+        # The style whose colour constants are currently uploaded. Only its gamma
+        # affects them, so the geometry program is only re-tinted when that
+        # changes rather than every frame.
+        self._albedo_gamma = None
 
         self._build_programs()
         self._build_static_buffers()
@@ -376,72 +736,53 @@ class GLScene:
         self.ssao_prog = c.program(vertex_shader=_FULLSCREEN_VS, fragment_shader=_SSAO_FS)
         self.blur_prog = c.program(vertex_shader=_FULLSCREEN_VS, fragment_shader=_BLUR_FS)
         self.comp_prog = c.program(vertex_shader=_FULLSCREEN_VS, fragment_shader=_COMPOSITE_FS)
+        self.dof_prog = c.program(vertex_shader=_FULLSCREEN_VS, fragment_shader=_DOF_FS)
+        self.fxaa_prog = c.program(vertex_shader=_FULLSCREEN_VS, fragment_shader=_FXAA_FS)
+        self.fxaa_prog["srcTex"].value = 0
         self.line_prog = c.program(vertex_shader=_LINE_VS, fragment_shader=_LINE_FS)
         self.blit_prog = c.program(vertex_shader=_FULLSCREEN_VS, fragment_shader=_BLIT_FS)
         self.blit_prog["srcTex"].value = 0
 
-        # Constant shader parameters (bead band, lighting, colors, SSAO kernel).
+        # Bead banding geometry (the colours themselves are per-style, below).
         self.geom_prog["band_half"].value = BEAD_BAND_HALFWIDTH
         self.geom_prog["band_soft"].value = BEAD_BAND_SOFT
-        self.geom_prog["equator_col"].value = tuple(c_ / 255.0 for c_ in BEAD_EQUATOR_COLOR)
-        self.geom_prog["pole_col"].value = tuple(c_ / 255.0 for c_ in BEAD_POLE_COLOR)
-        self.geom_prog["white_col"].value = tuple(c_ / 255.0 for c_ in BEAD_WHITE_POLE_COLOR)
         self.geom_prog["white_min"].value = BEAD_WHITE_POLE_MIN
         self.geom_prog["white_soft"].value = BEAD_WHITE_POLE_SOFT
-        # Periodic bead-clipping defaults to OFF; render() sets it per frame for
-        # periodic scenes (see render()).
+        # Periodic bead-clipping defaults to OFF; render() sets it per frame.
         self.geom_prog["clipEnable"].value = 0.0
         self.geom_prog["boxHalf"].value = (1e9, 1e9)
+        # The energy colormap never changes; only which mode is active and what
+        # range it spans do (per frame, in render()).
+        self.geom_prog["ramp"].write(np.array(INFERNO, dtype="f4").tobytes())
+        self.geom_prog["energyMode"].value = 0.0
+        self.geom_prog["energyRange"].value = (-6.0, 0.0)
 
-        kernel = _ssao_kernel(SSAO_KERNEL_SIZE)
-        self.ssao_prog["samples"].write(kernel.tobytes())
-        self.ssao_prog["radius"].value = 0.9   # ~ bead diameter: reaches neighbours
-        # Depth-comparison bias, in view-space units. Raised from a hairline
-        # 0.015: on a smooth CONVEX impostor sphere the near-origin AO samples sit
-        # just above the curving surface and, read back against that same surface,
-        # were counted as self-occlusion -- darkening each bead's body while its
-        # silhouette rim (AO ~ 1) stayed bright, which read as a bright halo around
-        # every bead's outline. A bias of ~one-tenth the sample radius clears the
-        # curvature so a lone sphere reads unoccluded, while genuine crevices where
-        # neighbouring beads pack together (depth gap >> bias) still darken.
-        self.ssao_prog["bias"].value = 0.06
-
-        self.comp_prog["lightDir"].value = tuple(_normalize(np.array(SPHERE_LIGHT_DIR)))
-        self.comp_prog["ambient"].value = SPHERE_AMBIENT
-        self.comp_prog["bgColor"].value = tuple(c_ / 255.0 for c_ in BG)
-        self.comp_prog["hazeColor"].value = tuple(c_ / 255.0 for c_ in HAZE_COLOR)
-        self.comp_prog["fogStrength"].value = HAZE_STRENGTH
-        # Contact-shadow strength/contrast (applied as a whole-color multiplier so
-        # packed beads visibly darken between each other).
-        self.comp_prog["aoStrength"].value = 0.85
-        self.comp_prog["aoPower"].value = 1.6
-
-        self.comp_prog["vignette"].value = 0.0   # per-frame in render()
-        # Texture unit assignments.
-        for name, unit in (("albedoTex", 0), ("normalTex", 1), ("posTex", 2),
-                           ("aoTex", 3)):
-            if name in self.comp_prog:
-                self.comp_prog[name].value = unit
+        # Texture unit assignments (fixed for the life of the programs).
+        self.comp_prog["albedoTex"].value = 0
+        self.comp_prog["normalTex"].value = 1
+        self.comp_prog["posTex"].value = 2
+        self.comp_prog["aoTex"].value = 3
         self.ssao_prog["posTex"].value = 0
         self.ssao_prog["normalTex"].value = 1
-        self.ssao_prog["noiseTex"].value = 2
-        self.ssao_prog["depthTex"].value = 3
         self.blur_prog["aoTex"].value = 0
         self.blur_prog["posTex"].value = 1
+        self.dof_prog["colorTex"].value = 0
+        self.dof_prog["posTex"].value = 1
 
     def _build_static_buffers(self):
         c = self.ctx
-        # Quad corners for the impostor billboard (triangle strip).
+        # Quad corners for the impostor billboard (triangle strip). They
+        # circumscribe the unit circle, which is what makes the silhouette
+        # construction in _GEOM_VS exact.
         quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4")
         self._quad_vbo = c.buffer(quad.tobytes())
-        # SSAO rotation-noise texture (RGB16F, nearest, repeat).
-        noise = _ssao_noise(4)
-        self._noise_tex = c.texture((4, 4), 3, noise.astype("f2").tobytes(), dtype="f2")
-        self._noise_tex.filter = (c.NEAREST, c.NEAREST)
-        self._noise_tex.repeat_x = True
-        self._noise_tex.repeat_y = True
-        # Empty VAO for fullscreen passes (vertices generated from gl_VertexID).
-        self._fs_vao = c.vertex_array(self.ssao_prog, [])
+        # One cached VAO per fullscreen program (vertices come from gl_VertexID,
+        # so they need no buffer -- but a VAO per draw is still an allocation).
+        self._fs_vaos = {
+            p: c.vertex_array(p, [])
+            for p in (self.ssao_prog, self.blur_prog, self.comp_prog,
+                      self.dof_prog, self.fxaa_prog, self.blit_prog)
+        }
 
     def resize(self, width, height):
         width = max(1, int(width))
@@ -453,11 +794,14 @@ class GLScene:
         self._release_fbos()
 
         # Albedo is f2 (not f1) so a per-bead brightness boost (>1) survives into
-        # the composite before the final clamp; the alpha channel carries the
-        # opaque periodic-edge vignette factor (see _GEOM_FS / _COMPOSITE_FS).
+        # the composite before the final clamp.
         self.albedo_tex = c.texture((width, height), 4, dtype="f2")
         self.normal_tex = c.texture((width, height), 3, dtype="f2")
-        self.pos_tex = c.texture((width, height), 3, dtype="f2")
+        # Full float for the view position: its z is a world-space distance, and
+        # the outline pass compares NEIGHBOURING distances against a threshold of
+        # a couple of thousandths of one -- which is below half-float resolution
+        # out at the far side of a big box, so f2 here reads as edge noise.
+        self.pos_tex = c.texture((width, height), 4, dtype="f4")
         self.depth_tex = c.depth_texture((width, height))
         self.depth_tex.compare_func = ""          # sample raw depth, not a compare
         for t in (self.albedo_tex, self.normal_tex, self.pos_tex):
@@ -467,92 +811,206 @@ class GLScene:
             depth_attachment=self.depth_tex,
         )
 
-        self.ao_tex = c.texture((width, height), 1, dtype="f2")
+        # Ambient occlusion and sun visibility, two channels of one texture at
+        # HALF resolution: both are broad, low-frequency terms that get blurred
+        # anyway, so a quarter of the pixels buys a quarter of the cost for no
+        # visible difference. LINEAR, because the composite then samples them at
+        # full res and nearest would show the half-res grid.
+        aw, ah = max(1, width // 2), max(1, height // 2)
+        self.ao_size = (aw, ah)
+        self.ao_tex = c.texture((aw, ah), 2, dtype="f2")
+        self.ao_blur_tex = c.texture((aw, ah), 2, dtype="f2")
+        for t in (self.ao_tex, self.ao_blur_tex):
+            t.filter = (c.LINEAR, c.LINEAR)
         self.ao_fbo = c.framebuffer(color_attachments=[self.ao_tex])
-        self.ao_blur_tex = c.texture((width, height), 1, dtype="f2")
         self.ao_blur_fbo = c.framebuffer(color_attachments=[self.ao_blur_tex])
 
-        self.final_tex = c.texture((width, height), 4, dtype="f1")
-        # Share the geometry depth buffer so the line pass is occluded by beads.
-        self.final_fbo = c.framebuffer(
-            color_attachments=[self.final_tex], depth_attachment=self.depth_tex
-        )
+        # The composite renders HERE rather than to the final texture, so the
+        # depth-of-field pass has something to read. LINEAR: DoF samples it
+        # off-grid.
+        self.lit_tex = c.texture((width, height), 4, dtype="f2")
+        self.lit_tex.filter = (c.LINEAR, c.LINEAR)
+        self.lit_fbo = c.framebuffer(color_attachments=[self.lit_tex])
 
-        self.ssao_prog["noiseScale"].value = (width / 4.0, height / 4.0)
-        self.blur_prog["texel"].value = (1.0 / width, 1.0 / height)
+        # The finished picture, before antialiasing: depth of field lands here and
+        # the lines are drawn into it, sharing the geometry depth buffer so they
+        # are occluded by the beads. LINEAR because FXAA reads it off-grid.
+        self.shaded_tex = c.texture((width, height), 4, dtype="f1")
+        self.shaded_tex.filter = (c.LINEAR, c.LINEAR)
+        self.shaded_fbo = c.framebuffer(
+            color_attachments=[self.shaded_tex], depth_attachment=self.depth_tex
+        )
+        # ...and after: what gets blitted to the window and read back for
+        # snapshots, so both see the same image.
+        self.final_tex = c.texture((width, height), 4, dtype="f1")
+        self.final_fbo = c.framebuffer(color_attachments=[self.final_tex])
+
+        self.blur_prog["texel"].value = (1.0 / aw, 1.0 / ah)
+        self.comp_prog["texel"].value = (1.0 / width, 1.0 / height)
+        self.dof_prog["texel"].value = (1.0 / width, 1.0 / height)
+        self.fxaa_prog["texel"].value = (1.0 / width, 1.0 / height)
 
     def _release_fbos(self):
-        for attr in ("gbuffer", "ao_fbo", "ao_blur_fbo", "final_fbo",
-                     "albedo_tex", "normal_tex", "pos_tex", "depth_tex",
-                     "ao_tex", "ao_blur_tex", "final_tex"):
+        for attr in ("gbuffer", "ao_fbo", "ao_blur_fbo", "lit_fbo", "shaded_fbo",
+                     "final_fbo", "albedo_tex", "normal_tex", "pos_tex",
+                     "depth_tex", "ao_tex", "ao_blur_tex", "lit_tex",
+                     "shaded_tex", "final_tex"):
             obj = getattr(self, attr, None)
             if obj is not None:
                 obj.release()
                 setattr(self, attr, None)
 
+    # ---- style --------------------------------------------------------------
+
+    def _apply_style(self, style, bead_radius, light_dir_view, depth_range,
+                     edge_fade, focal_px):
+        """Push one RenderStyle into the shader uniforms. Called per frame, so a
+        slider or a per-system override takes effect immediately; the cost is a
+        few dozen uniform writes, which is nothing beside one full-screen pass."""
+        gamma = style.display_gamma
+        if gamma != self._albedo_gamma:
+            self.geom_prog["equator_col"].value = to_linear(BEAD_EQUATOR_COLOR, gamma)
+            self.geom_prog["pole_col"].value = to_linear(BEAD_POLE_COLOR, gamma)
+            self.geom_prog["white_col"].value = to_linear(BEAD_WHITE_POLE_COLOR, gamma)
+            self._albedo_gamma = gamma
+
+        r = max(float(bead_radius), 1e-6)
+        light = tuple(float(v) for v in light_dir_view)
+        # The half-res pass owns both occlusion terms, so the shadow march's
+        # scales and the light direction go here, not to the composite.
+        a = self.ssao_prog
+        a["nSamples"].value = int(style.ao_samples)
+        a["radius"].value = style.ao_radius_r * r
+        a["bias"].value = style.ao_bias_r * r
+        a["lightDirView"].value = light
+        a["shadowOn"].value = 1.0 if style.shadows else 0.0
+        a["shadowLen"].value = style.shadow_len_r * r
+        a["shadowBias"].value = style.shadow_bias_r * r
+        a["shadowThick"].value = style.shadow_thick_r * r
+
+        p = self.comp_prog
+        p["lightDirView"].value = light
+        p["sunColor"].value = tuple(style.sun_color)
+        p["sunGain"].value = style.sun_gain
+        p["skyAmbient"].value = tuple(style.sky_ambient)
+        p["specPower"].value = style.spec_power
+        p["specGain"].value = style.spec_gain
+        p["fresnelColor"].value = tuple(style.fresnel_color)
+        p["fresnelGain"].value = style.fresnel_gain
+        p["bgColor"].value = to_linear(BG, gamma)
+        p["aoStrength"].value = style.ao_strength
+        p["curvAO"].value = 1.0 if style.curvature_ao else 0.0
+        p["outlineOn"].value = 1.0 if style.outline else 0.0
+        p["outlineStrength"].value = style.outline_strength
+        p["outlineThresh"].value = style.outline_threshold(focal_px)
+        p["outlineColor"].value = tuple(style.outline_color)
+        cue_near, cue_far = style.cue_range(*depth_range)
+        p["cueOn"].value = 1.0 if style.depth_cue else 0.0
+        p["cueNear"].value = cue_near
+        p["cueFar"].value = cue_far
+        p["cueStrength"].value = style.cue_strength
+        p["edgeFade"].value = float(edge_fade)
+        p["tonemapOn"].value = 1.0 if style.tonemap else 0.0
+        p["exposure"].value = style.tonemap_exposure
+        p["tonemapMix"].value = style.tonemap_mix
+        p["vignette"].value = style.vignette
+        p["invGamma"].value = 1.0 / gamma
+
+        focus, rng = style.focus_range(*depth_range)
+        d = self.dof_prog
+        d["enabled"].value = 1.0 if (style.dof and style.dof_bokeh_px > 0.0) else 0.0
+        d["focus"].value = focus
+        d["range"].value = rng
+        d["maxCoc"].value = (style.dof_bokeh_px * self.height / DOF_REFERENCE_HEIGHT)
+
+        self.fxaa_prog["aaOn"].value = 1.0 if style.antialias else 0.0
+
     # ---- per-frame instance / line uploads ----------------------------------
 
-    def _upload_instances(self, centers, radii, directors, brights):
-        """Upload all beads (opaque) into the geometry VAO. Layout is 8 floats
-        per instance: center(3), radius(1), director(3), brightness(1)."""
+    def _upload_instances(self, centers, radii, directors, brights, energies, fades):
+        """Upload all beads (opaque) into the geometry VAO. Layout is 10 floats
+        per instance: center(3), radius(1), director(3), brightness(1),
+        energy(1), fade(1)."""
         n = len(centers)
         if n == 0:
             return 0
-        data = np.empty((n, 8), dtype="f4")
+        data = np.empty((n, 10), dtype="f4")
         data[:, 0:3] = centers
         data[:, 3] = radii
         data[:, 4:7] = directors
         data[:, 7] = brights
+        data[:, 8] = energies
+        data[:, 9] = fades
         raw = data.tobytes()
         if n > self._inst_capacity:
             if self._inst_vbo is not None:
                 self._inst_vbo.release()
             if self._geom_vao is not None:
                 self._geom_vao.release()
-            self._inst_vbo = self.ctx.buffer(reserve=max(1, n) * 8 * 4, dynamic=True)
+            self._inst_vbo = self.ctx.buffer(reserve=max(1, n) * 10 * 4, dynamic=True)
             self._inst_capacity = n
             self._geom_vao = self.ctx.vertex_array(
                 self.geom_prog,
                 [(self._quad_vbo, "2f", "in_corner"),
-                 (self._inst_vbo, "3f 1f 3f 1f /i", "in_center", "in_radius",
-                  "in_dir", "in_bright")],
+                 (self._inst_vbo, "3f 1f 3f 1f 1f 1f /i", "in_center", "in_radius",
+                  "in_dir", "in_bright", "in_energy", "in_fade")],
             )
         self._inst_vbo.write(raw)
         return n
 
-    def _upload_lines(self, verts, colors):
-        """verts: (M,3) segment endpoints (pairs), colors: (M,4) rgba in [0,1]."""
+    def _upload_lines(self, slot, verts, colors):
+        """verts: (M,3) segment endpoints (pairs), colors: (M,4) rgba in [0,1].
+
+        Two slots, because the line pass is drawn twice: once depth-tested
+        against the beads, and once over the top of them (see render())."""
         m = len(verts)
         data = np.empty((m, 7), dtype="f4")
         data[:, 0:3] = verts
         data[:, 3:7] = colors
-        raw = data.tobytes()
-        if m > self._line_cap:
-            if self._line_vbo is not None:
-                self._line_vbo.release()
-            if self._line_vao is not None:
-                self._line_vao.release()
-            self._line_vbo = self.ctx.buffer(reserve=max(1, m) * 7 * 4, dynamic=True)
-            self._line_cap = m
-            self._line_vao = self.ctx.vertex_array(
+        if m > self._line_cap[slot]:
+            for obj in (self._line_vbo[slot], self._line_vao[slot]):
+                if obj is not None:
+                    obj.release()
+            self._line_vbo[slot] = self.ctx.buffer(reserve=max(1, m) * 7 * 4,
+                                                   dynamic=True)
+            self._line_cap[slot] = m
+            self._line_vao[slot] = self.ctx.vertex_array(
                 self.line_prog,
-                [(self._line_vbo, "3f 4f", "in_pos", "in_col")],
+                [(self._line_vbo[slot], "3f 4f", "in_pos", "in_col")],
             )
-        self._line_vbo.write(raw)
+        self._line_vbo[slot].write(data.tobytes())
         return m
 
     # ---- render -------------------------------------------------------------
 
-    def render(self, view, proj, centers, radii, directors, near, far,
+    def render(self, view, proj, centers, radii, directors, depth_range,
                line_verts=None, line_colors=None, brights=None,
-               box_half=None, vignette=0.0):
+               box_half=None, edge_fade=0.0, style=DEFAULT_STYLE,
+               bead_radius=None, focal_px=None, light_dir_world=None,
+               energies=None, fades=None, overlay_verts=None,
+               overlay_cols=None):
         """Render the beads (+ optional depth-occluded lines) into self.final_fbo.
+
         view/proj are row-major 4x4 numpy matrices (see view_matrix/proj_matrix).
-        `brights` (albedo multiplier) is an optional per-bead array. For a
-        periodic scene, pass `box_half=(hx, hy)` (world half-extents, box centered
-        at the origin): beads are then clipped to the box faces so wrapped ghosts
-        compose correctly (opaque, no transparency). `vignette` (0..1) is the
-        screen-space edge-darken strength applied to the beads in the composite."""
+        `depth_range` is (nearest, farthest) bead distance along the view axis;
+        the depth cue and the focus plane are placed as fractions of it, so they
+        follow the scene rather than needing absolute world numbers.
+        `brights` (albedo multiplier) is an optional per-bead array; `bead_radius`
+        the radius the AO/shadow reaches scale off (default: the median radius);
+        `focal_px` the camera's focal length in pixels, which is how big a bead
+        lands on screen and so how wide its outline should be (default: derived
+        from the projection).
+        For a periodic scene, pass `box_half=(hx, hy)` (world half-extents, box
+        centered at the origin): beads are then clipped to the box faces so
+        wrapped ghosts compose correctly (opaque, no transparency), and
+        `edge_fade` (0..1) softens the resulting seam at the frame edge.
+        `light_dir_world` overrides the style's sun direction (world space).
+        `energies` (per bead), when given, switches the beads from the director
+        banding to the energy colormap over `style.energy_range`. `fades` (per
+        bead, 1 = full strength) blends a bead toward the background, which is
+        how periodic image copies are made to trail off. `overlay_verts/cols` are
+        lines drawn over everything, depth test off.
+        """
         c = self.ctx
         vb, pb = _gl(view), _gl(proj)
         n = len(centers)
@@ -560,8 +1018,35 @@ class GLScene:
         radii = np.asarray(radii, "f4")
         directors = np.asarray(directors, "f4")
         brights = np.ones(n, "f4") if brights is None else np.asarray(brights, "f4")
+        # Energy colouring is on exactly when the caller supplies energies.
+        self.geom_prog["energyMode"].value = 0.0 if energies is None else 1.0
+        self.geom_prog["energyRange"].value = tuple(style.energy_range)
+        energies = np.zeros(n, "f4") if energies is None else np.asarray(energies, "f4")
+        fades = np.ones(n, "f4") if fades is None else np.asarray(fades, "f4")
+        if bead_radius is None:
+            bead_radius = float(np.median(radii)) if n else 1.0
 
-        n_op = self._upload_instances(centers, radii, directors, brights)
+        # The sun is fixed in the WORLD, so an orbiting camera moves through a lit
+        # scene instead of dragging the highlight around with it. Rotating it into
+        # view space here (the view matrix's rotation block; a direction has no
+        # translation) keeps the composite free of the view matrix.
+        sun_world = _normalize(np.asarray(
+            style.sun_dir if light_dir_world is None else light_dir_world,
+            dtype=np.float64))
+        light_dir_view = np.asarray(view, dtype=np.float64)[:3, :3] @ sun_world
+
+        # Only the half-res pass projects sample points back to the screen (for
+        # both the occlusion hemisphere and the shadow march); the composite is
+        # a pure per-pixel shade and needs no projection at all.
+        proj_scale = (float(proj[0, 0]), float(proj[1, 1]))
+        self.ssao_prog["projScale"].value = proj_scale
+        if focal_px is None:
+            focal_px = proj_scale[1] * self.height / 2.0
+        self._apply_style(style, bead_radius, light_dir_view, depth_range,
+                          edge_fade, focal_px)
+
+        n_op = self._upload_instances(centers, radii, directors, brights,
+                                      energies, fades)
 
         # --- geometry pass -> G-buffer (all beads, opaque) ---
         self.geom_prog["view"].write(vb)
@@ -582,58 +1067,75 @@ class GLScene:
         c.disable(c.BLEND)
         if n_op:
             self._geom_vao.render(mode=c.TRIANGLE_STRIP, instances=n_op)
+        c.disable(c.DEPTH_TEST)
 
-        # --- SSAO -> ao_fbo ---
-        self.ssao_prog["proj"].write(pb)
+        # --- occlusion (half res) -> ao_fbo, then the foreground-masked blur ---
+        # One pass computes both ambient occlusion and sun visibility, and one
+        # blur smooths both. Skipped entirely when neither is switched on, in
+        # which case the cleared (1, 1) reads as "fully open, fully lit".
         self.pos_tex.use(0)
         self.normal_tex.use(1)
-        self._noise_tex.use(2)
-        self.depth_tex.use(3)
         self.ao_fbo.use()
-        c.disable(c.DEPTH_TEST)
+        c.viewport = (0, 0, *self.ao_size)
         self.ao_fbo.clear(1.0, 1.0, 1.0, 1.0)
-        self._render_fullscreen(self.ssao_prog)
+        ao_tex = self.ao_tex
+        if style.ao_samples > 0 or style.shadows:
+            self._fs_vaos[self.ssao_prog].render(mode=c.TRIANGLES, vertices=3)
+            self.ao_tex.use(0)
+            self.pos_tex.use(1)
+            self.ao_blur_fbo.use()
+            self._fs_vaos[self.blur_prog].render(mode=c.TRIANGLES, vertices=3)
+            ao_tex = self.ao_blur_tex
 
-        # --- blur AO -> ao_blur_fbo (foreground-masked, see _BLUR_FS) ---
-        self.ao_tex.use(0)
-        self.pos_tex.use(1)
-        self.ao_blur_fbo.use()
-        self._render_fullscreen(self.blur_prog)
-
-        # --- composite (lighting + AO + fog + screen vignette) -> final_fbo ---
-        # NB: the composite must NOT sample depth_tex here -- it is final_fbo's own
-        # depth attachment, and reading an attached texture is a framebuffer
-        # feedback loop (undefined; black-tile artifacts on tile-based GPUs). The
-        # background is detected from pos_tex.z instead (see _COMPOSITE_FS).
+        # --- composite (lighting + AO + shadows + outline + cue + tonemap) ---
         self.albedo_tex.use(0)
         self.normal_tex.use(1)
         self.pos_tex.use(2)
-        self.ao_blur_tex.use(3)
-        self.comp_prog["fogNear"].value = float(near)
-        self.comp_prog["fogFar"].value = float(far)
-        self.comp_prog["vignette"].value = float(vignette)
-        self.final_fbo.use()
-        c.disable(c.DEPTH_TEST)
-        self._render_fullscreen(self.comp_prog)
+        ao_tex.use(3)
+        self.lit_fbo.use()
+        c.viewport = (0, 0, self.width, self.height)
+        self._fs_vaos[self.comp_prog].render(mode=c.TRIANGLES, vertices=3)
 
-        # --- depth-occluded lines (bonds + net) into the same FBO ---
-        if line_verts is not None and len(line_verts) >= 2:
-            m = self._upload_lines(np.asarray(line_verts, "f4"),
-                                   np.asarray(line_colors, "f4"))
+        # --- depth of field -> shaded_fbo ---
+        self.lit_tex.use(0)
+        self.pos_tex.use(1)
+        self.shaded_fbo.use()
+        self._fs_vaos[self.dof_prog].render(mode=c.TRIANGLES, vertices=3)
+
+        # --- depth-occluded lines (bonds + net + box) into the same FBO ---
+        # After the blur and the tonemap on purpose: these are drawing, not
+        # photography -- a defocused box outline reads as a rendering bug, and
+        # their colours are already the display-space values theme.py declares.
+        if ((line_verts is not None and len(line_verts) >= 2)
+                or (overlay_verts is not None and len(overlay_verts) >= 2)):
             self.line_prog["view"].write(vb)
             self.line_prog["proj"].write(pb)
-            self.final_fbo.use()
-            c.enable(c.DEPTH_TEST)
-            c.depth_func = "<="
-            c.depth_mask = False               # test against beads, don't write
+            self.shaded_fbo.use()
             c.enable(c.BLEND)
-            self._line_vao.render(mode=c.LINES, vertices=m)
-            c.depth_mask = True
+            if line_verts is not None and len(line_verts) >= 2:
+                m = self._upload_lines(0, np.asarray(line_verts, "f4"),
+                                       np.asarray(line_colors, "f4"))
+                c.enable(c.DEPTH_TEST)
+                c.depth_func = "<="
+                c.depth_mask = False           # test against beads, don't write
+                self._line_vao[0].render(mode=c.LINES, vertices=m)
+                c.depth_mask = True
+                c.disable(c.DEPTH_TEST)
+            if overlay_verts is not None and len(overlay_verts) >= 2:
+                # No depth test at all: these are the lines that have to stay
+                # readable whatever is in front of them -- the cell outline, when
+                # the cell itself is buried under its own periodic images.
+                m = self._upload_lines(1, np.asarray(overlay_verts, "f4"),
+                                       np.asarray(overlay_cols, "f4"))
+                self._line_vao[1].render(mode=c.LINES, vertices=m)
+            c.disable(c.BLEND)
 
-    def _render_fullscreen(self, prog):
-        vao = self.ctx.vertex_array(prog, [])
-        vao.render(mode=self.ctx.TRIANGLES, vertices=3)
-        vao.release()
+        # --- antialias the finished picture -> final_fbo ---
+        # Last, and on the gamma-encoded image: FXAA looks for edges the way the
+        # eye does, and the lines above are edges too.
+        self.shaded_tex.use(0)
+        self.final_fbo.use()
+        self._fs_vaos[self.fxaa_prog].render(mode=c.TRIANGLES, vertices=3)
 
     # ---- output -------------------------------------------------------------
 
@@ -647,7 +1149,7 @@ class GLScene:
         c.disable(c.DEPTH_TEST)
         c.disable(c.BLEND)
         self.final_tex.use(0)
-        self._render_fullscreen(self.blit_prog)
+        self._fs_vaos[self.blit_prog].render(mode=c.TRIANGLES, vertices=3)
 
     def read_rgb(self):
         """Read the final color buffer back as an (H, W, 3) uint8 array (row 0 =
@@ -658,7 +1160,8 @@ class GLScene:
 
     def release(self):
         self._release_fbos()
-        for obj in (self._inst_vbo, self._geom_vao, self._line_vbo, self._line_vao,
-                    self._quad_vbo, self._noise_tex, getattr(self, "_fs_vao", None)):
+        for obj in (self._inst_vbo, self._geom_vao, self._quad_vbo,
+                    *self._line_vbo, *self._line_vao,
+                    *getattr(self, "_fs_vaos", {}).values()):
             if obj is not None:
                 obj.release()

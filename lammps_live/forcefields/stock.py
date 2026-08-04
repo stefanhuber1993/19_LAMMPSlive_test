@@ -84,6 +84,122 @@ class LennardJones(ForceField):
         return None
 
 
+# --- ionic NaCl ---------------------------------------------------------------
+# The rigid-ion model of an alkali halide: long-range Coulomb (Madelung)
+# attraction between alternating Na(+) and Cl(-), balanced against a short-range
+# Born-Mayer exponential repulsion. Constants below were measured, not guessed:
+#
+#   rho = 0.32 A   the standard alkali-halide hardness length.
+#   A, sigma       set so a pressure sweep of a periodic 2D checkerboard (no free
+#                  surface) puts the zero-pressure nearest-neighbour distance at
+#                  2.89 A -- close to real NaCl's 2.82 A -- with a cohesive
+#                  energy near -3.5 eV/ion, the right ballpark for an alkali
+#                  halide. A bare Coulomb plus a point repulsion collapses the
+#                  lattice instead (with sigma = 0 the exponential is negligible
+#                  at contact), which is why sigma is not simply zero.
+#   alpha = 0.25   damping for the shifted-force Coulomb.
+NACL_BORN_A = 1.0       # eV
+NACL_BORN_RHO = 0.32    # Angstrom
+NACL_BORN_SIGMA = 2.4   # Angstrom
+NACL_DSF_ALPHA = 0.25   # 1/Angstrom
+NACL_COUL_CUTOFF = 12.0  # Angstrom
+NA_MASS, CL_MASS = 22.99, 35.45   # amu
+
+
+@register
+class BornDSF(ForceField):
+    """`born/coul/dsf` -- Born-Mayer repulsion plus damped-shifted-force Coulomb.
+
+    Why DSF and not Ewald/PPPM: this is a 2D, non-periodic-in-y slab, which is
+    exactly the geometry k-space solvers handle worst (they want a periodic third
+    dimension and a slab correction). Damped shifted force (Fennell & Gezelter
+    2006) gives a smooth, energy-conserving, real-space-only Coulomb instead --
+    no reciprocal-space part at all.
+
+    Two atom types, opposite charges. The charge is a live parameter and is the
+    most instructive dial in the file: take it to zero and the Madelung bonding
+    that holds the checkerboard together simply switches off, leaving a bare
+    Born-Mayer repulsion that blows the lattice apart.
+    """
+
+    name = "born_dsf"
+    units = "metal"
+    dimension = 2
+    # Ions carry a per-atom electrostatic charge, which the Coulomb term reads.
+    atom_style = "charge"
+    n_types = 2
+    has_directors = False
+    # born/coul/dsf offers no single(), so `compute group/group` cannot report the
+    # force between two groups and the runtime reconstructs it as "total force on
+    # the controlled ion minus the forces we applied to it ourselves".
+    supports_single = False
+    # No decomposition offered. The pair energy would split cleanly into
+    # repulsion and Coulomb, but the DSF Coulomb also carries a PER-ATOM self
+    # term (-(e_shift/2 + alpha/sqrt(pi)) q^2), and this interface expresses
+    # energies per PAIR -- so a decomposition here would silently disagree with
+    # the potential energy LAMMPS reports. An honest empty is better than a
+    # breakdown that does not add up.
+    energy_terms_labels = ()
+
+    params = (
+        # The whole ionic bond, on one slider.
+        Param("charge", 1.0, "ion charge |q|", 0.0, 1.5, optimum=1.0,
+              fmt="{:.2f}", unit=" e",
+              doc="Na(+q) / Cl(-q); 0 switches the Madelung bonding off"),
+        Param("born_A", NACL_BORN_A, "Born repulsion A", 0.0, 3.0,
+              optimum=NACL_BORN_A, fmt="{:.2f}", unit=" eV", advanced=True,
+              doc="prefactor of the exponential core A*exp((sigma-r)/rho)"),
+        Param("born_rho", NACL_BORN_RHO, "Born hardness rho", 0.15, 0.60,
+              optimum=NACL_BORN_RHO, fmt="{:.2f}", unit=" A", advanced=True,
+              doc="decay length of the repulsion; 0.32 A is the alkali-halide value"),
+        # Narrow, like LJ's sigma and for the same reason: it sets the
+        # equilibrium spacing, while the lattice constant is structural.
+        Param("born_sigma", NACL_BORN_SIGMA, "Born onset sigma", 2.0, 2.8,
+              optimum=NACL_BORN_SIGMA, fmt="{:.2f}", unit=" A", advanced=True,
+              doc="ion contact size: where the exponential repulsion turns on"),
+        Param("cutoff", NACL_COUL_CUTOFF, "Coulomb cutoff", 6.0, 12.0,
+              fmt="{:.1f}", unit=" A", advanced=True, tier=Tier.HOT_RESTYLE,
+              doc="real-space cutoff; DSF needs no reciprocal-space part"),
+    )
+
+    def __init__(self, alpha=NACL_DSF_ALPHA, masses=(NA_MASS, CL_MASS)):
+        self.alpha = alpha
+        self.masses = masses
+
+    def setup_commands(self, params):
+        return [f"mass 1 {self.masses[0]}", f"mass 2 {self.masses[1]}"] + \
+               self.charge_commands(params)
+
+    def charge_commands(self, params):
+        """Type 1 is the cation, type 2 the anion. Equal and opposite, so the
+        cell stays exactly neutral -- which the Coulomb sum needs."""
+        q = params["charge"]
+        return [f"set type 1 charge {q}", f"set type 2 charge {-q}"]
+
+    def pair_commands(self, params):
+        return [f"pair_style born/coul/dsf {self.alpha} {params['cutoff']}"] + \
+               self.coeff_commands(params)
+
+    def coeff_commands(self, params):
+        # C and D (the r^-6 / r^-8 dispersion terms) are zeroed: a pure
+        # exponential core added to the Coulomb.
+        return [f"pair_coeff * * {params['born_A']} {params['born_rho']} "
+                f"{params['born_sigma']} 0.0 0.0"]
+
+    def live_commands(self, params, changed_name):
+        """Charge is not a pair coefficient -- it lives on the particles -- so it
+        needs `set`, not `pair_coeff`. Everything else takes the generic path."""
+        if changed_name == "charge":
+            return self.charge_commands(params)
+        return super().live_commands(params, changed_name)
+
+    def interaction_cutoff(self, params):
+        return float(params["cutoff"])
+
+    def integrator_command(self):
+        return None      # the scenario integrates its own groups
+
+
 # --- EAM copper ---------------------------------------------------------------
 
 @register

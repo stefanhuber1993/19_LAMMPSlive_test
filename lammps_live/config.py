@@ -37,3 +37,14 @@ TRAIL_SAMPLE_EVERY_N_FRAMES = 5
 # it with a simple exponential filter before it reaches the device, in real
 # time rather than frame count so it's independent of frame rate.
 FF_SMOOTHING_TAU = 0.1   # seconds
+
+# Run the simulation on a worker thread so it overlaps the frame's drawing,
+# rather than the two taking turns. LAMMPS releases the GIL inside `run`, so the
+# step genuinely proceeds on another core while pygame draws -- worth ~5 ms a
+# frame on the big membrane systems. Costs one frame of latency between an input
+# force and seeing its effect. See stepper.py. False = take turns.
+OVERLAP_SIM_AND_RENDER = True
+
+# Joystick button that grabs / releases the puller, the same action as the B key.
+# 1 is the trigger on the Sidewinder FF2.
+JOYSTICK_ATTACH_BUTTON = 1

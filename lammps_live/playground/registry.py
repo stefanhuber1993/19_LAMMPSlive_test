@@ -47,11 +47,21 @@ def _playground_of(module, fallback_key):
     return pg
 
 
+# The order the picker, the number keys and Tab walk through. Not alphabetical:
+# the three MesoMem playgrounds are the point of the demo and build on each other
+# (one patch -> a sheet of them -> a box that assembles itself), so they come
+# first and in that order. Anything not named here follows, alphabetically, so a
+# new playground file appears without editing this list.
+_ORDER = ("mesomem_patch", "mesomem_sheet", "mesomem_assembly")
+
+
 def bundled_keys():
-    """Names of the bundled playground modules, in alphabetical order."""
+    """Names of the bundled playground modules, in presentation order."""
     package = importlib.import_module(_PACKAGE)
-    return sorted(m.name for m in pkgutil.iter_modules(package.__path__)
-                  if not m.name.startswith("_"))
+    found = {m.name for m in pkgutil.iter_modules(package.__path__)
+             if not m.name.startswith("_")}
+    first = [k for k in _ORDER if k in found]
+    return first + sorted(found - set(first))
 
 
 def load(ref):
@@ -84,3 +94,16 @@ def build(ref, mode=None, preset=None):
     """Construct a running PlaygroundSystem."""
     from .system import PlaygroundSystem
     return PlaygroundSystem(load(ref), mode_name=mode, preset=preset)
+
+
+def resolve(ref):
+    """Validate what the user asked for, returning it, or exit with the
+    alternatives. A path is taken on trust -- it is a file the user wrote, and
+    `load` will report anything wrong with it far more usefully than a list of
+    bundled names would."""
+    if os.path.sep in ref or ref.endswith(".py"):
+        return ref
+    known = bundled_keys()
+    if ref in known:
+        return ref
+    raise SystemExit(f"unknown playground {ref!r}.\nAvailable: " + ", ".join(known))

@@ -15,7 +15,7 @@ from lammps_live.playground import registry
 from lammps_live.playground.verify import verify_system
 
 PLAYGROUNDS = ["mesomem_patch", "mesomem_sheet", "mesomem_assembly",
-               "lj_argon", "cu_deposition"]
+               "lj_argon", "cu_deposition", "nacl"]
 
 
 @pytest.fixture(scope="module")
