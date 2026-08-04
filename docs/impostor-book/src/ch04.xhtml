@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>4. Ray-casting the sphere</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 4</p>
+<h1 class="first">Ray-casting the sphere</h1>
+
+<p class="lead">Fifteen lines of fragment shader turn a flat quad into a sphere
+that is correct to the last pixel. This is the chapter where the illusion
+happens.</p>
+
+<h2>The setup</h2>
+
+<p>The fragment shader runs once for every pixel the quad covers &#8212; roughly
+1100 of them for a front-row bead, 200 for a back-row one. Each invocation knows
+three things, all handed over by chapter&#160;3:</p>
+
+<ul>
+<li><code>v_rayView</code>: this pixel's point on the quad, in view space. Since
+the eye is at the origin, normalising it gives the ray direction.</li>
+<li><code>v_centerView</code>: the sphere's centre, in view space.</li>
+<li><code>v_radius</code>: the sphere's radius.</li>
+</ul>
+
+<p>And it must answer: does this ray hit that sphere, and if so, where?</p>
+
+<h2>Ray&#8211;sphere intersection</h2>
+
+<p>Write the ray as <code>p(t) = t &#183; dir</code> with <code>dir</code> unit and
+<code>t &#8805; 0</code> the distance along it. A point is on the sphere when
+<code>|p &#8722; c| = r</code>. Square both sides to kill the square root:</p>
+
+<pre>|t&#183;dir &#8722; c|&#178; = r&#178;
+t&#178;(dir&#183;dir) &#8722; 2t(dir&#183;c) + (c&#183;c) = r&#178;</pre>
+
+<p>and since <code>dir</code> is unit, <code>dir&#183;dir = 1</code>, leaving a plain
+quadratic in <code>t</code> with <code>a = 1</code>:</p>
+
+<pre>t&#178; &#8722; 2(dir&#183;c)&#160;t + (c&#183;c &#8722; r&#178;) = 0</pre>
+
+<p>Write <code>b = dir&#183;c</code>. The quadratic formula, with the 2s already
+cancelled:</p>
+
+<pre>t = b &#177; &#8730;(b&#178; &#8722; (c&#183;c &#8722; r&#178;))</pre>
+
+<p>which is exactly the shader:</p>
+
+<pre>vec3 dir = normalize(v_rayView);
+vec3 c = v_centerView;
+float b = dot(dir, c);
+float disc = b * b - (dot(c, c) - v_radius * v_radius);
+if (disc &lt; 0.0) discard;                  // ray misses the sphere
+float t = b - sqrt(disc);                 // near intersection
+if (t &lt; 0.0) discard;
+vec3 hit = dir * t;</pre>
+
+<figure>
+  <img src="images/fig-raysphere.png" alt="A ray from the eye passing through a sphere, marked with the closest-approach point b, the near root, the far root, and the outward normal at the near root."/>
+  <figcaption><strong>Figure 4.1</strong> &#8212; <code>b</code> is where the ray comes
+  closest to the centre; <code>&#8730;disc</code> is how far either side of that the
+  sphere reaches.</figcaption>
+</figure>
+
+<h3>Reading the three quantities geometrically</h3>
+
+<dl>
+<dt><code>b = dot(dir, c)</code></dt>
+<dd>How far along the ray you have to travel to be level with the centre &#8212; the
+point of closest approach. It is the projection of <code>c</code> onto the ray.</dd>
+
+<dt><code>disc = b&#178; &#8722; (c&#183;c &#8722; r&#178;)</code></dt>
+<dd>Rearrange: <code>disc = r&#178; &#8722; (c&#183;c &#8722; b&#178;)</code>, and by Pythagoras
+<code>c&#183;c &#8722; b&#178;</code> is the squared perpendicular distance from the centre to the
+ray &#8212; the <em>impact parameter</em> squared. So <code>disc = r&#178; &#8722; impact&#178;</code>:
+positive when the ray passes closer than <code>r</code>, negative when it misses.
+<code>&#8730;disc</code> is the half-chord length.</dd>
+
+<dt><code>t = b &#8722; &#8730;disc</code></dt>
+<dd>Back up from the closest approach by half a chord to reach the <em>front</em>
+of the sphere. The other root, <code>b + &#8730;disc</code>, is where the ray exits out
+the back &#8212; correct, invisible, discarded.</dd>
+</dl>
+
+<h3>Three worked rays</h3>
+
+<p>A bead centred at view <code>(0, 0, &#8722;12)</code>, radius 0.5. Rays aimed at
+lateral offsets 0, 0.4 and 0.49&#160;&#963; at that depth:</p>
+
+<table>
+<tr><th>offset</th><th class="num"><code>b</code></th><th class="num"><code>disc</code></th><th class="num"><code>t</code></th><th class="num"><code>N.z</code></th><th>where on the bead</th></tr>
+<tr><td>0.00</td><td class="num">12.000</td><td class="num">0.2500</td><td class="num">11.500</td><td class="num">1.000</td><td>dead centre, facing you</td></tr>
+<tr><td>0.40</td><td class="num">11.993</td><td class="num">0.0902</td><td class="num">11.693</td><td class="num">0.627</td><td>51&#176; round the curve</td></tr>
+<tr><td>0.49</td><td class="num">11.990</td><td class="num">0.0103</td><td class="num">11.889</td><td class="num">0.243</td><td>near the silhouette</td></tr>
+<tr><td>0.51</td><td class="num">&#8212;</td><td class="num">&#8722;0.010</td><td class="num">&#8212;</td><td class="num">&#8212;</td><td><code>discard</code></td></tr>
+</table>
+
+<p>Two things to notice. First, the hit distance ranges over 11.5 to 11.89 &#8212; a
+0.39&#160;&#963; spread, most of it in the last sliver near the rim. That variation is
+the sphere's <em>bulge</em>, and it is what will let one bead correctly poke
+through another. Second, <code>disc</code> collapses to zero at the silhouette,
+which means <code>&#8730;disc</code> has infinite slope there. The edge is
+mathematically sharp &#8212; and stays sharp in the output, which is chapter&#160;11's
+problem.</p>
+
+<h2><code>discard</code>, and what it really does</h2>
+
+<p><code>discard</code> aborts the fragment. No colour is written, no depth is
+written, and &#8212; crucially &#8212; whatever was already in the framebuffer at that
+pixel is untouched. This is what makes the quad invisible: 27% of its area, plus
+everything outside the circle, simply never happened.</p>
+
+<p>It is also brutally all-or-nothing. There is no "35% covered" &#8212; you cannot
+partially discard. Which is why every silhouette in this renderer is a hard
+staircase.</p>
+
+<h2>Writing the depth by hand</h2>
+
+<p>Here is the subtle bit that makes impostors actually work rather than merely
+look right in isolation.</p>
+
+<p>The hardware, left alone, assigns each fragment the depth interpolated from
+the triangle's vertices. Our triangle is a <em>flat quad</em>, so every pixel of
+a bead would get roughly the same depth &#8212; the depth of the quad plane. Two
+beads whose quads overlap would then resolve by which quad is nearer, all-or-
+nothing, and you would get the exact pathology the module docstring describes:
+beads "jump" in front of and behind each other instead of intersecting.</p>
+
+<p>So compute the real depth, from the real hit point:</p>
+
+<pre>vec4 clip = proj * vec4(hit, 1.0);
+gl_FragDepth = 0.5 * (clip.z / clip.w) + 0.5;</pre>
+
+<p>Project the hit point through the same matrix, do the perspective divide by
+hand, and remap &#8722;1..+1 to 0..1. Chapter&#160;2 worked exactly this arithmetic out:
+a hit at 11.5&#160;&#963; in this frame's frustum lands at
+<code>gl_FragDepth = 0.187</code>; a hit at 11.89 lands at 0.204. The hardware
+depth test now compares two genuine sphere surfaces, and two overlapping beads
+intersect along a real circle &#8212; for free, with no sorting, in any order you feel
+like drawing them.</p>
+
+<blockquote class="aside">
+<p><strong>The price: early-z dies.</strong> Normally a GPU knows a fragment's
+depth before running the fragment shader, so it can test and reject occluded
+fragments <em>without shading them</em>. That is "early depth test", and it is a
+large win in a scene where beads overlap heavily. The moment a shader writes
+<code>gl_FragDepth</code>, the hardware can no longer know the depth in advance,
+so every fragment must be fully shaded before it can be rejected. You pay this
+on every impostor renderer ever written. It also has a knock-on effect in
+chapter&#160;11: it is one of the reasons MSAA is off the table.</p>
+</blockquote>
+
+<h2>The normal, and everything downstream</h2>
+
+<pre>vec3 N = normalize(hit - c);</pre>
+
+<p>The outward normal of a sphere at a point is the direction from the centre to
+that point. Since <code>|hit &#8722; c| = r</code> exactly, you could divide by
+<code>r</code> instead of normalising and save a square root; the code takes the
+robust option.</p>
+
+<p>This <code>N</code> is the single most valuable thing the whole geometry pass
+produces. Chapter&#160;9 uses <code>dot(N, L)</code> for diffuse light,
+<code>dot(N, H)</code> for the specular highlight, <code>dot(N, V)</code> for the
+fresnel rim, and <code>N.z</code> alone for a free curvature-occlusion term.
+Chapter&#160;7 builds an entire hemisphere basis out of it.</p>
+
+<h2>Colouring the bead</h2>
+
+<p>MesoMem beads are not plain spheres &#8212; they have an <strong>orientation</strong>
+(the director <code>n</code>, the model's whole point), and the renderer paints
+that orientation onto the surface. The key is one dot product:</p>
+
+<pre>float s = dot(N, normalize(v_dirView));   // signed cos-latitude</pre>
+
+<p><code>s = +1</code> at the pole the director points toward, <code>0</code> all
+around the equator, <code>&#8722;1</code> at the opposite pole. It is a latitude
+coordinate, computed with one instruction.</p>
+
+<pre>float cosl = abs(s);
+float tt = clamp((cosl - (band_half - band_soft)) / (2.0 * band_soft), 0.0, 1.0);
+albedo = mix(equator_col, pole_col, tt);</pre>
+
+<p>With <code>band_half = 0.30</code> and <code>band_soft = 0.07</code>, the
+transition runs from <code>cosl = 0.23</code> to <code>cosl = 0.37</code>. In
+degrees: yellow out to 13&#176; either side of the equator, fully blue past 22&#176;.
+That yellow band is the hydrophobic waist of the model lipid, and the blue caps
+are its hydrophilic ends &#8212; the physics is literally painted on.</p>
+
+<p>Then a white cap over the <code>+n</code> pole:</p>
+
+<pre>float w = smoothstep(white_min - white_soft, white_min + white_soft, s);
+albedo = mix(albedo, white_col, w);</pre>
+
+<p><code>white_min = 0.954</code> is <code>cos(17.4&#176;)</code>, so it is the top 17&#176;
+of the bead. Note it keys off <code>s</code>, not <code>abs(s)</code> &#8212; which is
+the whole point: the yellow/blue banding is symmetric and cannot tell you which
+end is which, and this cap can. It survives into the energy colouring too, so
+switching to the inferno ramp costs you the energy scale but never the sense of
+the director.</p>
+
+<h3>The energy ramp</h3>
+
+<pre>float t = clamp((v_energy - energyRange.x)
+                / max(energyRange.y - energyRange.x, 1e-6), 0.0, 1.0);
+float f = t * 31.0;
+int i = int(floor(f));
+albedo = mix(ramp[i], ramp[min(i + 1, 31)], f - float(i));</pre>
+
+<p>A hand-rolled 32-entry lookup with linear interpolation between neighbours &#8212;
+a <code>numpy</code> programmer will recognise <code>np.interp</code>. It is done
+in a uniform array rather than a 1D texture because 32 entries is small, it
+avoids a sampler binding, and the interpolation is explicit.</p>
+
+<p>Notice the deliberate design decision recorded in the comment: this colour is
+<em>flat</em> across the bead, unlike the banding. The energy belongs to the whole
+particle, and shading it as a gradient would invite reading structure into a
+sphere that has none. That is a data-visualisation judgement expressed in three
+lines of shader.</p>
+
+<h2>The alpha channel, and the periodic clip</h2>
+
+<pre>o_albedo = vec4(albedo * v_bright, v_fade);
+o_normal = N;
+o_viewpos = vec4(hit, 1.0);</pre>
+
+<p>Three outputs from one invocation &#8212; that is the G-buffer, and chapter&#160;5
+is about why. The alpha slot of the albedo would otherwise be wasted, so it
+carries <code>v_fade</code>, a per-bead strength that chapter&#160;13's periodic
+images use to trail off into the background.</p>
+
+<p>One more piece, for periodic scenes:</p>
+
+<pre>if (clipEnable &gt; 0.5) {
+    vec3 wp = (viewInv * vec4(hit, 1.0)).xyz;
+    float dEdge = min(boxHalf.x - abs(wp.x), boxHalf.y - abs(wp.y));
+    if (dEdge &lt; 0.0) discard;             // outside the periodic cell -&gt; gone
+}</pre>
+
+<p>Transform the hit point back to world space and throw it away if it is outside
+the box. Note that this is a <em>per-pixel</em> clip, not a per-bead one: a bead
+straddling the boundary gets sliced exactly at the face, and its wrapped ghost on
+the opposite side gets the complementary slice, so the two halves add up to one
+whole bead. Any coarser test would make beads pop in and out at the seam.</p>
+
+<p>And the <code>discard</code> matters for a reason worth internalising: a
+discarded fragment writes no depth, so it cannot falsely occlude something
+genuinely behind it. Had the shader instead drawn those pixels in the background
+colour, it would have punched a bead-shaped hole through everything behind
+them.</p>
+
+</body>
+</html>

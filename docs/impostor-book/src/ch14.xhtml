@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>14. The cost model</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 14</p>
+<h1 class="first">The cost model</h1>
+
+<p class="lead">"1500 beads post-process for the same price as 7." That claim is
+true, and it is worth checking rather than believing, because where it stops being
+true is where you should look when the frame rate drops.</p>
+
+<figure>
+  <img src="images/fig-pipeline.png" alt="Seven stacked pass boxes with an arrow beside them showing that only the first scales with bead count and the rest scale with pixels."/>
+  <figcaption><strong>Figure 14.1</strong> &#8212; One pass depends on the scene. Six
+  depend only on the viewport.</figcaption>
+</figure>
+
+<h2>Counting the work</h2>
+
+<p>The viewport is 738,000 pixels; the half-resolution passes see 184,500. Here is
+roughly what each full-screen pass costs per pixel, counted from the shader
+source. Texture fetches dominate, so that is what is counted.</p>
+
+<table>
+<tr><th>pass</th><th class="num">pixels</th><th class="num">fetches/px</th><th class="num">total fetches</th></tr>
+<tr><td>2. occlusion</td><td class="num">184,500</td><td class="num">2 + 8 + 16</td><td class="num">4.8 M</td></tr>
+<tr><td>3. blur</td><td class="num">184,500</td><td class="num">32</td><td class="num">5.9 M</td></tr>
+<tr><td>4. composite</td><td class="num">738,000</td><td class="num">8</td><td class="num">5.9 M</td></tr>
+<tr><td>5. depth of field</td><td class="num">738,000</td><td class="num">up to 49</td><td class="num">&#8804; 36 M</td></tr>
+<tr><td>7. FXAA</td><td class="num">738,000</td><td class="num">5 &#8211; 9</td><td class="num">&#8776; 4.4 M</td></tr>
+</table>
+
+<p>Two things jump out. <strong>Depth of field is by far the most expensive
+pass</strong> &#8212; 24 taps, each reading two textures, and it is at full resolution.
+Its early-outs are therefore load-bearing, and its worst case (a scene almost
+entirely out of focus) is several times its typical case. If you ever need frame
+time back, that is the first place to look: run it at half resolution like the
+occlusion pass, or cut the taps to 12.</p>
+
+<p>Second, none of these numbers contain a bead count. That is the claim, and it
+holds exactly.</p>
+
+<blockquote class="aside">
+<p>These are counts from reading the source, not measurements. Fetch counts are a
+decent proxy for the cost of a bandwidth-bound post-processing chain, but cache
+behaviour, warp divergence and the tiler on Apple Silicon all matter and none of
+them are visible from the source. Measure before you optimise; the point of the
+table is to tell you <em>where to point the profiler</em>.</p>
+</blockquote>
+
+<h2>Where the bead count actually shows up</h2>
+
+<p>Pass&#160;1 is the only one that scales with the scene, and it does so in three
+places.</p>
+
+<h3>CPU: building the instance array</h3>
+
+<p>For the tiled sheet, <code>_periodic_image_instances</code> builds 19,966 rows
+&#215; 10 floats and writes 799&#160;kB to the GPU. All vectorised numpy, so it is a
+handful of milliseconds at most &#8212; but it <em>is</em> per frame, and it is
+Python. If you ever push to hundreds of thousands of instances, this is where the
+first wall is, and the fix is to keep the copies on the GPU (draw the base cell
+several times with an offset uniform) rather than materialising them in
+numpy.</p>
+
+<h3>Vertex shading</h3>
+
+<p>4 vertices &#215; 19,966 instances = 79,864 vertex invocations, each doing about
+twenty floating-point operations. This is free. It was free at 900 beads and it is
+free at 20,000.</p>
+
+<h3>Fragment shading &#8212; the real cost</h3>
+
+<p>Here is where it bites, and it traces straight back to chapter&#160;4.</p>
+
+<p>Each bead's quad covers roughly <code>(4/&#960;) &#183; &#960;r&#178; = 4r&#178;</code> pixels, where
+<code>r</code> is its on-screen radius. In the tiled sheet most copies are far
+away and small &#8212; call it 8&#160;px average radius, so 256 fragments per instance,
+times 19,966 instances &#8776; <strong>5 million fragments</strong> on a 738,000-pixel
+screen. That is about 7&#215; overdraw.</p>
+
+<p>Normally a GPU would reject most of that with early-z: the front rows are drawn
+somewhere in the batch, and later fragments behind them would be killed before
+shading. But the impostor writes <code>gl_FragDepth</code>, so the hardware cannot
+know a fragment's depth until the shader has run. <strong>Every one of those 5
+million fragments executes the full ray-sphere test, the banding, and the periodic
+clip &#8212; and then most of them are thrown away.</strong></p>
+
+<p>That is the true price of the impostor technique, and it is worth stating
+plainly because it is invisible in the source. It is still an enormous win over a
+mesh, which would have had the same overdraw <em>plus</em> a million triangles to
+set up. But it is where the tiled sheet spends its time, and it explains why the
+7-bead patch and the 20,000-instance sheet do not, in fact, cost the same &#8212; the
+<em>post-processing</em> costs the same, which is the claim actually made.</p>
+
+<h2>Two numbers to keep in mind</h2>
+
+<p><strong>The crossover.</strong> The post-processing chain does roughly 50
+million texture fetches per frame regardless. The geometry pass does roughly 5
+million fragment shader invocations for the tiled sheet, each substantially more
+expensive than a fetch. So the two are within a small factor of each other at
+about twenty thousand instances &#8212; which is a satisfying place to be, because it
+means neither half is obviously wasted. Below that, post-processing dominates and
+extra beads are nearly free. Above it, every additional bead costs.</p>
+
+<p><strong>The memory.</strong> 38&#160;MB of framebuffers, fixed, plus under a
+megabyte of instance data. The framebuffers scale with the <em>viewport</em>, so
+going fullscreen at 2560&#215;1440 roughly quadruples them to 150&#160;MB &#8212; and
+quadruples every per-pixel cost in the table above. Fullscreen is the expensive
+mode, not the big scene.</p>
+
+<h2>The design principle, stated once</h2>
+
+<p>What makes all of this work is a single architectural decision made in
+chapter&#160;5: <strong>convert the scene into a screen-sized data structure as early
+as possible, then never look at the scene again.</strong></p>
+
+<p>Every effect after that point is a function of the image, so its cost is a
+function of the image. The scene's complexity is absorbed once, in pass&#160;1, and
+everything downstream is insulated from it. That is why adding ambient occlusion,
+contact shadows, outlines, depth cueing, depth of field and antialiasing to this
+renderer cost six full-screen passes rather than six traversals of the bead
+list.</p>
+
+<p>The same principle is why a deferred renderer's costs are so predictable, and
+why its limitations (chapter&#160;6: no off-screen occluders, no hidden occluders,
+guessed thicknesses) are exactly the things that <em>are not in the image</em>.
+The architecture buys you speed by forgetting, and what it forgets is what it
+cannot then do.</p>
+
+</body>
+</html>

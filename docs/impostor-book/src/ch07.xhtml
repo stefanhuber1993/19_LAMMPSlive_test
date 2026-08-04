@@ -1,0 +1,262 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>7. Occlusion: ambient and the sun</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 7</p>
+<h1 class="first">Occlusion: ambient and the sun</h1>
+
+<p class="lead">Two questions, one pass, half resolution. "How much of the sky can
+this point see?" and "can it see the sun?" &#8212; both answered by poking around in
+the depth buffer.</p>
+
+<h2>What ambient occlusion is for</h2>
+
+<p>Chapter&#160;9's lighting has an ambient term: a constant blue-grey fill,
+<code>sky_ambient = (0.30, 0.38, 0.52)</code>, standing in for light arriving from
+the whole sky rather than from the sun. Applied uniformly, it is a lie. A point
+deep in a crevice between three touching beads cannot see much sky &#8212; the beads
+are in the way &#8212; so it should receive far less of that fill than a point on an
+exposed cap.</p>
+
+<p>Ambient occlusion is a scalar per pixel, 0 to 1, meaning "what fraction of the
+hemisphere above this surface is open?" Multiply the ambient term by it and
+crevices darken. In a dense bead cloud this is not decoration: it is most of what
+tells you which beads are touching and which merely overlap on screen.</p>
+
+<p>Computing it properly means integrating visibility over a hemisphere, which
+means ray-tracing the scene. <strong>Screen-space</strong> ambient occlusion does it
+with about eight texture lookups instead, by asking the G-buffer.</p>
+
+<h2>The algorithm, step by step</h2>
+
+<figure>
+  <img src="images/fig-ssao.png" alt="A surface profile with a point P, its normal, a dashed hemisphere of sample points, some inside the solid material and some in open air."/>
+  <figcaption><strong>Figure 7.1</strong> &#8212; Scatter points over the hemisphere
+  above <code>P</code>; for each, ask the G-buffer whether the visible surface at
+  that screen position is nearer than the sample. Nearer means the sample is
+  buried.</figcaption>
+</figure>
+
+<h3>1. Get the surface</h3>
+
+<pre>vec3 P = texture(posTex, uv).xyz;
+if (P.z &gt;= -1e-4) { frag = vec2(1.0); return; }              // background
+vec3 N = normalize(texture(normalTex, uv).xyz);</pre>
+
+<p>Sky is fully open and fully lit: <code>(1, 1)</code>, and out. This early-out
+matters &#8212; on a typical sheet frame more than half the screen is background.</p>
+
+<h3>2. Build a tangent frame</h3>
+
+<pre>float rot = hash12(gl_FragCoord.xy);
+vec3 rv = normalize(vec3(cos(rot * 6.283), sin(rot * 6.283), 0.0));
+vec3 T = normalize(rv - N * dot(rv, N));
+vec3 B = cross(N, T);
+mat3 TBN = mat3(T, B, N);</pre>
+
+<p>The samples must land in the hemisphere <em>above</em> the surface, never inside
+it, so they need a coordinate frame whose z axis is <code>N</code>. Line three is
+Gram&#8211;Schmidt: take an arbitrary vector <code>rv</code>, subtract off its
+component along <code>N</code> (<code>N * dot(rv, N)</code> is that component), and
+what remains is perpendicular to <code>N</code>. Normalise, take a cross product
+for the third axis, and <code>mat3(T, B, N)</code> is a rotation matrix that maps
+"up" in sample space to <code>N</code> in view space.</p>
+
+<p>The arbitrary vector is chosen by the per-pixel hash, so neighbouring pixels
+sample <em>rotated</em> versions of the same pattern. That is the noise-instead-of-
+pattern principle from chapter&#160;6, and without it eight samples produce eight
+visible bands.</p>
+
+<h3>3. Distribute the samples</h3>
+
+<pre>vec2 xi = fract(vec2(float(i) * 0.7548776662,
+                     float(i) * 0.5698402909) + rot);
+float r = sqrt(xi.x);                        // cosine-weighted hemisphere
+float phi = 6.2831853 * xi.y;
+vec3 h = vec3(r * cos(phi), r * sin(phi), sqrt(max(1.0 - xi.x, 0.0)));</pre>
+
+<p>Check that <code>h</code> is a unit vector: its length squared is
+<code>r&#178; + (1 &#8722; xi.x) = xi.x + 1 &#8722; xi.x = 1</code>. So the samples sit on the
+unit hemisphere <em>shell</em>, all at the same distance from <code>P</code>, spread
+over directions.</p>
+
+<p>The distribution is <strong>cosine-weighted</strong>: because <code>xi.x</code> is
+uniform and <code>h.z = &#8730;(1 &#8722; xi.x)</code>, the density of directions is
+proportional to <code>cos&#952;</code> from the normal. That is Malley's method, and it
+is the right weighting because the ambient light a surface receives from a
+direction is itself weighted by <code>cos&#952;</code> &#8212; a grazing ray delivers less
+energy per unit area. Sampling in proportion to the weight means every sample
+contributes equally, so you need no per-sample weight in the sum.</p>
+
+<h3>4. Project and compare</h3>
+
+<pre>vec3 sp = P + TBN * h * radius;
+vec2 suv = view_to_uv(sp);
+if (suv.x &lt; 0.0 || suv.x &gt; 1.0 || suv.y &lt; 0.0 || suv.y &gt; 1.0) continue;
+float sz = texture(posTex, suv).z;
+if (sz &gt;= -1e-4) continue;                   // background: occludes nothing
+float sd = -sz, sampleDist = -sp.z;
+if (sd &lt; sampleDist - bias)
+    occ += smoothstep(0.0, 1.0, radius / max(abs(sampleDist - sd), 1e-4));</pre>
+
+<p>This is the heart of it, and it is only three ideas:</p>
+
+<ol>
+<li><strong>Where would this 3D sample appear on screen?</strong>
+<code>view_to_uv</code>, chapter&#160;6.</li>
+<li><strong>What is the nearest surface there?</strong> One texture lookup.</li>
+<li><strong>Is that surface nearer than my sample?</strong> If yes, my sample is
+<em>inside</em> something &#8212; buried &#8212; so that direction is blocked.</li>
+</ol>
+
+<p>The <code>bias</code> (<code>0.08 &#215; r = 0.04&#160;&#963;</code>) stops a sample sitting a
+hair above a curved surface from being judged buried by its own bead &#8212; the
+classic self-occlusion acne. The <code>smoothstep</code> is the range check: the
+weight is 1 while the occluder is within <code>radius</code> of the sample and
+falls off beyond, so a bead six &#963; in front of this crevice does not darken it. Drop
+that term and every silhouette in the image grows a dark halo, because the
+background just behind a bead's edge would be "occluded" by the bead.</p>
+
+<h3>5. Average</h3>
+
+<pre>frag.x = clamp(1.0 - occ / float(nSamples), 0.0, 1.0);</pre>
+
+<p>Fraction blocked &#8594; fraction open. Note this raw value is <em>not</em> the number
+used for shading; chapter&#160;9 raises it to the power <code>ao_strength = 5.83</code>
+first, which pins fully-open surfaces at 1.0 and bends only the partly occluded
+ones down.</p>
+
+<h3>The scales, in real units</h3>
+
+<p><code>ao_radius_r = 2.0</code> means the hemisphere has radius
+<code>2 &#215; 0.5 = 1.0&#160;&#963;</code> &#8212; two bead radii, so it reaches a neighbouring
+bead's surface and no further. At <code>d = 12&#160;&#963;</code> that projects to
+<code>1.0 &#215; 444.4 / 12 = 37&#160;pixels</code> on screen, or 18.5 at the half
+resolution the pass runs at. So each pixel is scattering eight lookups over an
+18-pixel neighbourhood. Far enough to find the crevice, close enough that the
+lookups stay in cache.</p>
+
+<p>The <code>_r</code> suffix convention in <code>RenderStyle</code> is doing real
+work here: quoting the radius in bead radii is what lets the same style file drive
+a 0.5&#160;&#963; MesoMem bead and a 1.0&#160;&#197; ion without retuning.</p>
+
+<h2>Contact shadows, in the same pass</h2>
+
+<p>The second half of the shader answers a different question with the same
+machinery: can this point see the sun?</p>
+
+<figure>
+  <img src="images/fig-march.png" alt="A point P on one sphere, with sixteen sample points marching toward the sun at quadratically increasing spacing, several landing inside a second sphere."/>
+  <figcaption><strong>Figure 7.2</strong> &#8212; Sixteen steps toward the light, spaced
+  quadratically. A filled dot is a step that landed inside stored
+  geometry.</figcaption>
+</figure>
+
+<pre>float sun_visibility(vec3 P, vec3 N, vec3 L) {
+    if (shadowOn &lt; 0.5 || dot(N, L) &lt;= 0.0) return 1.0;
+    const int STEPS = 16;
+    vec3 origin = P + N * shadowBias;
+    float jit = hash12(gl_FragCoord.xy);
+    for (int i = 0; i &lt; STEPS; ++i) {
+        float f = (float(i) + jit) / float(STEPS);
+        vec3 sp = origin + L * (shadowLen * f * f);
+        ...
+        if (dz &gt; shadowBias &amp;&amp; dz &lt; shadowThick) return 0.0;
+    }
+    return 1.0;
+}</pre>
+
+<p>Walk from the surface toward the sun in sixteen steps. At each step, ask the
+G-buffer what the nearest surface at that screen position is. If it is in front
+of the step, something is standing between this point and the sun.</p>
+
+<h3>Four details, each earning its place</h3>
+
+<p><strong><code>dot(N, L) &lt;= 0</code> returns early.</strong> A surface facing away
+from the sun gets no diffuse light anyway (<code>max(dot(N,L), 0)</code> in
+chapter&#160;9 is zero there), so marching would be sixteen lookups spent on a
+number that gets multiplied by zero. This one line skips roughly half the lit
+pixels.</p>
+
+<p><strong>Start along the normal, not along the light.</strong></p>
+
+<pre>// Start along the NORMAL, not along the light: near a silhouette the light
+// can graze back across this very bead and the ray then reports the surface
+// shadowing itself (classic acne).</pre>
+
+<p>Offsetting along <code>L</code> keeps you on the surface when the light grazes
+it, and the first step promptly finds "an occluder" &#8212; the bead you are standing
+on. Offsetting along <code>N</code> lifts you clear of the surface regardless of
+the light angle. The lift is <code>0.08 &#215; 0.5 = 0.04&#160;&#963;</code>.</p>
+
+<p><strong>Quadratic step spacing.</strong> This is the nicest idea in the
+function. With <code>shadowLen = 5.5 &#215; 0.5 = 2.75&#160;&#963;</code>:</p>
+
+<table>
+<tr><th>step</th><th class="num">f</th><th class="num">distance (&#963;)</th><th class="num">gap from previous</th></tr>
+<tr><td>0</td><td class="num">0.031</td><td class="num">0.003</td><td class="num">&#8212;</td></tr>
+<tr><td>1</td><td class="num">0.094</td><td class="num">0.024</td><td class="num">0.022</td></tr>
+<tr><td>3</td><td class="num">0.219</td><td class="num">0.132</td><td class="num">0.054</td></tr>
+<tr><td>7</td><td class="num">0.469</td><td class="num">0.604</td><td class="num">0.129</td></tr>
+<tr><td>15</td><td class="num">0.969</td><td class="num">2.581</td><td class="num">0.344</td></tr>
+</table>
+
+<p>Compare a linear march: 16 equal steps over 2.75&#160;&#963; is 0.172&#160;&#963; each, which is
+a third of a bead radius &#8212; so the very contact you are trying to render, the
+dark seam where two beads touch, falls entirely between the first two steps and
+is missed. The quadratic spacing puts five steps inside the first tenth of a
+radius and still reaches five radii out. Same sixteen lookups, precision exactly
+where the eye is looking.</p>
+
+<p><strong>The thickness guess.</strong></p>
+
+<pre>if (dz &gt; shadowBias &amp;&amp; dz &lt; shadowThick) return 0.0;</pre>
+
+<p><code>dz</code> is how far in <em>front</em> of the step the stored surface sits.
+Positive means something is in the way. But the depth buffer only records a
+front surface; it has no idea how deep that object goes. If you accepted any
+positive <code>dz</code>, a bead in the far background would be shadowed by a bead
+in the foreground twenty &#963; nearer, which is nonsense &#8212; the ray passes well
+behind it. So the renderer assumes occluders are <code>shadow_thick_r = 2.6</code>
+bead radii thick (1.3&#160;&#963;) and ignores anything further in front than that. It is
+a guess. It is the guess every screen-space shadow implementation has to make.</p>
+
+<h2>Why both live in one half-resolution pass</h2>
+
+<pre>aw, ah = max(1, width // 2), max(1, height // 2)
+self.ao_tex = c.texture((aw, ah), 2, dtype="f2")</pre>
+
+<p>410&#215;450 = 184,500&#160;pixels instead of 738,000: a quarter of the work for both
+terms. That is legitimate because both are broad, low-frequency signals &#8212;
+neither ambient occlusion nor a soft contact shadow has detail at the pixel
+level &#8212; and both get blurred immediately afterwards anyway.</p>
+
+<p>Two channels of one texture, not two textures: one framebuffer, one draw, one
+blur downstream. And they share the expensive parts &#8212; the background test, the
+normal fetch, the <code>hash12</code>. Bundling them is free.</p>
+
+<p>The comment adds the reason that actually forced the design:</p>
+
+<blockquote class="aside">
+<p>"it rides in this pass, at half resolution, so that the AO blur downstream
+smooths BOTH terms. That matters more here than for the AO: the march below is a
+binary hit, jittered per pixel, so on its own it comes out as dithered noise along
+every shadow edge, and blurring is what turns that noise back into a soft
+penumbra."</p>
+</blockquote>
+
+<p>Follow that through, because it is a genuinely elegant piece of engineering.
+<code>sun_visibility</code> returns 0 or 1 &#8212; there is no soft shadow anywhere in
+it. The softness comes entirely from the jitter making <em>neighbouring pixels
+disagree</em>, and the blur then averaging their disagreement. Nine of sixteen
+neighbours in shadow becomes 0.56. A penumbra, synthesised out of a binary test
+and a box filter.</p>
+
+</body>
+</html>

@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>6. The screen-space trick</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 6</p>
+<h1 class="first">The screen-space trick</h1>
+
+<p class="lead">Once the G-buffer exists, the screen is a database of the scene:
+738,000 rows, four columns, indexed by pixel. Every effect in the rest of the
+book is a query against it.</p>
+
+<h2>The full-screen triangle</h2>
+
+<p>Every pass from here on draws exactly one triangle covering the whole screen,
+so that the fragment shader runs once per pixel. The vertex shader is a small
+piece of showing off:</p>
+
+<pre>void main() {
+    vec2 p = vec2((gl_VertexID &lt;&lt; 1) &amp; 2, gl_VertexID &amp; 2);
+    uv = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}</pre>
+
+<p>There is no vertex buffer at all. <code>gl_VertexID</code> is a built-in
+counter &#8212; 0, 1, 2 &#8212; and the bit arithmetic turns it into corners:</p>
+
+<table>
+<tr><th><code>gl_VertexID</code></th><th class="num"><code>(id&lt;&lt;1)&amp;2</code></th><th class="num"><code>id&amp;2</code></th><th><code>uv</code></th><th><code>gl_Position.xy</code></th></tr>
+<tr><td>0</td><td class="num">0</td><td class="num">0</td><td>(0, 0)</td><td>(&#8722;1, &#8722;1)</td></tr>
+<tr><td>1</td><td class="num">2</td><td class="num">0</td><td>(2, 0)</td><td>(&#160;3, &#8722;1)</td></tr>
+<tr><td>2</td><td class="num">0</td><td class="num">2</td><td>(0, 2)</td><td>(&#8722;1, &#160;3)</td></tr>
+</table>
+
+<p>A giant right triangle with corners at (&#8722;1,&#8722;1), (3,&#8722;1) and (&#8722;1,3). Only the
+lower-left quarter is on screen, and that quarter is exactly the whole viewport.
+The <code>uv</code> varying runs 0..1 across the visible part for free, because
+the corners were chosen so that <code>uv</code> and clip position stay in
+lockstep.</p>
+
+<p>Why a triangle rather than two triangles forming a quad? GPUs shade in 2&#215;2
+pixel blocks, and along a shared diagonal the blocks straddling it get shaded
+<em>twice</em> &#8212; once for each triangle. That is a few percent of wasted work on
+every full-screen pass, and there are six of them here. A single triangle has no
+interior seam. It also needs no vertex buffer, which is why
+<code>_build_static_buffers</code> can create the VAOs with an empty attribute
+list:</p>
+
+<pre>self._fs_vaos = {p: c.vertex_array(p, []) for p in (...)}</pre>
+
+<h2>The one function everything is built on</h2>
+
+<p>The G-buffer is indexed by <em>screen position</em>. But the questions the
+effects want to ask are about <em>3D space</em>: "is there anything at this point
+half a bead-radius above the surface?" So you constantly need to go from a
+view-space point to the texture coordinate where the G-buffer stores what is
+there. That is <code>view_to_uv</code>:</p>
+
+<pre>uniform vec2 projScale;
+
+vec2 view_to_uv(vec3 p) {
+    vec2 ndc = projScale * p.xy / max(-p.z, 1e-6);
+    return ndc * 0.5 + 0.5;
+}</pre>
+
+<p>It is chapter&#160;2's projection with everything unnecessary removed.
+<code>projScale</code> is <code>(P[0][0], P[1][1])</code> &#8212; the <code>fx</code> and
+<code>fy</code> from the projection matrix, uploaded per frame:</p>
+
+<pre>proj_scale = (float(proj[0, 0]), float(proj[1, 1]))
+self.ssao_prog["projScale"].value = proj_scale</pre>
+
+<p>No matrix multiply, no <code>w</code>: two multiplies, one divide, one
+multiply-add. Worked example, the bead from chapter&#160;2 at view
+<code>(2, 0, &#8722;12)</code>:</p>
+
+<pre>ndc = (1.0839 &#215; 2 / 12, 0.9876 &#215; 0 / 12) = (0.18065, 0)
+uv  = (0.5903, 0.5)
+     &#8594; pixel (484.1, 450.0), which is where chapter 2 said it lands.</pre>
+
+<p>The <code>max(-p.z, 1e-6)</code> is not paranoia: sample points can land behind
+the eye, and the division would blow up or flip sign. Clamping puts them
+harmlessly far off-screen, where the bounds check that always follows a
+<code>view_to_uv</code> call rejects them.</p>
+
+<blockquote class="aside">
+<p><strong>The assumption baked in.</strong> The comment says it: "Assumes a
+SYMMETRIC frustum, which <code>proj_matrix</code> above always builds." A
+symmetric frustum has zeros in <code>P[0][2]</code> and <code>P[1][2]</code>, so
+those terms can be dropped. If you ever add a lens shift or an off-centre
+frustum &#8212; VR does, tiled rendering does &#8212; this two-line function silently
+gives wrong answers everywhere, and the symptom would be occlusion sliding
+sideways as you look around.</p>
+</blockquote>
+
+<h2>What screen space can and cannot know</h2>
+
+<p>This is the honest limitation, and it is worth stating plainly because it
+governs everything in chapters 7&#8211;11.</p>
+
+<p>The G-buffer holds the <em>nearest</em> surface at each pixel. Everything
+behind that surface is gone. So a screen-space effect can answer "what is the
+nearest thing along this pixel's line of sight?" and nothing else. In
+particular:</p>
+
+<ul>
+<li>An occluder hidden <em>behind</em> another object cannot cast a shadow or
+occlude anything &#8212; the buffer has no record of it.</li>
+<li>An occluder <em>off the edge of the frame</em> cannot either. Pan the camera
+and shadows near the border change.</li>
+<li>How <em>thick</em> an occluder is has to be guessed, since only its front
+surface is stored. Chapter&#160;7's <code>shadowThick</code> is exactly that
+guess.</li>
+</ul>
+
+<p>The code comment gets the trade-off exactly right: "That costs missing
+shadows, not ugly ones, which is the right way round." A screen-space effect
+fails by omission &#8212; something that should have been dark is merely lit &#8212; and
+an omission reads as a slightly flatter picture, not as a bug. Compare the
+failure mode of shadow maps, which is a hard black band across a wall.</p>
+
+<p>What you buy for that is enormous: <strong>cost proportional to pixels, not to
+scene complexity.</strong> Seven beads or fifteen hundred, the occlusion pass does
+the same 184,500 pixels of work.</p>
+
+<h2>Noise instead of pattern</h2>
+
+<p>Screen-space effects are all approximations built from a handful of samples,
+and a handful of samples means error. The trick that makes that error acceptable
+appears twice in this file:</p>
+
+<pre>float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}</pre>
+
+<p>A hash: take the pixel coordinate, multiply by irrational-looking constants,
+throw away the integer parts, mix the components together, throw away the integer
+part again. The specific constants have no meaning &#8212; they are chosen so nearby
+inputs land far apart in the output. Given a pixel it returns a repeatable
+pseudo-random number in 0..1.</p>
+
+<p>Both the occlusion and the shadow march use it to rotate or offset their
+sampling pattern <em>per pixel</em>. The comment states the principle better than
+I can:</p>
+
+<blockquote class="aside">
+<p>"it trades structured error (banding, terracing) for unstructured error of the
+same size, which reads as texture instead."</p>
+</blockquote>
+
+<p>This is genuinely worth internalising, because it is not obvious. The
+<em>amount</em> of error is unchanged. But the eye is superb at seeing structure
+and poor at seeing noise: sixteen shadow-march steps at the same spacing on every
+pixel produce sixteen visible terraces marching across the image, and the same
+sixteen steps offset randomly per pixel produce a fine dither that the blur in
+chapter&#160;8 turns into a smooth gradient. Same error, entirely different
+picture.</p>
+
+<h3>The R2 sequence</h3>
+
+<p>The ambient-occlusion loop wants points spread evenly over a disc. White noise
+clumps &#8212; random points leave gaps and clusters, and with only eight samples the
+clumping is the dominant error. So it uses a low-discrepancy sequence instead:</p>
+
+<pre>vec2 xi = fract(vec2(float(i) * 0.7548776662,
+                     float(i) * 0.5698402909) + rot);</pre>
+
+<p>Those two constants are the <em>R2 sequence</em>: the fractional parts of
+<code>1/&#966;</code> and <code>1/&#966;&#178;</code> where &#966; is the plastic number
+(the real root of <code>x&#179; = x + 1</code>), the two-dimensional analogue of using
+the golden ratio in 1D. Successive points fill the unit square with far more even
+coverage than random ones, so eight samples behave like considerably more. The
+<code>+ rot</code> is the per-pixel hash from above, sliding the whole sequence so
+neighbouring pixels use different points.</p>
+
+<p>Note the comment: "no bit operations, so it works in GLSL 330". The more common
+low-discrepancy choice, the Hammersley sequence, needs a bit-reversal, and the
+integer intrinsics for that arrived in GLSL 400. The renderer targets 330 because
+macOS caps out at OpenGL 4.1. That is a real constraint shaping a real code
+choice, and it will shape yours too.</p>
+
+</body>
+</html>

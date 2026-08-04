@@ -1,0 +1,353 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>9. The composite</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 9</p>
+<h1 class="first">The composite</h1>
+
+<p class="lead">One pass, one hundred lines, and the entire look of the renderer.
+Light, then edges, then distance, then the transfer curve that maps the physics
+onto a screen.</p>
+
+<h2>First: what space are these numbers in?</h2>
+
+<p>Before any lighting maths, one convention has to be nailed down, because
+getting it wrong makes everything downstream subtly wrong in a way that is very
+hard to diagnose.</p>
+
+<p>A colour byte in <code>theme.py</code> &#8212; the bead's yellow,
+<code>(247, 225, 122)</code> &#8212; is a <em>display</em> value. It is not proportional
+to light. Displays are deliberately nonlinear: a pixel value of 128 emits roughly
+22% of the light of a pixel value of 255, not 50%. That curve exists because human
+brightness perception is itself compressive, so encoding perceptually rather than
+physically uses the available bits far better.</p>
+
+<p>Physics, though, is linear. Two lamps deliver twice the light of one. Every
+formula in this chapter &#8212; adding an ambient term to a sun term, multiplying by an
+occlusion factor &#8212; is only correct in <strong>linear light</strong>. So the
+renderer converts on the way in and back on the way out:</p>
+
+<pre>def to_linear(color255, gamma):
+    return tuple(float(c / 255.0) ** gamma for c in color255)</pre>
+
+<figure>
+  <img src="images/fig-gamma.png" alt="Plot of the two gamma curves, with the bead's yellow and blue marked on the display-to-linear curve."/>
+  <figcaption><strong>Figure 9.1</strong> &#8212; The bead's blue,
+  <code>122/255 = 0.478</code> in display space, is only <strong>0.198</strong> of
+  the light of white. Treating 0.478 as a light value would make the poles more
+  than twice as bright as they should be relative to the yellow band.</figcaption>
+</figure>
+
+<p>At the very end of the pass, <code>pow(col, vec3(invGamma))</code> encodes back
+to display space. In between, every number means light.</p>
+
+<blockquote class="aside">
+<p><strong>How this shows up if you get it wrong.</strong> The docstring records
+the symptom: <code>display_gamma = 1.0</code> disables the conversion and gives
+"the flat, washed-out look this renderer had before". Skipping the conversion
+compresses the range &#8212; darks come up, colours desaturate, and shading gradients
+across a sphere flatten out. It looks like a lighting problem and it is a units
+problem.</p>
+</blockquote>
+
+<h2>The lighting model</h2>
+
+<pre>vec3 N = normalize(texture(normalTex, uv).xyz);
+vec3 L = normalize(lightDirView);
+vec3 V = normalize(-P);                // eye is the origin in view space</pre>
+
+<p>Three unit vectors: the surface normal, the direction toward the light, and the
+direction toward the viewer. Note <code>V = normalize(-P)</code> &#8212; a one-line
+consequence of the camera being at the view-space origin, which is the whole
+reason chapter&#160;2 put it there.</p>
+
+<h3>Diffuse</h3>
+
+<pre>float diff = max(dot(N, L), 0.0);</pre>
+
+<p>Lambert's cosine law. A surface tilted away from the light spreads the same
+beam over a larger area, so the irradiance falls as <code>cos&#952;</code>, which for
+unit vectors is the dot product. The <code>max(..., 0)</code> clamps surfaces
+facing away, where the cosine would be negative &#8212; a "negative light" that would
+come out as a black smear.</p>
+
+<h3>Specular</h3>
+
+<pre>vec3 H = normalize(L + V);
+float spec = pow(max(dot(N, H), 0.0), specPower);</pre>
+
+<p>The Blinn&#8211;Phong highlight. <code>H</code>, the <em>half vector</em>, is the
+direction exactly between the light and the eye; a perfect mirror at this point
+would need its normal to be <code>H</code> to bounce the light into your eye. So
+<code>dot(N, H)</code> measures how close this surface is to being that mirror,
+and raising it to a power (<code>spec_power = 32</code>) makes the highlight tight
+&#8212; a bigger exponent is a smoother surface. The style file glosses the range
+usefully: "32 reads as plastic, 96 as a polished liquid".</p>
+
+<h3>Fresnel</h3>
+
+<pre>float fres = pow(1.0 - max(dot(N, V), 0.0), 5.0);
+col = mix(col, fresnelColor, fres * fresnelGain * ao);</pre>
+
+<p>Schlick's approximation. Every material becomes mirror-like at grazing angles
+&#8212; look along a sheet of paper and it shines. <code>dot(N, V)</code> is 1 facing
+you and 0 at the silhouette, so <code>1 &#8722; dot(N, V)</code> is 0 in the middle and
+1 at the rim, and the fifth power keeps it concentrated in the last sliver. The
+style comment names its effect exactly: this term "is most of what makes a bead
+read as wet rather than chalky".</p>
+
+<h3>Putting them together</h3>
+
+<pre>col  = alb * (skyAmbient * ao + sunColor * diff * shadow * sunGain);
+col += vec3(1.0) * spec * shadow * specGain;
+col  = mix(col, fresnelColor, fres * fresnelGain * ao);</pre>
+
+<p>Two observations worth more than they look.</p>
+
+<p><strong>The specular is white, not <code>alb</code>-tinted.</strong> A highlight
+is light reflected off the <em>surface</em> before it enters the material, so it
+keeps the light's colour, not the pigment's. This is why a red plastic ball has a
+white highlight. Tinting it is one of the most common giveaways of a hand-rolled
+shading model.</p>
+
+<p><strong>Ambient occlusion multiplies the ambient term only.</strong> Look at
+where <code>ao</code> appears: on <code>skyAmbient</code> and on the fresnel, never
+on <code>sunColor * diff</code>. The comment is blunt about it &#8212; "AO darkens the
+AMBIENT term only &#8212; that is what it models. Scaling the sun by it too would just
+be a second, wrong shadow." Ambient occlusion answers "how much <em>sky</em> can
+this point see"; the sun already has its own visibility term,
+<code>shadow</code>, computed properly by marching. Applying AO to both
+double-counts and gives you mud.</p>
+
+<h3>Curvature occlusion, for free</h3>
+
+<pre>if (curvAO &gt; 0.5) ao *= 0.55 + 0.45 * smoothstep(0.0, 0.55, N.z);</pre>
+
+<p>A sphere occludes <em>itself</em>: near its rim, half the hemisphere above the
+surface is filled by the sphere's own body. And <code>N.z</code> &#8212; the normal's
+component toward the camera &#8212; goes to zero exactly at the silhouette. So this one
+line darkens each bead toward its rim by up to 45%, needs no samples at all, and
+does most of the work of visually separating overlapping beads.</p>
+
+<h3>The exponent</h3>
+
+<pre>ao = pow(clamp(ao, 0.0, 1.0), aoStrength);     // aoStrength = 5.83</pre>
+
+<p>Why a power rather than a multiply? Because <code>1&#8319; = 1</code>. Raising to a
+power leaves fully-open surfaces at exactly full brightness and bends everything
+below down &#8212; 0.9 becomes 0.57, 0.7 becomes 0.16, 0.5 becomes 0.018. Crevices
+plunge; open caps are untouched. A multiply, by contrast, would dim the whole
+image uniformly and you would have to raise the exposure to compensate. This is a
+good general trick for any 0..1 "visibility" factor you want to sharpen.</p>
+
+<h2>The outline</h2>
+
+<p>The most distinctive thing about this renderer's look, and a lovely piece of
+maths.</p>
+
+<pre>float dl = -texture(posTex, uv + vec2(-texel.x, 0.0)).z;
+float dr = -texture(posTex, uv + vec2( texel.x, 0.0)).z;
+float dd = -texture(posTex, uv + vec2(0.0, -texel.y)).z;
+float du = -texture(posTex, uv + vec2(0.0,  texel.y)).z;
+float g = max(abs(dl - dr), abs(dd - du));
+float t0 = outlineThresh * dist;
+float edge = smoothstep(t0, t0 * 4.0, g);
+col = mix(col, outlineColor, clamp(edge * outlineStrength, 0.0, 1.0));</pre>
+
+<p>Four neighbouring depths, two central differences, take the larger. Where depth
+changes fast between adjacent pixels, ink. That is an edge detector &#8212; a Sobel
+filter's simpler cousin &#8212; run on depth instead of colour, which is why it finds
+geometric edges and ignores texture.</p>
+
+<h3>The threshold, derived</h3>
+
+<p>The question is what value of <code>g</code> should count as an edge. This is
+where the design gets careful, because the naive answer &#8212; pick a constant &#8212;
+falls apart immediately.</p>
+
+<p>A sphere is <em>curved</em>, so its own surface has a depth gradient
+everywhere, and near the rim that gradient goes to infinity. Any fixed threshold
+therefore draws a ring at some radius on every bead. The question is: which
+radius? And the answer changes with how big the bead is on screen, which changes
+with distance, viewport size, and zoom. The comment records what that failure
+looks like:</p>
+
+<blockquote class="aside">
+<p>"a threshold that draws a crisp 1px ring on a distant bead swallows a third of
+a near one (the ring is an axis-aligned band, so what is left of a swallowed bead
+is a bright SQUARE &#8212; unmistakable once seen)"</p>
+</blockquote>
+
+<p>The square is worth pausing on, because it is a nice deduction. <code>g</code>
+is <code>max</code> of the <em>x</em>-gradient and the <em>y</em>-gradient, so the
+region where <code>g</code> stays <em>below</em> threshold is bounded by
+<code>max(|x|, |y|) &lt; const</code> &#8212; a square, not a circle. Blow up the
+threshold and the surviving un-inked centre of the bead is square-cornered.</p>
+
+<p>So the style file exposes the parameter in the units you actually think in
+&#8212; <em>at what fraction of its radius should a bead start being outlined?</em>
+<code>outline_edge_fraction = 0.90</code> &#8212; and derives the shader's threshold.
+Here is the derivation.</p>
+
+<figure>
+  <img src="images/fig-outline.png" alt="Plot of u/sqrt(1-u^2) against u, rising steeply near u=1, with 0.85, 0.90 and 0.94 marked."/>
+  <figcaption><strong>Figure 9.2</strong> &#8212; A sphere's own depth slope. It is
+  finite everywhere except at the silhouette, where it diverges &#8212; which is why a
+  threshold can pick out a ring at all.</figcaption>
+</figure>
+
+<p>Take a bead of world radius <code>r</code> at distance <code>D</code>, focal
+length <code>f</code> pixels. Two facts:</p>
+
+<ol>
+<li>One pixel spans <code>D/f</code> world units at that distance (chapter&#160;2's
+pinhole formula, rearranged).</li>
+<li>At a distance <code>s</code> from the bead's centre in the screen plane, the
+sphere's surface stands <code>&#8730;(r&#178; &#8722; s&#178;)</code> in front of its centre plane,
+so its depth slope is <code>ds/dz = s/&#8730;(r&#178; &#8722; s&#178;)</code>.</li>
+</ol>
+
+<p>The central difference the shader computes spans two pixels, so:</p>
+
+<pre>g = 2 &#183; (D/f) &#183; s/&#8730;(r&#178; &#8722; s&#178;)</pre>
+
+<p>Substitute <code>u = s/r</code> &#8212; the fraction of the radius &#8212; and the
+<code>r</code> cancels top and bottom:</p>
+
+<pre>g = 2 &#183; (D/f) &#183; u/&#8730;(1 &#8722; u&#178;)</pre>
+
+<p>Now set the shader's threshold to <code>t0 = thresh &#215; D</code> (scaled by
+distance, which the shader does), demand <code>g = t0</code> at the chosen
+<code>u</code>, and the <code>D</code> cancels too:</p>
+
+<pre>thresh = 2u / (&#8730;(1 &#8722; u&#178;) &#183; f)</pre>
+
+<p>Which is exactly the method in <code>render_style.py</code>:</p>
+
+<pre>def outline_threshold(self, focal_px):
+    u = min(max(self.outline_edge_fraction, 0.0), 0.999)
+    return 2.0 * u / ((1.0 - u * u) ** 0.5) / max(focal_px, 1.0)</pre>
+
+<p><strong>Both <code>D</code> and <code>r</code> cancel.</strong> One number holds
+for every bead in the scene at every depth, and only the focal length &#8212; how big
+things are on screen &#8212; survives. Change the window size, go fullscreen, zoom:
+the camera reports a new <code>focal_px</code> and the outline stays the same
+width relative to the beads.</p>
+
+<h3>Check it against the numbers</h3>
+
+<p>At <code>f = 444.4</code>, <code>u = 0.9</code>: <code>thresh = 0.009292</code>.</p>
+
+<table>
+<tr><th>bead at</th><th class="num">world units/px</th><th class="num"><code>g</code> at u = 0.9</th><th class="num">threshold <code>t0</code></th></tr>
+<tr><td>12.0 &#963; (front row)</td><td class="num">0.02700</td><td class="num">0.11151</td><td class="num">0.11151</td></tr>
+<tr><td>26.0 &#963; (back row)</td><td class="num">0.05851</td><td class="num">0.24160</td><td class="num">0.24160</td></tr>
+</table>
+
+<p>Equal in both rows, as designed. And the <code>smoothstep(t0, t0*4, g)</code>
+ramps the ink in over a band: <code>g = 4t0</code> happens at
+<code>u = 0.9927</code>. So on a front-row bead of 18.7&#160;px radius, the outline
+fades in from 1.9&#160;px inside the edge to 0.14&#160;px &#8212; a soft, roughly
+two-pixel ring. Push <code>outline_edge_fraction</code> to 0.94 and it is a
+hairline; drop it to 0.85 and it is heavy ink.</p>
+
+<h2>Depth cue</h2>
+
+<pre>float c = clamp((dist - cueNear) / max(cueFar - cueNear, 1e-4), 0.0, 1.0);
+col = mix(col, sky, c * cueStrength);</pre>
+
+<p>A straight linear fade toward the background colour with distance. Not physical
+fog &#8212; real atmospheric extinction is exponential &#8212; and the comment defends the
+choice: this is "a depth-perception aid from technical illustration", and it works
+better in a dense bead cloud precisely because the ramp is placed over the scene's
+own depth span rather than over some absolute physical scale.</p>
+
+<pre>def cue_range(self, d_front, d_back):
+    span = max(d_back - d_front, 1e-4)
+    return d_front + self.cue_start * span, d_front + self.cue_end * span</pre>
+
+<p>For the sheet (<code>cue_start = 0.0</code>, <code>cue_end = 0.70</code>) over
+11.911 to 28.077&#160;&#963;, that puts the ramp from 11.911 to 23.23&#160;&#963;, reaching 60% of
+the way to the background there. Dolly the camera in and the ramp follows,
+because it is quoted as a fraction. Absolute distances would need retuning every
+time you moved.</p>
+
+<h2>Two fades and their order</h2>
+
+<pre>if (strength &lt; 1.0) col = mix(sky, col, clamp(strength, 0.0, 1.0));
+
+if (edgeFade &gt; 0.0) {
+    vec2 dc = abs(uv - 0.5) * 2.0;         // 0 at center -&gt; 1 at each edge
+    col = mix(col, sky, edgeFade * smoothstep(0.55, 1.0, max(dc.x, dc.y)));
+}</pre>
+
+<p>The first is chapter&#160;13's periodic-image fade, arriving via the albedo's
+alpha channel. The second fades bead fragments toward the background near the
+frame edge, softening the clip seam on periodic scenes.</p>
+
+<p>The comment on the ordering is a small lesson in composing effects: the image
+fade goes after the depth cue "because it is the same kind of statement &#8212; this
+is further away, let go of it &#8212; and before the screen vignette, which is about
+the frame rather than the scene." Effects that talk about the <em>world</em> before
+effects that talk about the <em>picture</em>.</p>
+
+<h2>Tonemapping</h2>
+
+<pre>col = mix(col, aces(col * exposure), tonemapMix);
+col = pow(clamp(col, 0.0, 1.0), vec3(invGamma));
+vec2 q = uv - 0.5;
+col *= 1.0 - vignette * dot(q, q);</pre>
+
+<p>Linear light is unbounded &#8212; a specular highlight can easily hit 3.0 &#8212; and a
+display tops out at 1.0. A <em>tonemap</em> is the curve that squeezes the one into
+the other. The naive answer, <code>min(col, 1.0)</code>, turns every highlight into
+a flat white blob. Film does better: it rolls off gradually, so bright things stay
+bright but keep their shape. <code>aces()</code> is Krzysztof Narkowicz's
+famous rational fit to the Academy Color Encoding System's curve, five
+coefficients and one divide.</p>
+
+<p>This renderer uses it at half strength, and the comment explains why:</p>
+
+<blockquote class="aside">
+<p>"the full filmic S lifts the shadows and pulls saturated colour toward grey,
+which on a near-monochrome scene reads as washed out. Blending it half-and-half
+with the linear colour keeps the rolloff at half slope and gives the colour
+back."</p>
+</blockquote>
+
+<p>That is a real trade honestly stated, including its cost: "the linear half is
+unbounded, so a very bright specular clips instead of rolling off &#8212; hence the
+clamp." Half of a filmic curve is not a filmic curve, and the code knows it.</p>
+
+<p>Then the gamma encode, and the vignette. <code>dot(q, q)</code> with
+<code>q = uv &#8722; 0.5</code> is 0 at the centre and <code>0.25 + 0.25 = 0.5</code> in
+each corner, so <code>vignette = 1.1</code> multiplies the corners by
+<code>1 &#8722; 0.55 = 0.45</code>.</p>
+
+<h2>One structural detail</h2>
+
+<p>Look at where the tonemap block sits: <em>outside</em> the
+<code>if (P.z &lt; -1e-4)</code> that separates beads from sky. Both go through it.
+The comment explains the bug that would otherwise appear:</p>
+
+<blockquote class="aside">
+<p>"anything faded toward the background has to pass through the same transfer
+curve as the background, or a 'fully cued' bead lands several times brighter than
+the void it was supposed to disappear into."</p>
+</blockquote>
+
+<p>The depth cue mixes a bead's colour toward <code>sky</code> in <em>linear</em>
+space. If the sky then got tonemapped and the bead did not, two values that were
+identical before the curve would differ after it, and a fully faded bead would
+show as a visible ghost against the background it was supposed to have become.
+Whenever you blend two things together, they must be in the same space and take
+the same path afterwards.</p>
+
+</body>
+</html>

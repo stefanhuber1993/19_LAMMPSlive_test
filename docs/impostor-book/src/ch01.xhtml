@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>1. The problem with spheres</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 1</p>
+<h1 class="first">The problem with spheres</h1>
+
+<p class="lead">A sphere is the one shape a GPU cannot draw. It can only draw
+triangles. Everything that follows is a way of not paying for that.</p>
+
+<h2>What a mesh sphere costs</h2>
+
+<p>The obvious way to put a bead on screen is to build a triangle mesh that
+approximates a sphere and draw it. A UV sphere fine enough to look round at
+19&#160;pixels of radius wants roughly 32 segments around and 16 rings up, which
+is about 1000 triangles and 561 vertices. Multiply by the sheet's 900 beads:</p>
+
+<pre>900 beads &#215; 1000 triangles  =  900,000 triangles
+900 beads &#215;  561 vertices   =  505,000 vertex-shader invocations</pre>
+
+<p>And you would do that every frame, at 60&#160;frames per second, for an object
+that covers &#8212; let us compute it &#8212; a circle of radius 18.7&#160;px at the
+front of the sheet, so about 1100&#160;pixels. You are running 561 vertex shaders
+to fill 1100 pixels. The mesh is more detailed than the screen it lands on.</p>
+
+<p>Worse, the mesh is <em>wrong</em>. A 1000-triangle sphere has a visibly faceted
+silhouette when it fills a quarter of the screen, which is exactly what happens in
+the 7-bead patch scene. To fix that you refine the mesh, which makes the count
+worse, and you still have a polygon, not a sphere.</p>
+
+<h2>The impostor bargain</h2>
+
+<p>Here is the observation the whole technique rests on. A sphere, seen from any
+angle, has the silhouette of a <strong>circle</strong>. It has no interesting
+geometry at all from the outside &#8212; only its position, its radius, and the
+direction you are looking from. Everything that makes it look like a sphere
+rather than a flat disc is <em>shading</em>: the way the surface normal turns away
+from you toward the rim, and the way the surface bulges toward you in the middle
+so it can intersect its neighbours.</p>
+
+<p>So: do not send a sphere. Send a <strong>flat quad</strong> &#8212; two triangles,
+four vertices &#8212; big enough to cover where the circle will land. Then, in the
+fragment shader, for each pixel the quad covers, work out whether the ray from
+the eye through that pixel would have hit the sphere. If it misses,
+<code>discard</code> the pixel and it is as if nothing was ever drawn there. If it
+hits, compute exactly where, and write out that point's normal and its depth as
+though a real sphere had been rasterised.</p>
+
+<pre>900 beads &#215; 2 triangles  =    1,800 triangles
+900 beads &#215; 4 vertices   =    3,600 vertex-shader invocations</pre>
+
+<p>140&#215; fewer vertex invocations, and the result is not an approximation of a
+sphere &#8212; it is <em>analytically exact</em>, correct to the last pixel, at every
+zoom level, forever. A quad that covers 4&#160;pixels and a quad that covers the
+whole screen both give a mathematically perfect sphere. You cannot say that about
+any mesh.</p>
+
+<p>That is an impostor: a piece of flat geometry standing in for a shape, with a
+fragment shader doing the actual work of being that shape. It is the standard
+technique in molecular visualisation for exactly this reason &#8212; VMD, PyMOL and
+every modern MD viewer draw atoms this way.</p>
+
+<figure>
+  <img src="images/fig-instancing.png" alt="Diagram: a quad VBO and an instance VBO feeding a vertex shader that runs four times per bead, then a fragment shader that runs once per covered pixel."/>
+  <figcaption><strong>Figure 1.1</strong> &#8212; One draw call. The four quad
+  corners are uploaded once and never touched again; the per-bead data changes
+  every frame. <code>instances=900</code> is the entire per-bead cost on the CPU
+  side.</figcaption>
+</figure>
+
+<h2>Instancing: the four corners, 900 times</h2>
+
+<p>You do not want 900 separate draw calls, one per bead &#8212; each one is a
+round-trip through the driver and they add up fast. Instead you use
+<em>instanced</em> rendering: upload the quad's four corners <strong>once</strong>,
+upload a per-bead array alongside it, and tell the GPU "draw that quad 900 times,
+and on the <code>i</code>-th time, feed the vertex shader row <code>i</code> of the
+per-bead array."</p>
+
+<p>In <code>gl3d.py</code> the per-bead array is ten floats wide:</p>
+
+<pre>data = np.empty((n, 10), dtype="f4")
+data[:, 0:3] = centers      # world position
+data[:, 3]   = radii        # world radius
+data[:, 4:7] = directors    # the bead's unit orientation vector
+data[:, 7]   = brights      # albedo multiplier (the "spotlight")
+data[:, 8]   = energies     # potential energy, for the inferno colouring
+data[:, 9]   = fades        # 1 = solid, 0 = faded into the background</pre>
+
+<p>900&#160;beads &#215; 10&#160;floats &#215; 4&#160;bytes = 36&#160;kB, memcpy'd to the GPU each
+frame. That is nothing. And the declaration that binds it is one line:</p>
+
+<pre>self._geom_vao = self.ctx.vertex_array(
+    self.geom_prog,
+    [(self._quad_vbo, "2f", "in_corner"),
+     (self._inst_vbo, "3f 1f 3f 1f 1f 1f /i", "in_center", "in_radius",
+      "in_dir", "in_bright", "in_energy", "in_fade")],
+)</pre>
+
+<p>The <code>/i</code> at the end of the second format string is the entire
+instancing mechanism. It means "advance this buffer once per <em>instance</em>,
+not once per vertex". Without it, the GPU would walk the bead array four times
+faster than intended and you would get garbage. With it, all four corners of bead
+<code>i</code> see the same centre, radius and director.</p>
+
+<blockquote class="aside">
+<p><strong>Where the CPU time actually goes.</strong> Notice that the buffer is
+only reallocated when the bead count <em>grows</em>
+(<code>if n &gt; self._inst_capacity</code>). Steady state is one
+<code>numpy</code> fill and one <code>write()</code> per frame, with no GL object
+churn. This is the same instinct as preallocating an array outside a Python loop,
+and it matters more here, because allocating a GL buffer can stall the driver.</p>
+</blockquote>
+
+<h2>What you give up</h2>
+
+<p>Impostors are not free of consequences, and it is worth naming them now
+because three later chapters exist to work around them.</p>
+
+<ul>
+<li><strong>The fragment shader must write depth by hand.</strong> The quad is
+flat; the sphere is not. If you let the hardware interpolate the quad's depth,
+two overlapping beads resolve wrongly. Chapter&#160;4 fixes this with
+<code>gl_FragDepth</code> &#8212; and doing so disables an important hardware
+optimisation, which is why chapter&#160;11 cannot use MSAA.</li>
+<li><strong>The quad must be big enough.</strong> Off to the side of the screen a
+sphere projects to an <em>ellipse</em>, not a circle, and a naively sized quad
+slices the bead. Chapter&#160;3 is entirely about getting this exactly
+right.</li>
+<li><strong>Every silhouette is a hard edge.</strong> <code>discard</code> is
+all-or-nothing: a pixel is either fully bead or fully background, with nothing in
+between. That is a jagged staircase, and chapter&#160;11 has to clean it up in
+screen space.</li>
+</ul>
+
+<p>All three are cheaper to fix than a mesh would have been. That is the
+bargain.</p>
+
+</body>
+</html>

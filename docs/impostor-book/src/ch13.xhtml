@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>13. Drawing an infinite membrane</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 13</p>
+<h1 class="first">Drawing an infinite membrane</h1>
+
+<p class="lead">A periodic cell is a window onto an unbounded system. Drawing one
+copy of it says otherwise. Twenty thousand instances and one fade function fix
+that, and everything downstream costs exactly what it did before.</p>
+
+<h2>The problem</h2>
+
+<p>The sheet is periodic in <em>x</em> and <em>y</em>: a bead leaving the right
+face re-enters at the left, and the physics is that of an endless membrane. Draw
+only the cell and the viewer sees a small square raft floating in a void &#8212; which
+is a false statement about the simulation.</p>
+
+<p>The fix is to draw the neighbouring cells too. Because everything after the
+G-buffer is screen-space, this is unusually cheap: more instances make pass&#160;1
+more expensive and change <em>nothing else in the pipeline</em>. Occlusion, blur,
+composite, depth of field and antialiasing all still process 738,000 pixels.</p>
+
+<h2>The declaration</h2>
+
+<pre>periodic_images=(2, (0.5, 3), 0),
+image_fade_start=0.15,
+image_fade_end=1.0,</pre>
+
+<p>Per axis, and each entry is either a single number (the same either side) or a
+<code>(before, after)</code> pair &#8212; and either may be <strong>fractional</strong>.
+So the sheet asks for two cells either side in <em>x</em>, and in <em>y</em> half a
+cell in front and three cells behind. The <em>z</em> count is 0 because the cell is
+not periodic in <em>z</em>, and the renderer clamps it there anyway: "asking for
+images along a free axis would be inventing matter."</p>
+
+<p>The asymmetry in <em>y</em> is the point of the whole feature. It puts the real
+cell &#8212; the one carrying the controlled bead, its control net and the box outline
+&#8212; near the <em>front</em> of the block, with a little material in front of it and
+a long tail of copies receding to the horizon. You look <em>into</em> a membrane
+rather than at a raft.</p>
+
+<blockquote class="aside">
+<p><strong>Why it is declared, not derived.</strong> "Worked out per frame it
+would flip from one side to the other as the view swung past a right angle, and
+the whole block would jump." A camera-dependent choice of which side to extend
+would be discontinuous in camera angle. Anything discontinuous in a continuously
+varying input will eventually be seen to pop. Declaring it makes the block a
+property of the scene, not of the view.</p>
+</blockquote>
+
+<h2>Generating the copies</h2>
+
+<pre>reach[axis] = (1.0 + 2.0 * before, 1.0 + 2.0 * after)
+whole[axis] = [int(math.ceil(before)), int(math.ceil(after))]</pre>
+
+<p>Two different quantities, and the distinction is the whole implementation.</p>
+
+<p>Work in <strong>half-widths</strong>, so the real cell spans &#8722;1 to +1 on each
+axis. <code>n</code> whole copies out from a boundary then reach to
+<code>1 + 2n</code>. That formula accepts fractions happily &#8212; <code>0.5</code>
+gives a reach of 2.0, i.e. half a neighbouring cell &#8212; but you cannot generate
+half an instance. So: generate <code>ceil(n)</code> whole copies, then
+<strong>clip</strong> the resulting beads to the fractional reach.</p>
+
+<pre>offsets = [np.array([i, j, k]) * lengths
+           for i in range(-whole[0][0], whole[0][1] + 1)
+           for j in range(-whole[1][0], whole[1][1] + 1)
+           for k in range(-whole[2][0], whole[2][1] + 1)]
+P = np.concatenate([pts + o for o in offsets])</pre>
+
+<p>For the sheet: <code>whole = [[2,2], [1,3], [0,0]]</code>, so 5&#160;&#215;&#160;5&#160;&#215;&#160;1 =
+25 copies of 900 beads = 22,500. After the clip, 19,966 survive. All of it is
+vectorised numpy &#8212; a list comprehension over 25 offsets and one
+<code>concatenate</code>, then boolean indexing. No Python loop touches a
+bead.</p>
+
+<h3>Reach and side, per axis</h3>
+
+<pre>signed = (P - centre) / half
+side = (signed &gt; 0.0).astype(int)
+limit = np.take_along_axis(reach[None, :, :].repeat(len(P), 0),
+                           side[:, :, None], axis=2)[:, :, 0]</pre>
+
+<p><code>signed</code> is each bead's position in half-widths: inside the real cell
+it is between &#8722;1 and +1 on every axis. <code>side</code> picks which end of the
+<code>(before, after)</code> pair applies, because the two directions can reach
+different distances. The <code>take_along_axis</code> gymnastics is just a
+vectorised "for each bead and each axis, look up the reach on the side this bead
+is on".</p>
+
+<h2>The fade, and why it is a fraction</h2>
+
+<p>If the copies simply stopped, you would have swapped one false statement for
+another: instead of a small raft you would have a large one, with a hard straight
+edge announcing where the renderer gave up. So they fade to the background.</p>
+
+<pre>out = np.clip((np.abs(signed) - 1.0) / np.maximum(limit - 1.0, 1e-9), 0.0, None)
+u = np.max(np.where(limit &gt; 1.0, out, 0.0), axis=1)
+span = max(style.image_fade_end - style.image_fade_start, 1e-6)
+F = np.clip(1.0 - (u - style.image_fade_start) / span, 0.0, 1.0)</pre>
+
+<p><code>u</code> is <strong>how far out this bead is as a fraction of how far the
+copies reach in that direction</strong>: 0 anywhere in the real cell, 1 at the
+outer edge of the block, and the furthest-out axis wins. That normalisation is the
+critical design choice, and the comment says why:</p>
+
+<blockquote class="aside">
+<p>"Expressed as a fraction rather than in half-widths so the fade cannot be left
+promising range that is not drawn: at 1.0 it reaches the background exactly where
+the copies are cut, whatever the counts, and there is no straight edge to see.
+That is the one thing this has to get right &#8212; an abrupt boundary is worse than no
+images at all."</p>
+</blockquote>
+
+<p>Work the sheet's asymmetry through. In <em>x</em> the reach is 5 half-widths
+either side; in <em>y</em> it is 2 in front and 7 behind. Quoted in half-widths, a
+single fade distance would finish long before the far <em>y</em> edge and long
+after the near one. Quoted as a fraction of each side's own reach, all four
+boundaries dissolve exactly where they are cut. With
+<code>image_fade_start = 0.15</code>, beads stay at full strength through the
+first 15% of the block and then fade linearly to nothing at the edge.</p>
+
+<h3>The bead that must be dropped, not faded</h3>
+
+<pre>keep = (F &gt; 0.01) &amp; np.all(np.abs(signed) &lt;= limit + 1e-9, axis=1)</pre>
+
+<pre># a fully faded copy is background-coloured but still writes depth,
+# so it would punch a hole in whatever is behind it.</pre>
+
+<p>This is the sort of bug that is obvious in hindsight and baffling in practice.
+The fade is applied in the composite &#8212; the bead is drawn, it writes depth, and
+then its colour is mixed to the background. A bead at <code>F = 0</code> is
+invisible <em>and</em> occluding: anything behind it vanishes, leaving a
+bead-shaped bite out of the scene with nothing visible causing it. So faded-out
+copies must be removed on the CPU, before they ever reach the G-buffer.</p>
+
+<h2>How the fade travels</h2>
+
+<p>Follow <code>F</code> through the pipeline, because it is a nice illustration of
+threading a per-instance value all the way to the end:</p>
+
+<pre>Python:    fades = F                          (per bead, 0..1)
+VBO:       column 9 of the instance array
+vertex:    in_fade -&gt; v_fade                  (a varying)
+fragment:  o_albedo = vec4(albedo * v_bright, v_fade)
+G-buffer:  the albedo texture's ALPHA channel
+composite: float strength = albedoSample.a;
+           if (strength &lt; 1.0) col = mix(sky, col, strength);</pre>
+
+<p>It rides in the albedo's alpha, a channel that was otherwise doing nothing
+&#8212; the beads are opaque, so alpha has no blending job. Free storage in a texture
+you already allocated is worth noticing when you need to get one more number from
+pass&#160;1 to pass&#160;4.</p>
+
+<h2>Two mutually exclusive strategies</h2>
+
+<p>The renderer has <em>two</em> ways of handling a periodic seam, and picks one:</p>
+
+<pre>if tiling:
+    bpts, ... = self._periodic_image_instances(...)
+    box_half, edge_fade_on = None, False
+else:
+    bpts, ... = self._wrap_ghost_instances(...)
+    box_half = (self.box_x / 2.0, self.box_y / 2.0) if periodic else None
+    edge_fade_on = periodic</pre>
+
+<p>Without tiling, a bead straddling a face is clipped to the box in the fragment
+shader (chapter&#160;4) and a wrapped ghost is drawn on the opposite face carrying
+the complementary slice. With tiling, neither is needed, for a reason worth
+stating out loud:</p>
+
+<blockquote class="aside">
+<p>"a bead poking out of the real cell is exactly the neighbouring copy's bead
+poking in, which is what the true infinite tiling looks like."</p>
+</blockquote>
+
+<p>Drawing the neighbours correctly makes the seam handling redundant. That is the
+mark of the right abstraction: the special case disappears rather than being
+handled.</p>
+
+<h2>What it costs, measured</h2>
+
+<table>
+<tr><th></th><th class="num">single cell</th><th class="num">tiled (2, (0.5,3), 0)</th></tr>
+<tr><td>instances</td><td class="num">900</td><td class="num">19,966</td></tr>
+<tr><td>instance upload</td><td class="num">36 kB</td><td class="num">799 kB</td></tr>
+<tr><td>depth span</td><td class="num">11.9 &#8211; 28.1 &#963;</td><td class="num">3.5 &#8211; 77.7 &#963;</td></tr>
+<tr><td>passes 2&#8211;7 cost</td><td class="num">738,000 px</td><td class="num">738,000 px</td></tr>
+</table>
+
+<p>Twenty-two times the geometry, and the entire post-processing chain does not
+notice. That is the deferred architecture paying for itself.</p>
+
+<p>The wider depth span does matter, though, and the renderer accounts for it. The
+frustum and the cue ramp are measured over <em>what is actually drawn</em>:</p>
+
+<pre>_, bdepth, _ = camera.project(bpts)
+dmin = float(np.min(bdepth[bfinite]))
+dmax = float(np.max(bdepth[bfinite]))</pre>
+
+<blockquote class="aside">
+<p>"With periodic images that is the difference between an infinite-looking
+membrane and one whose front and back rows are sliced off by the near and far
+planes &#8212; the images nearest the eye sit well in front of anything in the real
+cell."</p>
+</blockquote>
+
+<p>The nearest instance is now at 3.5&#160;&#963; rather than 11.9. Measure the frustum
+over the real cell only and the front two rows of copies get clipped away by the
+near plane &#8212; the exact rows that were supposed to make the membrane run off the
+bottom of the frame. Every scene-relative quantity in <code>RenderStyle</code>
+(the cue range, the focus plane) follows from this same pair of numbers, so they
+all move together.</p>
+
+</body>
+</html>

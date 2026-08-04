@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>8. The blur that must not leak</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 8</p>
+<h1 class="first">The blur that must not leak</h1>
+
+<p class="lead">Sixteen lines, one nested loop, and one <code>if</code> that is the
+difference between soft shading and a glowing halo around every bead.</p>
+
+<h2>Why blur at all</h2>
+
+<p>Chapter&#160;7 produced two noisy signals. The ambient occlusion is noisy because
+eight samples cannot integrate a hemisphere accurately; the sun visibility is
+noisy because it is a jittered binary test. Both are, by construction,
+low-frequency quantities &#8212; occlusion varies over the scale of a bead, not a
+pixel. Averaging over a neighbourhood therefore costs almost no real signal and
+removes almost all of the noise. It is the cheapest possible denoiser and exactly
+the right one.</p>
+
+<pre>vec2 sum = vec2(0.0);
+float wsum = 0.0;
+for (int x = -2; x &lt; 2; ++x)
+    for (int y = -2; y &lt; 2; ++y) {
+        vec2 o = uv + vec2(x, y) * texel;
+        float fg = texture(posTex, o).z &lt; -1e-4 ? 1.0 : 0.0;
+        sum += texture(aoTex, o).rg * fg;
+        wsum += fg;
+    }
+frag = wsum &gt; 0.0 ? sum / wsum : texture(aoTex, uv).rg;</pre>
+
+<p>Sixteen taps in a 4&#215;4 box, at half resolution, so it reaches eight full-res
+pixels &#8212; a fair fraction of the 37-pixel occlusion radius. Both channels
+(<code>.rg</code>) are filtered together, because they are two channels of one
+texture. A box blur, not a Gaussian: for a signal with no high frequencies in it
+to begin with, the difference is invisible and the box is a third of the
+instructions.</p>
+
+<h2>The halo, and the one line that prevents it</h2>
+
+<p>Now the important part. Recall chapter&#160;7's first line: background pixels
+return <code>(1.0, 1.0)</code> &#8212; fully open, fully lit. That is correct as a
+value. It is poison as a blur input.</p>
+
+<p>Consider a pixel just inside the silhouette of a bead. Its own occlusion is,
+say, 0.4 &#8212; it is near the rim, partly shadowed by its own bead and its
+neighbours. But half of its 4&#215;4 neighbourhood is <em>background</em>, sitting at
+1.0. A naive average gives roughly <code>(8&#215;0.4 + 8&#215;1.0)/16 = 0.7</code>. The rim
+pixel has been lightened, and so has every rim pixel all the way around every
+bead. The result is a bright fringe hugging every silhouette &#8212; and since it
+follows the geometry, it reads unmistakably as a glow.</p>
+
+<figure>
+  <img src="images/fig-blurmask.png" alt="Three greyscale panels: noisy ambient occlusion on a disc; a naive blur showing a bright ring at the disc's edge; a masked blur with no ring."/>
+  <figcaption><strong>Figure 8.1</strong> &#8212; The same disc of occlusion, blurred
+  two ways. The middle panel's bright rim is entirely background bleeding
+  inward.</figcaption>
+</figure>
+
+<p>The fix is to make the blur a <em>weighted</em> average and to give background
+taps a weight of zero:</p>
+
+<pre>float fg = texture(posTex, o).z &lt; -1e-4 ? 1.0 : 0.0;
+sum  += texture(aoTex, o).rg * fg;
+wsum += fg;
+...
+frag = sum / wsum;</pre>
+
+<p>Now the rim pixel averages only the eight foreground taps and stays at 0.4. The
+blur is confined inside the geometry and cannot cross a silhouette. This is the
+same idea as a bilateral filter &#8212; weight taps by whether they belong to the same
+surface &#8212; in its simplest possible form, using the free coverage mask from
+chapter&#160;5.</p>
+
+<p>The fallback matters too. If <em>every</em> tap is background, <code>wsum</code>
+is zero and <code>sum / wsum</code> is a NaN. NaNs are contagious: they survive
+multiplication, they survive <code>mix</code>, and one of them can turn a whole
+pixel black or white for the rest of the frame. Hence:</p>
+
+<pre>frag = wsum &gt; 0.0 ? sum / wsum : texture(aoTex, uv).rg;</pre>
+
+<p>Take the unblurred value, which is <code>(1, 1)</code> for background anyway.
+Guarding a division whose denominator can go to zero is not paranoia in a shader;
+it is the only debugging you get, since you cannot print anything.</p>
+
+<blockquote class="aside">
+<p><strong>An asymmetry worth noticing.</strong> <code>for (int x = -2; x &lt; 2;
+++x)</code> runs over &#8722;2, &#8722;1, 0, 1 &#8212; four values, but not centred on zero. The
+kernel is offset half a texel toward the lower-left. For a signal this smooth,
+half a texel at half resolution is invisible, which is presumably why it has never
+mattered. It is still the kind of off-by-one that would be a real bug in a sharper
+filter, and worth spotting when you read shader loops.</p>
+</blockquote>
+
+<h2>Where the LINEAR filter comes in</h2>
+
+<pre>for t in (self.ao_tex, self.ao_blur_tex):
+    t.filter = (c.LINEAR, c.LINEAR)</pre>
+
+<p>The G-buffer textures are <code>NEAREST</code> (chapter&#160;5); these two are
+<code>LINEAR</code>, for the opposite reason. The composite pass runs at full
+resolution and samples this half-resolution texture, so every second full-res
+pixel falls between texels. With <code>NEAREST</code> you would see the
+half-resolution grid as visible 2&#215;2 blocks in the shading. With
+<code>LINEAR</code> the hardware interpolates for free and the upsample is
+invisible.</p>
+
+<p>That is the half-resolution trick completed: sample at half res, blur at half
+res, and let the texture unit's bilinear filter do the reconstruction on the way
+out. Three quarters of the work saved, no visible difference.</p>
+
+<h2>Skipping the whole thing</h2>
+
+<pre>self.ao_fbo.clear(1.0, 1.0, 1.0, 1.0)
+ao_tex = self.ao_tex
+if style.ao_samples &gt; 0 or style.shadows:
+    ... render ssao, then blur ...
+    ao_tex = self.ao_blur_tex</pre>
+
+<p>If a style switches both terms off, neither pass runs and the composite reads
+the cleared texture &#8212; which is <code>(1, 1)</code>, meaning "fully open, fully
+lit", exactly the identity for both terms. The disabled path needs no branch in
+the composite shader and no separate code path. Choosing your clear value to be
+the identity of the operation that consumes it is a small, reusable trick.</p>
+
+<h3>An exercise for later</h3>
+
+<p>A box blur is <em>separable</em>: a 4&#215;4 box is a horizontal 4-tap followed by a
+vertical 4-tap, 8 taps instead of 16. The mask does not break this, because both
+the numerator (<code>sum</code>) and the denominator (<code>wsum</code>) are
+themselves box-filtered quantities and can be separated independently &#8212; you
+would carry three channels through an intermediate texture. Whether that is worth
+an extra full-screen pass at 184,500 pixels is a genuinely open question; measure
+it before you believe either answer.</p>
+
+</body>
+</html>

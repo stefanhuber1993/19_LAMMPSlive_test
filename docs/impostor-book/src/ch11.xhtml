@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>11. Antialiasing after the fact</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 11</p>
+<h1 class="first">Antialiasing after the fact</h1>
+
+<p class="lead">Every edge in this renderer is a cliff. The usual hardware fix is
+unavailable, so the last pass finds the cliffs in the finished image and smooths
+them by hand.</p>
+
+<h2>Three sources of hard edges</h2>
+
+<p>The module docstring names them, and each traces back to an earlier
+chapter:</p>
+
+<ul>
+<li><strong>The impostor silhouette.</strong> Chapter&#160;4's
+<code>if (disc &lt; 0.0) discard;</code> &#8212; a pixel is fully bead or fully nothing.
+There is no partial coverage.</li>
+<li><strong>The outline.</strong> Chapter&#160;9's <code>smoothstep</code> over a
+depth gradient that, near the rim, diverges within a pixel &#8212; so the smoothstep
+saturates instantly and behaves like a step.</li>
+<li><strong>The periodic clip.</strong> Another flat <code>discard</code>, at the
+box faces.</li>
+</ul>
+
+<p>Aliasing is what happens when a signal has detail finer than your sampling
+grid: an infinitely sharp edge has infinite frequency content, and sampling it at
+one point per pixel gives a staircase. Worse, when the geometry moves, the
+staircase <em>crawls</em> &#8212; individual pixels flip on and off as the edge slides
+across them. On the sheet, where hundreds of small beads each contribute two or
+three arcs of silhouette, this is the single most distracting artefact in an
+otherwise still image.</p>
+
+<h2>Why not MSAA</h2>
+
+<p>The standard hardware answer is multisample antialiasing: rasterise at four
+sample points per pixel, keep four depth values, shade once per <em>covered
+primitive</em> rather than once per sample, average at the end. It is nearly free
+in a forward renderer. Here it is not available, for two independent reasons the
+docstring names precisely:</p>
+
+<p><strong>Deferred rendering breaks the "shade once" trick.</strong> MSAA's
+efficiency comes from shading a pixel once and replicating the result to whichever
+samples the triangle covered. A deferred renderer does not shade during
+rasterisation at all &#8212; it shades in a later full-screen pass, which has no idea
+which samples belonged to which primitive. To make MSAA work you would have to
+keep the G-buffer at 4&#215; resolution (that is 152&#160;MB instead of 38) and run
+lighting, occlusion and outlining on every sample. That is not antialiasing; it is
+supersampling with extra steps.</p>
+
+<p><strong><code>gl_FragDepth</code> makes it worse.</strong> Chapter&#160;4's
+hand-written depth already forced early-z off. It also means the hardware cannot
+compute per-sample depth from the triangle's plane equation &#8212; the shader's depth
+value applies to the whole pixel &#8212; so the depth resolve within a pixel degrades
+exactly where the beads intersect, which is the one place you wanted it.</p>
+
+<p>So: do it in screen space, on the finished image, as a post-process. That is
+<strong>FXAA</strong> &#8212; Timothy Lottes's fast approximate antialiasing, the
+technique that made deferred rendering practical for a generation of games. One
+full-screen pass, no extra geometry cost, no interaction with the G-buffer
+whatsoever.</p>
+
+<h2>How FXAA works</h2>
+
+<h3>1. Luma</h3>
+
+<pre>float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }</pre>
+
+<p>Rec.&#160;601 luminance weights. Green dominates because human vision is most
+sensitive there; blue barely counts. FXAA works on brightness rather than colour
+because an edge you cannot see in brightness is one you barely see at all &#8212; the
+eye's spatial acuity for chroma is several times worse than for luma. Blurring
+such an edge would cost sharpness for nothing.</p>
+
+<h3>2. Find edges, and bail out fast</h3>
+
+<pre>float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+float range = lMax - lMin;
+if (range &lt; max(0.0625, lMax * 0.125)) { frag = vec4(rgbM, 1.0); return; }</pre>
+
+<p>Five samples &#8212; centre plus four diagonals &#8212; and their luma spread. Two
+thresholds combined with <code>max</code>: an absolute floor (1/16) so that
+near-black regions with tiny absolute differences are left alone, and a relative
+one (1/8 of the local maximum) so that bright regions need a proportionally bigger
+jump. Relative because perception is: a difference of 0.05 is obvious against a
+dark background and invisible against a bright one.</p>
+
+<p>The comment identifies this line as more than a correctness measure &#8212; "which
+is most of the screen, so this early-out is also where the speed comes from". On a
+typical frame the great majority of pixels are smooth interiors or flat
+background, and they cost five texture fetches and nothing else.</p>
+
+<h3>3. Estimate the edge direction</h3>
+
+<pre>vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)),
+                 ((lNW + lSW) - (lNE + lSE)));</pre>
+
+<p>Two finite differences from the four diagonals: top pair minus bottom pair is
+the vertical luma gradient, left pair minus right pair the horizontal. The
+gradient points <em>across</em> the edge; rotating it by 90&#176; &#8212; which is what the
+minus sign and the swap accomplish &#8212; gives the direction <em>along</em> it.</p>
+
+<p>That distinction is the whole of FXAA. Blurring along an edge softens the
+staircase without losing the edge. Blurring across it would just be a blur.</p>
+
+<pre>float reduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
+float rcpMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+dir = clamp(dir * rcpMin, -8.0, 8.0) * texel;</pre>
+
+<p>Normalise by the <em>smaller</em> component so the step lands roughly one pixel
+along the shallow axis; <code>reduce</code> adds a floor proportional to local
+brightness, so that in dark areas &#8212; where the gradients are small and the
+direction estimate is mostly noise &#8212; the step shrinks instead of flailing. The
+<code>clamp(&#8230;, -8, 8)</code> caps how far a near-horizontal or near-vertical edge
+can reach.</p>
+
+<h3>4. Sample along the edge, and sanity-check</h3>
+
+<pre>vec3 rgbA = 0.5 * (texture(srcTex, uv + dir * (1.0/3.0 - 0.5)).rgb +
+                   texture(srcTex, uv + dir * (2.0/3.0 - 0.5)).rgb);
+vec3 rgbB = rgbA * 0.5 + 0.25 * (texture(srcTex, uv - dir * 0.5).rgb +
+                                 texture(srcTex, uv + dir * 0.5).rgb);
+float lB = luma(rgbB);
+frag = vec4((lB &lt; lMin || lB &gt; lMax) ? rgbA : rgbB, 1.0);</pre>
+
+<p><code>rgbA</code> averages two taps close to the centre (at &#8722;1/6 and +1/6 of
+the step). <code>rgbB</code> adds two more out at the ends (&#8722;1/2 and +1/2), giving
+a wider average with more smoothing.</p>
+
+<p>The last line is a safety net worth admiring. If the wide average's luma has
+escaped the neighbourhood's own range, the outer taps have walked off this edge
+onto something unrelated &#8212; a different bead, a bond line &#8212; and blending them in
+would smear two distinct objects together. So fall back to the narrow pair. It is
+a cheap, local test for "did my extrapolation leave the thing I was
+extrapolating?", and the same shape of check turns up in temporal antialiasing as
+neighbourhood clamping.</p>
+
+<h2>Why it must be last</h2>
+
+<p>The ordering is not arbitrary, and both constraints are stated in the
+comment:</p>
+
+<p><strong>After the tonemap and gamma encode.</strong> FXAA thresholds on luma
+against fixed constants like 0.0625, and those constants only mean anything in
+display space. An edge in linear light is not where the eye sees one &#8212; the
+gamma curve stretches the darks apart and squeezes the brights together, so a
+linear-space luma difference of 0.0625 is a wildly different perceptual step at
+the two ends of the range.</p>
+
+<p><strong>After the lines.</strong> The bond spokes, control net and box outline
+drawn in chapter&#160;12 are one-pixel GL lines &#8212; about the most aliased thing you
+can draw. Running FXAA after them antialiases them for free.</p>
+
+<p>So the final sequence is: composite &#8594; depth of field &#8594; lines &#8594; FXAA &#8594;
+<code>final_fbo</code>. Which is exactly what <code>render()</code> does, ending
+with:</p>
+
+<pre>self.shaded_tex.use(0)
+self.final_fbo.use()
+self._fs_vaos[self.fxaa_prog].render(mode=c.TRIANGLES, vertices=3)</pre>
+
+<h2>What FXAA costs you</h2>
+
+<p>It is an approximation and it does not pretend otherwise. It has no idea where
+the geometry actually was; it infers edges from the image. So it will occasionally
+soften something that was meant to be sharp &#8212; a genuine one-pixel feature that
+looks like an aliased edge &#8212; and it cannot fix temporal shimmer, because it has
+no memory of the previous frame. The modern answer to both is TAA, which stores
+history and reprojects it, at the cost of ghosting and a great deal more
+complexity.</p>
+
+<p>For a still-ish scene of round objects, FXAA is the right amount of machinery.
+<code>style.antialias = False</code> turns it off if you want to see what it was
+doing: the picture gets crisper and visibly jagged, most obviously on the
+sheet.</p>
+
+</body>
+</html>

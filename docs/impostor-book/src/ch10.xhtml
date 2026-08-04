@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>10. Depth of field</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 10</p>
+<h1 class="first">Depth of field</h1>
+
+<p class="lead">A lens can only focus one distance at a time. Everything else
+smears into a disc, and the size of that disc is the entire effect.</p>
+
+<h2>The circle of confusion</h2>
+
+<p>A pinhole camera &#8212; which is what chapter&#160;2's projection describes &#8212; has
+infinite depth of field: every point maps to exactly one point, sharp everywhere.
+A real lens has aperture, and only points at one particular distance converge back
+to a single point on the sensor. A point nearer or further converges in front of
+or behind the sensor plane, so by the time it reaches the sensor it has spread
+into a small disc. That disc is the <strong>circle of confusion</strong>, and its
+radius is what you have to compute.</p>
+
+<pre>float coc_of(vec3 P) {
+    if (P.z &gt;= -1e-4) return 1.0;                   // background: fully blurred
+    return clamp(abs(-P.z - focus) / range, 0.0, 1.0);
+}</pre>
+
+<p>Distance from the focus plane, divided by a range, clamped &#8212; a linear ramp
+rather than the physically correct hyperbola. In a scene 16&#160;&#963; deep with a
+maximum blur of three pixels, the difference between linear and physical is
+invisible, and the linear version gives you two intuitive knobs instead of an
+f-number and a sensor size.</p>
+
+<p>The knobs are quoted, like the depth cue's, as fractions of the scene's own
+depth span:</p>
+
+<pre>def focus_range(self, d_front, d_back):
+    span = max(d_back - d_front, 1e-4)
+    return d_front + self.dof_focus * span, max(self.dof_range * span, 1e-4)</pre>
+
+<p>For the sheet (<code>dof_focus = 0.25</code>, <code>dof_range = 1.5</code>,
+<code>dof_bokeh_px = 6.0</code>) over 11.911 to 28.077&#160;&#963;:</p>
+
+<pre>span   = 16.166 &#963;
+focus  = 11.911 + 0.25 &#215; 16.166  = 15.95 &#963;
+range  = 1.5 &#215; 16.166            = 24.25 &#963;
+CoC at the near edge  = |11.911 &#8722; 15.95| / 24.25 = 0.167  &#8594; 1.0 px
+CoC at the far edge   = |28.077 &#8722; 15.95| / 24.25 = 0.500  &#8594; 3.0 px</pre>
+
+<figure>
+  <img src="images/fig-dof.png" alt="Left: blur radius against distance, a V shape with its minimum at the focus plane. Right: 24 sample points on a golden-angle spiral filling a disc."/>
+  <figcaption><strong>Figure 10.1</strong> &#8212; The sheet's actual settings. The
+  blur never exceeds three pixels; <code>dof_range = 1.5</code> means it would
+  take one and a half scene-depths to reach the maximum, so the effect is a gentle
+  tilt-shift rather than a bokeh.</figcaption>
+</figure>
+
+<h2>Gathering the disc</h2>
+
+<pre>const int TAPS = 24;
+const float GA = 2.39996323;
+float radius = coc * maxCoc;
+
+vec3 sum = c0.rgb;
+float wsum = 1.0;
+for (int i = 1; i &lt;= TAPS; ++i) {
+    float t = float(i) / float(TAPS);
+    float a = float(i) * GA;
+    vec2 off = vec2(cos(a), sin(a)) * sqrt(t) * radius * texel;
+    ...
+}</pre>
+
+<p>Twenty-four samples on a spiral. Two details make it work:</p>
+
+<p><strong>The golden angle.</strong> <code>2.39996323</code> radians is 137.5&#176;,
+<code>2&#960;/&#966;&#178;</code>. Advance by this angle each step and successive points never
+line up into spokes &#8212; it is the most irrational rotation there is, which is
+exactly why sunflower seeds use it. Any rational fraction of a turn (say 90&#176;)
+would put every fourth sample on the same ray and produce a visible star.</p>
+
+<p><strong><code>sqrt(t)</code>.</strong> If the radius grew linearly with
+<code>t</code>, the samples would be evenly spaced along the <em>spiral</em>, which
+means densely packed near the centre &#8212; the area of an annulus grows as
+<code>r</code>, so uniform radial spacing over-samples the middle. Taking the
+square root spaces them uniformly by <strong>area</strong>. The same
+<code>&#8730;</code> appeared in chapter&#160;7's hemisphere for the same reason, and it
+will keep appearing: whenever you map a uniform random number to a radius, you
+want its square root.</p>
+
+<h2>Gather versus scatter, honestly</h2>
+
+<p>Here is the interesting compromise, and the comment states it more clearly
+than most published descriptions of the technique:</p>
+
+<pre>float w = max(coc_of(texture(posTex, uv + off).xyz), 0.05);
+sum += texture(colorTex, uv + off).rgb * w;
+wsum += w;</pre>
+
+<blockquote class="aside">
+<p>"Weight each tap by its OWN circle of confusion, so a blurry foreground bleeds
+outward instead of being clipped off by a sharp background pixel. Not exact &#8212;
+physically an out-of-focus foreground SCATTERS over the background, and a gather
+filter like this one can only pull inward &#8212; but it removes the tell-tale hard
+edge around near objects, which is the 90%-for-5% version of the fix."</p>
+</blockquote>
+
+<p>Unpack that. Physically, an out-of-focus point <em>spreads outward</em> onto its
+neighbours &#8212; a <em>scatter</em>. But a fragment shader can only write to its own
+pixel; it cannot deposit light on its neighbours. So every practical
+implementation inverts the problem into a <em>gather</em>: instead of asking
+"where does my light go?", each pixel asks "whose light lands on me?"</p>
+
+<p>The inversion is only exact if every contributing pixel has the same circle of
+confusion. At a depth discontinuity &#8212; a blurred bead in front of a sharp
+background &#8212; it is not. A naive gather would let a sharp background pixel
+dominate the average right up to the bead's edge, and the blurred bead would end
+up with a razor-sharp outline: unmistakably wrong. Weighting each tap by its own
+CoC means a blurry tap contributes strongly and a sharp one weakly, which
+approximately restores the outward bleed. The <code>max(..., 0.05)</code> floor
+keeps a fully sharp neighbourhood from summing to zero.</p>
+
+<p>It is not correct. It is close enough that you will not notice, and correct
+scattering costs a sorted per-pixel accumulation buffer.</p>
+
+<h2>Two early-outs</h2>
+
+<pre>if (enabled &lt; 0.5) { frag = c0; return; }
+float coc = coc_of(texture(posTex, uv).xyz);
+if (coc &lt; 0.02) { frag = c0; return; }          // already sharp</pre>
+
+<p>Full-screen passes live and die by early-outs. Pixels near the focus plane skip
+24 texture fetch pairs entirely, so the cost scales with how much of the frame is
+actually out of focus rather than with the frame.</p>
+
+<p>The uniform-driven <code>enabled</code> branch is uniform across every
+invocation, so the GPU's branch predictor handles it perfectly &#8212; there is no
+divergence penalty when all threads in a warp take the same path. The
+<code>coc &lt; 0.02</code> branch <em>does</em> diverge at the boundary between sharp
+and blurred regions, where some pixels in a warp exit early and some do not; those
+warps pay for both paths. That is fine, because such warps are a thin band around
+the focus plane.</p>
+
+<h2>Blur that stays the same size</h2>
+
+<pre>DOF_REFERENCE_HEIGHT = 900.0
+...
+d["maxCoc"].value = (style.dof_bokeh_px * self.height / DOF_REFERENCE_HEIGHT)</pre>
+
+<p>A blur radius in pixels is not a property of the picture; it is a property of
+the picture <em>at a particular size</em>. Go fullscreen at 1600&#160;px tall with a
+fixed 6-pixel bokeh, and every bead is now nearly twice as big while the blur is
+not &#8212; the image gets visibly sharper. Scaling <code>maxCoc</code> with the
+viewport height keeps the blur the same fraction of the picture.</p>
+
+<p>This is the same instinct as the outline threshold in chapter&#160;9 and the
+<code>_r</code>-suffixed AO radii in chapter&#160;7: <strong>express every visual
+parameter in units that do not change when something irrelevant does.</strong>
+Blur as a fraction of the frame, occlusion as a multiple of the bead radius,
+outlines as a fraction of the on-screen radius, depth ramps as fractions of the
+scene's depth. That single discipline is why three very different scenes can share
+one style file.</p>
+
+<h2>Where it sits in the chain</h2>
+
+<pre>self.lit_tex.use(0)      # the composite's output
+self.pos_tex.use(1)      # the G-buffer position, still needed for the CoC
+self.shaded_fbo.use()
+self._fs_vaos[self.dof_prog].render(mode=c.TRIANGLES, vertices=3)</pre>
+
+<p>DoF reads the <em>composited</em> image, which is why the composite renders to
+<code>lit_fbo</code> rather than straight to the output &#8212; you cannot blur a
+picture you have not finished painting. And it still reads the G-buffer position
+texture, six passes downstream from the geometry that wrote it. The G-buffer is
+not consumed; it stays live for the whole frame.</p>
+
+<p>It also runs <em>before</em> the lines, which is deliberate and slightly
+opinionated: chapter&#160;12 has the argument.</p>
+
+</body>
+</html>

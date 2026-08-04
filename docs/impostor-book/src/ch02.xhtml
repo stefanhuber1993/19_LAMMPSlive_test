@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>2. Where a bead lives</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 2</p>
+<h1 class="first">Where a bead lives</h1>
+
+<p class="lead">Five coordinate systems, four transformations, and one division
+that does all the actual perspective. Get this chapter solid and the rest of the
+book is bookkeeping.</p>
+
+<figure>
+  <img src="images/fig-spaces.png" alt="Five boxes: world, view, clip, NDC, screen, connected by arrows labelled view matrix, projection matrix, perspective divide, viewport transform."/>
+  <figcaption><strong>Figure 2.1</strong> &#8212; A bead at world
+  <code>(2, 0, 0)&#160;&#963;</code>, followed all the way to a pixel. Every number
+  in this figure is derived below.</figcaption>
+</figure>
+
+<h2>World space</h2>
+
+<p>Where the physics lives. LAMMPS reports positions in the simulation's own
+units &#8212; here reduced units, so distances are in &#963;, and the sheet's cell is
+about 23.6&#160;&#963; wide. The membrane lies in the world <em>xy</em>-plane with its
+normal along <code>+z</code>; that is a convention this project chose, and the
+camera and the lighting are both built around it.</p>
+
+<p>Nothing about the screen exists yet. A bead at <code>(2, 0, 0)</code> is two
+&#963; to the right of the origin, and that statement is true no matter where you
+put the camera.</p>
+
+<h2>View space: put the eye at the origin</h2>
+
+<p>The projection maths is much simpler if the camera is at the origin looking
+down its own axis. So the first transformation is a rigid motion &#8212; a rotation
+plus a translation, no scaling, no distortion &#8212; that carries the camera to the
+origin and drags the whole world along with it.</p>
+
+<pre>def view_matrix(eye, right, true_up, forward):
+    R = np.array([right, true_up, -forward])
+    t = -R @ np.asarray(eye)
+    M = np.eye(4)
+    M[:3, :3] = R
+    M[:3, 3] = t
+    return M</pre>
+
+<p>Read <code>R</code> row by row. The first row is the camera's <code>right</code>
+vector, so <code>(R @ v)[0] = dot(right, v)</code> &#8212; "how far along the
+camera's right is this?" The second row gives "how far up", and the third row is
+<code>-forward</code>, giving "how far <em>behind</em> the camera". That last minus
+sign is the OpenGL convention: <strong>the camera looks down &#8722;z</strong>, so
+things in front of you have <em>negative</em> view-space z.</p>
+
+<blockquote class="aside">
+<p><strong>Why negative z is worth tolerating.</strong> It is a genuine
+annoyance &#8212; you will write <code>-P.z</code> to get a distance about forty
+times in this codebase. But it makes the coordinate system right-handed with
+<code>+x</code> right and <code>+y</code> up, which matches every maths textbook
+you have ever read. The alternative (left-handed, <code>+z</code> forward) makes
+cross products come out backwards. Every GLSL sample you find online assumes the
+OpenGL convention, so take the minus sign.</p>
+</blockquote>
+
+<p>The translation <code>t = -R @ eye</code> is just the rotation applied to the
+eye, negated: rotate first, then slide the rotated eye to the origin. If you
+prefer, <code>view = R &#183; (world &#8722; eye)</code>, written as one 4&#215;4 matrix so it
+composes with the projection.</p>
+
+<h3>Worked example</h3>
+
+<p>The sheet's camera sits at <code>eye = (0, &#8722;14.46, 14.18)</code> looking at
+<code>target = (0, 5.63, 0)</code>. A bead near the front of the sheet lands at
+view-space <code>(2.0, 0, &#8722;12.0)</code>: two &#963; to the camera's right, level with
+the view axis, twelve &#963; in front of the lens. From here on we only ever use
+those three numbers &#8212; the world position has done its job.</p>
+
+<h2>The projection matrix, from a pinhole camera</h2>
+
+<p>Now the interesting part. Forget matrices for a second and think about a
+pinhole camera, which is what <code>Camera3D</code> literally implements:</p>
+
+<pre>sx = self.cx + cx * scale      # scale = focal / depth
+sy = self.cy - cy * scale</pre>
+
+<p>A point <code>cx</code> units to the right, at depth <code>d</code>, lands
+<code>focal &#215; cx / d</code> pixels right of the screen centre. That is similar
+triangles, and it is the whole of perspective: <strong>divide by the
+distance</strong>. Things twice as far away are half as big.</p>
+
+<p>The GPU cannot literally divide inside a matrix multiply &#8212; matrices are
+linear and division is not. So it does something slightly sneaky: it keeps a
+fourth coordinate <code>w</code>, arranges for <code>w</code> to come out equal to
+the distance, and then divides by it in fixed-function hardware after the vertex
+shader returns. That post-shader division is called the <strong>perspective
+divide</strong>, and it is the only nonlinear step in the pipeline.</p>
+
+<pre>def proj_matrix(fx, fy, near, far):
+    M = np.zeros((4, 4))
+    M[0, 0] = fx
+    M[1, 1] = fy
+    M[2, 2] = -(far + near) / (far - near)
+    M[2, 3] = -2.0 * far * near / (far - near)
+    M[3, 2] = -1.0
+    return M</pre>
+
+<p>The bottom row is the trick: <code>M[3, 2] = -1</code> means
+<code>clip.w = &#8722;z_view</code>, which for a point in front of the camera is a
+positive distance. Everything else divides by that.</p>
+
+<h3>What fx and fy are</h3>
+
+<p>They are the pinhole focal length, rescaled so the screen runs from &#8722;1 to
++1 instead of from 0 to <code>W</code>:</p>
+
+<pre>fx = camera.focal / (camera.viewport_w / 2.0)   # 444.4 / 410 = 1.0839
+fy = camera.focal / (camera.viewport_h / 2.0)   # 444.4 / 450 = 0.9876</pre>
+
+<p>Check it. <code>ndc.x = fx &#183; x / (&#8722;z)</code>, and the viewport transform then
+maps &#8722;1..+1 onto 0..W, so the pixel offset from centre is
+<code>ndc.x &#183; W/2 = focal &#183; x / (&#8722;z)</code>. The <code>W/2</code> cancels the one
+in <code>fx</code>, and you are back at the pinhole formula. The projection matrix
+is a pinhole camera wearing a normalisation.</p>
+
+<p>Note <code>fx &#8800; fy</code> here because the viewport is 820&#215;900 &#8212; taller
+than it is wide. The <em>focal length in pixels is the same</em> in both
+directions (a pixel is square); it is only the normalisation that differs. Get
+this backwards and your beads come out as eggs.</p>
+
+<h2>Clip space and the divide</h2>
+
+<p>Our bead at view <code>(2, 0, &#8722;12)</code>. The frustum for this frame runs
+<code>near = 10.411</code> to <code>far = 29.577</code> &#8212; the renderer measures
+the bead extent and pads it, in <code>_render_gl_3d</code>:</p>
+
+<pre>near_clip = dmin - phys_r - 1.0     # 11.911 - 0.5 - 1 = 10.411
+far_clip  = dmax + phys_r + 1.0     # 28.077 + 0.5 + 1 = 29.577</pre>
+
+<p>so <code>M[2][2] = &#8722;2.0864</code> and <code>M[2][3] = &#8722;32.1325</code>. Multiply
+out:</p>
+
+<pre>clip.x = fx &#183; 2      =    2.1678
+clip.y = fy &#183; 0      =    0
+clip.z = &#8722;2.0864&#183;(&#8722;12) + (&#8722;32.1325) &#183; 1  =  &#8722;7.096
+clip.w = &#8722;(&#8722;12)     =   12.0</pre>
+
+<p>Divide by <code>w</code> and you are in <strong>normalised device
+coordinates</strong>, the cube from &#8722;1 to +1 in all three axes:</p>
+
+<pre>ndc = (0.1807, 0.0, &#8722;0.5913)</pre>
+
+<p>and the viewport transform turns that into a pixel:</p>
+
+<pre>x_px = (0.1807 &#215; 0.5 + 0.5) &#215; 820 = 484.1
+y_px = (0.0    &#215; 0.5 + 0.5) &#215; 900 = 450.0</pre>
+
+<p>which is exactly what <code>Camera3D.project</code> gives on the CPU:
+<code>410 + 2 &#215; (444.4/12) = 484.07</code>. The two paths agree, which is not an
+accident &#8212; <code>gl3d.py</code>'s matrix helpers were written to match
+<code>camera.py</code> so the CPU overlays land on top of the GPU beads.</p>
+
+<h2>The depth mapping is not linear</h2>
+
+<p>The <code>z</code> component of NDC is what ends up in the depth buffer,
+remapped from &#8722;1..+1 to 0..1:</p>
+
+<pre>gl_FragDepth = 0.5 &#215; (clip.z / clip.w) + 0.5   =  0.5 &#215; (&#8722;0.5913) + 0.5  =  0.204</pre>
+
+<p>Our bead sits at 12&#160;&#963; in a frustum spanning 10.4 to 29.6 &#8212; 8% of the way
+through &#8212; but it lands at 20% of the depth buffer. That is the
+<code>1/z</code> in the divide: after dividing <code>clip.z</code> by
+<code>w = distance</code>, the mapping is hyperbolic, not linear.</p>
+
+<figure>
+  <img src="images/fig-depth.png" alt="Plot of gl_FragDepth against view distance, showing a strongly curved line against a straight dashed reference."/>
+  <figcaption><strong>Figure 2.2</strong> &#8212; The sheet's actual frustum. The
+  first 3&#160;&#963; of the scene get half the depth buffer; the last 8&#160;&#963; share
+  about 6% of it.</figcaption>
+</figure>
+
+<p>This is why the near plane matters so much. Push <code>near</code> from 10.4
+down to 0.05 and the curve becomes a cliff: essentially the whole 0..1 range is
+spent on the first fraction of a &#963;, and everything past 12&#160;&#963; is crammed into
+the last few floating-point values &#8212; two beads a tenth of a &#963; apart get the
+<em>same</em> depth, and which one wins flickers frame to frame. That artefact is
+called z-fighting, and the reason you have never seen it in this renderer is the
+two lines above: the near plane is fitted to the scene every single frame.</p>
+
+<blockquote class="aside">
+<p><strong>Why widen the planes for the box outline.</strong> Just after those
+two lines, <code>_render_gl_3d</code> projects the eight corners of the periodic
+box and pushes <code>near_clip</code>/<code>far_clip</code> out to enclose them.
+The box outline is drawn as real GL lines through the same matrices
+(chapter&#160;12), so a corner poking in front of the nearest bead would simply be
+cut off at the near plane. You would see an edge of the box vanish as you orbited
+&#8212; the kind of bug that takes an hour to attribute to the near plane.</p>
+</blockquote>
+
+<h2>The one function you will use constantly</h2>
+
+<p>Everything above runs <em>forward</em>: a 3D point becomes a pixel. Chapters 6
+onward need the same thing in a hurry, inside a fragment shader, without a matrix
+multiply. That reduces to two lines, and they are worth memorising:</p>
+
+<pre>vec2 view_to_uv(vec3 p) {
+    vec2 ndc = projScale * p.xy / max(-p.z, 1e-6);
+    return ndc * 0.5 + 0.5;
+}</pre>
+
+<p><code>projScale</code> is just <code>(fx, fy)</code>, uploaded as a
+<code>vec2</code>. That is the whole projection: multiply by <code>fx</code>,
+divide by the distance, shift into 0..1. Chapter&#160;6 explains why this small
+function is the load-bearing wall of the entire post-processing chain.</p>
+
+</body>
+</html>

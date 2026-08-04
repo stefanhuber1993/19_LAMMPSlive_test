@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>15. Things to go and break</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 15</p>
+<h1 class="first">Things to go and break</h1>
+
+<p class="lead">Reading a shader teaches you what it says. Breaking one teaches
+you what it does. These are ordered by how much you will learn per minute
+spent.</p>
+
+<h2>How to look at things</h2>
+
+<p>Two facts make experimenting cheap here. First, <code>_apply_style</code> runs
+<em>every frame</em>, so any <code>RenderStyle</code> field is live &#8212; edit the
+playground file, restart, and you see it. Second, the pipeline is
+context-agnostic, so you can render without a window at all:</p>
+
+<pre>import moderngl
+from lammps_live.ui.gl3d import GLScene, view_matrix, proj_matrix
+
+ctx = moderngl.create_standalone_context(require=330)
+scene = GLScene(ctx, 820, 900)
+scene.render(view, proj, centers, radii, directors, (11.9, 28.1))
+img = scene.read_rgb()          # (900, 820, 3) uint8, row 0 = top</pre>
+
+<p>That validates the GLSL and the instance-buffer layout with no display, which
+makes it a fine place to try shader edits before wiring them into the app.</p>
+
+<h2>Level 1: turn things off</h2>
+
+<p>Every one of these is a single field in a playground's
+<code>DEFAULT_STYLE.varied(...)</code> call. Change it, look, change it back.</p>
+
+<dl>
+<dt><code>display_gamma = 1.0</code></dt>
+<dd>Disables the linear-light conversion entirely (chapter&#160;9). The whole image
+goes flat and chalky. This is the single most instructive one-character change in
+the file, because the failure looks like a <em>lighting</em> problem and is a
+<em>units</em> problem.</dd>
+
+<dt><code>antialias = False</code></dt>
+<dd>Chapter&#160;11's pass, gone. Look at the sheet's far rows and then move the
+camera: the crawl is the thing FXAA was actually buying, more than the static
+jaggedness.</dd>
+
+<dt><code>curvature_ao = False</code></dt>
+<dd>One line of chapter&#160;9, and beads immediately stop separating from each
+other. This is the cheapest effect in the renderer and one of the most
+valuable.</dd>
+
+<dt><code>ao_strength = 1.0</code></dt>
+<dd>Turns the exponent into a no-op. The occlusion is still computed, but nothing
+looks occluded &#8212; which tells you how much of "ambient occlusion looks right" is
+the raw term and how much is the curve applied to it.</dd>
+
+<dt><code>outline_edge_fraction = 0.60</code></dt>
+<dd>Well past sensible. Watch for the bright <em>square</em> in the middle of each
+bead that chapter&#160;9 predicted from <code>g = max(|dx|, |dy|)</code>. Seeing the
+prediction come true is worth more than reading the derivation twice.</dd>
+</dl>
+
+<h2>Level 2: break an invariant deliberately</h2>
+
+<p>These need a shader edit in <code>gl3d.py</code>. Each targets one specific
+argument in the book.</p>
+
+<h3>1. The screen-parallel billboard (chapter 3)</h3>
+
+<p>In <code>_GEOM_VS</code>, replace the tangent-circle construction with the naive
+one:</p>
+
+<pre>vec3 corner = C + vec3(in_corner * r, 0.0);</pre>
+
+<p>Then look at the <em>corners</em> of the viewport, where chapter&#160;3 computed
+that beads need a quad 70% larger than <code>r</code>. You should see beads with
+straight bites taken out of them along the frame edge, and the bite should grow as
+you move toward the corner. Now try the historical fix &#8212; multiply <code>r</code>
+by 1.15 &#8212; and confirm it helps in the middle distance and still fails in the
+corner.</p>
+
+<h3>2. Interpolated depth (chapter 4)</h3>
+
+<p>Comment out the two lines that write <code>gl_FragDepth</code>. The beads still
+look like spheres, individually. But watch two beads overlap: instead of
+intersecting along a curve, one will jump wholesale in front of the other. This is
+the artefact the entire hand-written-depth machinery exists to remove, and the
+module docstring's description ("z-jumps") is exact.</p>
+
+<p>While you are there, measure the frame time with and without. The difference is
+early-z, and it is the price chapter&#160;14 talks about.</p>
+
+<h3>3. The unmasked blur (chapter 8)</h3>
+
+<p>In <code>_BLUR_FS</code>, set <code>float fg = 1.0;</code> unconditionally. Every
+bead grows a bright halo, because the background's <code>(1, 1)</code> bleeds
+inward across the silhouette. Then work out why the halo is <em>bright</em> rather
+than dark &#8212; the answer is in chapter&#160;7's very first lines.</p>
+
+<h3>4. Linear shadow steps (chapter 7)</h3>
+
+<p>Change <code>shadowLen * f * f</code> to <code>shadowLen * f</code>. The contact
+shadows &#8212; the dark seams where beads touch &#8212; largely vanish, because with
+16&#160;equal steps over 2.75&#160;&#963; the first step is already a third of a bead radius
+out. Same sixteen lookups, badly spent.</p>
+
+<h3>5. Remove the jitter (chapter 6)</h3>
+
+<p>Set <code>float jit = 0.5;</code> in <code>sun_visibility</code> and
+<code>float rot = 0.0;</code> in the occlusion loop. The error does not get any
+larger, but it becomes <em>structured</em>: banding in the occlusion, terracing at
+shadow edges. This is the clearest possible demonstration that noise is not the
+enemy &#8212; pattern is.</p>
+
+<h3>6. Un-cancel the outline threshold (chapter 9)</h3>
+
+<p>In the composite, replace <code>float t0 = outlineThresh * dist;</code> with a
+constant, say <code>float t0 = 0.15;</code>. Now the outline is a fixed depth
+gradient rather than a fixed fraction of each bead's radius, so near beads get
+swallowed and far ones get nothing. Then orbit, and watch the outline width
+breathe as the beads change distance. That is the artefact the
+<code>* dist</code> and the <code>focal_px</code> derivation jointly remove.</p>
+
+<h2>Level 3: build something</h2>
+
+<h3>7. Visualise the G-buffer</h3>
+
+<p>Write a debug composite that outputs one channel raw:
+<code>frag = vec4(N * 0.5 + 0.5, 1.0)</code> for normals,
+<code>vec4(vec3(ao), 1.0)</code> for occlusion, <code>vec4(vec3(shadow), 1.0)</code>
+for sun visibility, <code>vec4(vec3(-P.z / 30.0), 1.0)</code> for depth. Half an
+hour's work, and it is the single most useful debugging tool you can have in a
+deferred renderer &#8212; every bug becomes "which buffer is wrong?"</p>
+
+<h3>8. Separate the blur</h3>
+
+<p>Chapter&#160;8's exercise: split the 4&#215;4 masked box blur into a horizontal and a
+vertical pass, carrying the weighted sum and the weight sum through an
+intermediate texture. 8 taps instead of 16, at the cost of one more full-screen
+pass at 184,500 pixels. Then measure it, and be prepared for the answer to be
+"no difference" &#8212; at this resolution the pass setup may cost more than the
+taps.</p>
+
+<h3>9. Half-resolution depth of field</h3>
+
+<p>Chapter&#160;14 identified DoF as the most expensive pass. Render it at half
+resolution into a smaller texture and composite it back, blending by circle of
+confusion so sharp regions keep full resolution. This is what production engines
+do, and getting the sharp/blurred boundary clean is the interesting part.</p>
+
+<h3>10. A second light</h3>
+
+<p>The composite has one sun. Add a second direction with its own colour and gain,
+and note what you can and cannot reuse: the diffuse and specular terms duplicate
+trivially, but the contact-shadow march in pass&#160;2 would need a second 16-step
+loop and a third output channel. Working out the cost of that &#8212; and why real
+engines therefore use shadow maps once they have more than one or two lights &#8212;
+is the real exercise.</p>
+
+<h2>A last word</h2>
+
+<p>The thing worth taking from this renderer is not any single technique. It is
+the habit visible in every comment in <code>gl3d.py</code> and
+<code>render_style.py</code>: each number is expressed in units that do not change
+when something irrelevant changes. Occlusion radii in bead radii. Depth ramps in
+fractions of the scene's span. Blur in pixels at a reference viewport height.
+Outlines in fractions of a bead's on-screen radius, converted through the focal
+length so that both the distance and the radius cancel.</p>
+
+<p>That discipline is why one style file drives a 7-bead patch, a 900-bead sheet
+and a 1500-bead assembly box, in a window or fullscreen, without any of them
+needing to be retuned. It is a much more transferable lesson than the ray-sphere
+formula &#8212; and unlike the formula, you will have to keep choosing it.</p>
+
+</body>
+</html>

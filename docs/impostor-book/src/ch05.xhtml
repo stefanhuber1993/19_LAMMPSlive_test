@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>5. The G-buffer</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 5</p>
+<h1 class="first">The G-buffer: shade it later</h1>
+
+<p class="lead">Pass 1 does not compute a single pixel of colour. It writes down
+what is at every pixel and stops. Everything after it is a photograph of a
+photograph.</p>
+
+<h2>Forward versus deferred</h2>
+
+<p>The straightforward way to render is <strong>forward</strong>: as each fragment
+comes out of the rasteriser, shade it right there &#8212; look up the lights, compute
+diffuse and specular, write the final colour. It is simple, and it has two
+problems that matter here.</p>
+
+<p><strong>Overdraw.</strong> In a dense bead cloud, five or six beads can stack
+up on the same pixel. Forward shading fully lights all six, then throws five
+away. You paid six times for one pixel.</p>
+
+<p><strong>Neighbours.</strong> Ambient occlusion, outlines, depth of field and
+antialiasing all need to know about <em>other pixels</em>: what is beside me, what
+is behind me. A forward fragment shader cannot ask. It sees one fragment and has
+no access to the rest of the frame.</p>
+
+<p><strong>Deferred</strong> shading splits the job in two. Pass&#160;1 rasterises
+the geometry and writes, for each pixel, the raw material facts &#8212; colour,
+normal, position &#8212; into a set of textures. Then, in a completely separate pass,
+you draw one full-screen triangle and shade every pixel from those textures. By
+then the depth test has already thrown away the hidden fragments, so lighting
+runs exactly once per <em>visible</em> pixel, and the shader can sample any
+neighbour it likes.</p>
+
+<p>That bundle of textures is the <strong>geometry buffer</strong>, or G-buffer.</p>
+
+<figure>
+  <img src="images/fig-gbuffer.png" alt="Four stacked labelled boxes: albedo RGBA16F, normal RGB16F, view position RGBA32F, depth DEPTH24, with descriptions."/>
+  <figcaption><strong>Figure 5.1</strong> &#8212; The four attachments. After pass&#160;1
+  the beads are never consulted again; the rest of the pipeline knows only
+  this.</figcaption>
+</figure>
+
+<h2>Multiple render targets</h2>
+
+<p>A fragment shader can write to more than one texture at a time. In GLSL you
+declare the slots:</p>
+
+<pre>layout(location=0) out vec4 o_albedo;
+layout(location=1) out vec3 o_normal;
+layout(location=2) out vec4 o_viewpos;</pre>
+
+<p>and on the Python side you attach three textures to one framebuffer, in that
+order:</p>
+
+<pre>self.gbuffer = c.framebuffer(
+    color_attachments=[self.albedo_tex, self.normal_tex, self.pos_tex],
+    depth_attachment=self.depth_tex,
+)</pre>
+
+<p>Position 0 in the list is <code>location=0</code>. One draw call, one fragment
+shader invocation, three textures written. This is called MRT, and it is what
+makes deferred rendering practical: the alternative would be rasterising the
+geometry three separate times.</p>
+
+<h2>Why each format is what it is</h2>
+
+<p>Texture formats are where deferred renderers are won and lost. Each choice in
+<code>resize()</code> has a specific reason.</p>
+
+<h3>albedo: <code>RGBA16F</code> (4 channels, half float)</h3>
+
+<pre># Albedo is f2 (not f1) so a per-bead brightness boost (&gt;1) survives into
+# the composite before the final clamp.</pre>
+
+<p>An 8-bit texture (<code>f1</code>) stores 0..1 and clamps. But
+<code>in_bright</code> can exceed 1 &#8212; that is the "spotlight" that highlights a
+tagged cluster &#8212; and <code>o_albedo = vec4(albedo * v_bright, v_fade)</code>
+would silently clip it to white. Half float carries values above 1 through to the
+tonemap, which is the thing that is <em>supposed</em> to decide how bright is too
+bright. The fourth channel is the per-bead fade.</p>
+
+<h3>normal: <code>RGB16F</code></h3>
+
+<p>A unit vector in &#8722;1..+1. Half float gives about three decimal digits, which is
+plenty &#8212; a normal error of 0.001 shifts a highlight by a fraction of a pixel.
+(Production engines often pack normals into two 8-bit channels using an octahedral
+mapping and reconstruct the third component; that halves the bandwidth and is not
+worth the complexity at this scale.)</p>
+
+<h3>view position: <code>RGBA32F</code> &#8212; full float, and it matters</h3>
+
+<pre># Full float for the view position: its z is a world-space distance, and
+# the outline pass compares NEIGHBOURING distances against a threshold of
+# a couple of thousandths of one -- which is below half-float resolution
+# out at the far side of a big box, so f2 here reads as edge noise.</pre>
+
+<p>Worth doing the arithmetic on, because it is a lovely example of a format
+choice with a visible consequence. A half float has 10 bits of mantissa, so near
+a value of 28 the spacing between representable numbers is about
+<code>28 / 2&#185;&#8304; &#8776; 0.027</code>. Chapter&#160;9's outline compares neighbouring
+depths against a threshold of <code>0.009292 &#215; 28 = 0.26</code>. The quantisation
+step is a tenth of the threshold &#8212; so the depth gradient the outline measures
+would come out in visible stair-steps, and the outline would sparkle. Full float
+has 24 bits of mantissa; the step at 28 is <code>1.7&#215;10&#8315;&#8310;</code>. Problem
+gone.</p>
+
+<h3>depth: a <code>depth_texture</code>, with comparison disabled</h3>
+
+<pre>self.depth_tex = c.depth_texture((width, height))
+self.depth_tex.compare_func = ""          # sample raw depth, not a compare</pre>
+
+<p>Depth textures default to <em>comparison</em> mode, a shadow-mapping feature
+where sampling returns "is this nearer than X?" rather than the depth itself.
+Clearing <code>compare_func</code> makes it an ordinary readable texture.</p>
+
+<h3><code>NEAREST</code> filtering on all three</h3>
+
+<pre>for t in (self.albedo_tex, self.normal_tex, self.pos_tex):
+    t.filter = (c.NEAREST, c.NEAREST)</pre>
+
+<p>Linear filtering would blend neighbouring texels. For a colour that is
+desirable; for a G-buffer it is nonsense &#8212; averaging the view positions of a
+foreground bead and the background behind it gives a point in empty space that
+belongs to nothing. Every G-buffer read in this renderer wants the value at one
+specific pixel, so: nearest.</p>
+
+<h2>The background test</h2>
+
+<p>Every later pass has to distinguish "a bead is here" from "empty sky". The
+convention this renderer uses costs nothing:</p>
+
+<pre>self.gbuffer.clear(0.0, 0.0, 0.0, 0.0, depth=1.0)
+...
+if (P.z &lt; -1e-4) { /* a bead */ } else { /* sky */ }</pre>
+
+<p>The buffer is cleared to zero. Any real bead is <em>in front of</em> the camera,
+and view space puts "in front" at negative z, so any bead fragment has
+<code>P.z &lt; 0</code> strictly. Zero therefore unambiguously means "nothing was
+written here". You get a free coverage mask out of a channel you needed
+anyway.</p>
+
+<blockquote class="aside">
+<p><strong>A real bug this convention avoided.</strong> The composite pass could
+in principle test the depth texture instead. It must not, and the comment records
+why: the depth texture is <em>this framebuffer's own depth attachment</em>.
+Reading a texture you are simultaneously rendering with is a framebuffer feedback
+loop, which is undefined in OpenGL. On a tile-based GPU &#8212; Apple Silicon &#8212; it
+surfaced as intermittent black tiles. Undefined behaviour rarely announces
+itself; it shows up as an intermittent artefact on one machine.</p>
+</blockquote>
+
+<h2>What it costs</h2>
+
+<p>The sim viewport is 820&#215;900 = 738,000 pixels. Per pixel the G-buffer is
+8&#160;bytes of albedo + 6 of normal + 16 of position + 4 of depth = 34&#160;bytes.
+Add the downstream buffers and the whole pipeline holds:</p>
+
+<table>
+<tr><th>buffer</th><th>format</th><th class="num">size</th></tr>
+<tr><td>albedo</td><td>RGBA16F</td><td class="num">5.9 MB</td></tr>
+<tr><td>normal</td><td>RGB16F</td><td class="num">4.4 MB</td></tr>
+<tr><td>view position</td><td>RGBA32F</td><td class="num">11.8 MB</td></tr>
+<tr><td>depth</td><td>DEPTH24</td><td class="num">3.0 MB</td></tr>
+<tr><td>occlusion &#215; 2 (half res)</td><td>RG16F</td><td class="num">1.5 MB</td></tr>
+<tr><td>lit (composite output)</td><td>RGBA16F</td><td class="num">5.9 MB</td></tr>
+<tr><td>shaded, final</td><td>RGBA8 &#215; 2</td><td class="num">5.9 MB</td></tr>
+<tr><th>total</th><th></th><th class="num">38 MB</th></tr>
+</table>
+
+<p>That is the deferred bargain stated in bytes: you trade about 38&#160;MB of
+video memory and 25&#160;MB per frame of write bandwidth for the ability to shade
+each visible pixel once and to let every effect see its neighbours. On any GPU
+made this decade it is an obviously good trade. On a mobile chip with 8&#160;MB of
+tile memory it would not be, which is why mobile renderers still favour
+forward.</p>
+
+<h2>The resize dance</h2>
+
+<p>Every one of these textures is sized to the viewport, so all of them are torn
+down and rebuilt when the window changes:</p>
+
+<pre>def resize(self, width, height):
+    if width == self.width and height == self.height:
+        return
+    ...
+    self._release_fbos()</pre>
+
+<p>The early return matters: <code>resize()</code> is called every frame from the
+renderer, and rebuilding ten textures per frame would be a disaster. The
+<code>release()</code> matters too &#8212; Python's garbage collector does not know
+about GPU memory, and a dropped reference to a moderngl texture does not free the
+VRAM until the object is finalised, which may be much later or never. Explicit
+release is the rule for every GL resource in the file.</p>
+
+</body>
+</html>

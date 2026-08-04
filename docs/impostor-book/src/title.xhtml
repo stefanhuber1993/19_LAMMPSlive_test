@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Spheres Without Geometry</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<section epub:type="titlepage" class="titlepage">
+  <h1>Spheres Without&#160;Geometry</h1>
+  <p class="sub">How the LAMMPS-live impostor renderer draws<br/>1500 beads in one draw call</p>
+  <p class="by">a short textbook for the code in<br/><code>lammps_live/ui/gl3d.py</code></p>
+</section>
+
+<h1>How to read this</h1>
+
+<p class="lead">You have ten years of Python and three days of shaders. This book
+assumes exactly that. Every piece of maths is written out and checked against a
+number, and every number is one your own renderer actually produces.</p>
+
+<p>The scene the numbers come from is the MesoMem membrane sheet
+(<code>lammps_live/playgrounds/mesomem_sheet.py</code>): 900 beads of radius
+0.5&#160;&#963;, seen through the 820&#160;&#215;&#160;900&#160;pixel sim viewport,
+at the focal length the camera picks when it fits the sheet to that viewport.
+Those are the real values, pulled out of the running system, not round numbers
+invented for a textbook. One simplification: they are measured with
+<code>periodic_images = (0, 0, 0)</code>, the single real cell, so that the depth
+span stays small and the arithmetic stays readable. Chapter&#160;13 turns the
+images back on and gives the numbers for that.</p>
+
+<table>
+<tr><th>quantity</th><th>symbol</th><th class="num">value</th></tr>
+<tr><td>sim viewport</td><td><code>W &#215; H</code></td><td class="num">820 &#215; 900 px</td></tr>
+<tr><td>focal length</td><td><code>f</code></td><td class="num">444.4 px</td></tr>
+<tr><td>bead radius</td><td><code>r</code></td><td class="num">0.5 &#963;</td></tr>
+<tr><td>nearest bead</td><td><code>d_front</code></td><td class="num">11.911 &#963;</td></tr>
+<tr><td>farthest bead</td><td><code>d_back</code></td><td class="num">28.077 &#963;</td></tr>
+<tr><td>bead radius on screen, front</td><td></td><td class="num">18.7 px</td></tr>
+<tr><td>bead radius on screen, back</td><td></td><td class="num">7.9 px</td></tr>
+</table>
+
+<p>Keep those seven numbers somewhere in your head. Almost every calculation in
+the book is one of them divided by another.</p>
+
+<h2>What each chapter is for</h2>
+
+<dl>
+<dt>1&#8211;2</dt><dd>The idea of an impostor, and the projection maths you need before
+you can build one. If you already know view and projection matrices cold, skim
+chapter 2 for the number table and move on.</dd>
+<dt>3&#8211;4</dt><dd>The heart of it: the vertex shader that builds the quad and the
+fragment shader that ray-casts the sphere inside it. This is where the impostor
+technique actually lives.</dd>
+<dt>5&#8211;6</dt><dd>Deferred shading. What a G-buffer is, and the one trick
+(<code>view_to_uv</code>) that every screen-space effect in the book is built
+on.</dd>
+<dt>7&#8211;11</dt><dd>The effects, one per chapter: occlusion, shadows, blur, the
+composite, depth of field, antialiasing.</dd>
+<dt>12&#8211;14</dt><dd>Lines, periodic images, and a cost model that explains why
+the whole thing runs at a fixed price no matter how many beads you throw at
+it.</dd>
+<dt>15</dt><dd>Things to go and break, in ascending order of how much you will
+learn from breaking them.</dd>
+</dl>
+
+<h2>A note on the maths notation</h2>
+
+<p>GLSL is written in <code>code font</code>. Vectors are bold in your head and
+plain on the page: <code>N</code> is a normal, <code>P</code> a position,
+<code>L</code> a direction toward the light. <code>dot(a, b)</code> is the dot
+product, which for two unit vectors is the cosine of the angle between them
+&#8212; that single fact is doing about half the work in this renderer, so if it
+is not automatic yet, make it automatic now.</p>
+
+<blockquote class="aside">
+<p><strong>The Python analogy that actually helps.</strong> A fragment shader is
+a function you write once and the GPU calls once per pixel, with no shared state
+between calls, no loops you control, and no way to look at the neighbour's
+answer. It is <code>map()</code> over about 700,000 items, run in parallel, where
+your function may only read from textures and write to its own output slot. Every
+strange thing in this book &#8212; why the blur needs a mask, why depth of field
+gathers instead of scatters, why antialiasing happens at the very end &#8212;
+follows from that one restriction.</p>
+</blockquote>
+
+</body>
+</html>

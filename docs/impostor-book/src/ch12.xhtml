@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>12. Lines, and the depth buffer that outlives its pass</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 12</p>
+<h1 class="first">Lines, and the depth buffer<br/>that outlives its pass</h1>
+
+<p class="lead">Bond spokes, the control net and the box outline are drawn as real
+GL lines, five passes after the geometry &#8212; and they are correctly hidden behind
+the beads without a single line of occlusion code.</p>
+
+<h2>Sharing a depth attachment</h2>
+
+<p>Here is the trick, and it is one line of Python:</p>
+
+<pre>self.shaded_fbo = c.framebuffer(
+    color_attachments=[self.shaded_tex], depth_attachment=self.depth_tex
+)</pre>
+
+<p><code>self.depth_tex</code> is the <em>same texture object</em> the G-buffer used
+for depth back in pass&#160;1. It was filled with every bead's hand-written
+<code>gl_FragDepth</code>, and nothing since has cleared it. So when the line pass
+binds this framebuffer and enables depth testing, it is testing against the real
+sphere surfaces &#8212; five passes and three intermediate textures later.</p>
+
+<pre>c.enable(c.DEPTH_TEST)
+c.depth_func = "&lt;="
+c.depth_mask = False           # test against beads, don't write
+self._line_vao[0].render(mode=c.LINES, vertices=m)</pre>
+
+<p>A bond spoke running from one bead to another disappears where it passes behind
+a third. There is no sorting, no clipping, no per-segment visibility test. Compare
+what the CPU fallback path in <code>renderer.py</code> has to do
+(<code>_draw_net_occluded</code>): step along each segment, project each step,
+compare against a software z-buffer, and draw the visible runs. Reusing the depth
+attachment replaces all of it.</p>
+
+<h3><code>depth_mask = False</code></h3>
+
+<p>Test against the depth buffer, but do not write to it. Two reasons. First, the
+lines are drawn with alpha blending, and a blended fragment that writes depth
+would occlude later blended fragments that should have shown through it &#8212; the
+standard transparency-ordering problem. Second, nothing after this pass reads
+depth, so writing would be wasted bandwidth. Restore it immediately afterwards
+(<code>c.depth_mask = True</code>), because GL state is global and the next frame
+inherits whatever you left behind.</p>
+
+<h3><code>depth_func = "&lt;="</code></h3>
+
+<p>Less-than-<em>or-equal</em>, where the geometry pass used strictly less-than. A
+line drawn exactly on a bead's surface &#8212; a bond spoke starting at a bead
+centre &#8212; would fail a strict test on the pixels where the two coincide. The
+tolerant comparison lets coincident geometry through.</p>
+
+<h2>Two slots, and one that ignores depth entirely</h2>
+
+<pre>self._line_vbo = [None, None]</pre>
+
+<p>The line pass runs twice per frame, from two buffers. The first is
+depth-tested, as above. The second is not:</p>
+
+<pre>// No depth test at all: these are the lines that have to stay
+// readable whatever is in front of them -- the cell outline, when
+// the cell itself is buried under its own periodic images.</pre>
+
+<p>This is a genuine design decision rather than a technical necessity, and
+<code>_build_gl_lines</code> spells out the reasoning. Once chapter&#160;13's
+periodic images surround the real cell, the box outline that says <em>this is the
+real cell</em> is buried inside copies of itself. Depth-correct rendering would
+hide the one line carrying the most information. So it is promoted to an overlay
+&#8212; and, in the same breath, exempted from the depth cue:</p>
+
+<pre># Un-fogged when it is on top: the depth cue exists to push
+# SCENERY into the distance, and once the outline is the only
+# thing saying where the real cell is among its images, it is
+# annotation rather than scenery.</pre>
+
+<p>Scenery obeys the atmosphere; annotation does not. That is a clean way to think
+about any overlay in a 3D view.</p>
+
+<h2>Why lines come after the blur and the tonemap</h2>
+
+<p>The pass order puts the lines between depth of field and FXAA, which means they
+are never defocused and never tonemapped. The comment defends it in one
+sentence:</p>
+
+<blockquote class="aside">
+<p>"After the blur and the tonemap on purpose: these are drawing, not photography
+&#8212; a defocused box outline reads as a rendering bug, and their colours are already
+the display-space values <code>theme.py</code> declares."</p>
+</blockquote>
+
+<p>Both halves are worth having. A blurred annotation looks like something went
+wrong, even though it is exactly what a camera would do &#8212; because the viewer does
+not model the outline as being <em>in</em> the scene. And the line colours come
+straight from <code>theme.py</code> as display-space bytes; sending them through
+the linear-light pipeline and back would require converting them into linear on
+the way in, which is pointless work to arrive at the same numbers.</p>
+
+<p>They do go through FXAA, though, because a one-pixel GL line is about the most
+aliased primitive there is.</p>
+
+<h2>What the lines encode</h2>
+
+<p><code>_build_gl_lines</code> is CPU-side and per-frame, and it packs a
+surprising amount of information into line colour and alpha.</p>
+
+<h3>Bond spokes: alpha as a strain gauge</h3>
+
+<pre>offset = abs(norm(pts[a] - pts[b]) - d_opt)
+alpha = BOND_PEAK_ALPHA * math.exp(-offset / lam)
+if alpha &lt; BOND_MIN_ALPHA: continue</pre>
+
+<p>Alpha peaks when a pair sits exactly at the equilibrium spacing and decays
+exponentially either side, with decay length <code>lam = 0.10 &#215; d_opt</code>. So a
+bond fades as its pair is stretched or compressed &#8212; pull a bead out of the sheet
+and you watch its spokes dissolve. The minimum-alpha test doubles as the distance
+cutoff that bounds how many pairs get drawn at all, which is what keeps this
+<code>O(pairs)</code> Python loop affordable.</p>
+
+<h3>Per-vertex colour, and the fog</h3>
+
+<pre>fog = self._fog(depth[idx], near, far)
+r, g, bb = _lerp_color(BOND_3D_COLOR, HAZE_COLOR, fog)</pre>
+
+<p>Each endpoint gets its own colour, computed at its own depth, and the GPU
+interpolates between them along the segment. A single line therefore fogs
+<em>along its length</em> for free &#8212; the far end recedes and the near end does
+not.</p>
+
+<p>The <code>near</code>/<code>far</code> passed in here are the same
+<code>cue_range</code> the composite uses on the beads, so a spoke recedes on
+exactly the ramp the beads do. That is the kind of consistency that is invisible
+when you get it right and glaring when you get it wrong.</p>
+
+<h3>The box outline's dissolving corner</h3>
+
+<pre># Per-VERTEX alpha, so the near corner dissolves along the
+# edges rather than the whole edge switching off.</pre>
+
+<p>A wireframe box always has one corner nearest the camera, and the three edges
+meeting there sit in front of the whole scene, which reads as clutter. Fading them
+by depth is the fix &#8212; and doing it <em>per vertex</em> rather than per edge is
+what makes it smooth. Orbit the camera and the fade slides continuously around the
+box, because it is a function of depth, which changes continuously. Per-edge
+alpha would make whole edges blink as the nearest corner changed.</p>
+
+<h2>The buffer growth pattern</h2>
+
+<pre>if m &gt; self._line_cap[slot]:
+    for obj in (self._line_vbo[slot], self._line_vao[slot]):
+        if obj is not None:
+            obj.release()
+    self._line_vbo[slot] = self.ctx.buffer(reserve=max(1, m) * 7 * 4, dynamic=True)
+    self._line_cap[slot] = m
+    self._line_vao[slot] = self.ctx.vertex_array(...)
+self._line_vbo[slot].write(data.tobytes())</pre>
+
+<p>The same grow-only pattern as the instance buffer in chapter&#160;1. The line
+count genuinely fluctuates frame to frame &#8212; bonds appear and vanish as pairs
+drift through the alpha cutoff &#8212; so a naive "allocate exactly what I need"
+would reallocate constantly. Growing and never shrinking converges to the
+high-water mark after a few seconds and then costs nothing.</p>
+
+<p>Note that the VAO must be recreated along with the buffer: a VAO stores a
+<em>reference</em> to the buffer object, and the old one is dangling once you
+release it. That is the sort of thing that produces a crash somewhere unrelated
+three frames later.</p>
+
+</body>
+</html>

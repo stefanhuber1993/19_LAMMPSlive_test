@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>3. The billboard that is exactly right</title>
+  <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+
+<p class="chapnum">Chapter 3</p>
+<h1 class="first">The billboard that is exactly right</h1>
+
+<p class="lead">The vertex shader's whole job is to place four corners. Doing it
+naively costs you the edges of your beads; doing it exactly costs four extra
+lines of algebra.</p>
+
+<h2>The naive quad, and why it fails</h2>
+
+<p>The obvious billboard: take the bead's centre in view space, build a square
+around it lying parallel to the screen, half-size <code>r</code>. In shader
+terms, <code>corner = C + (in_corner.x, in_corner.y, 0) * r</code>. It is one
+line, and it is what most first attempts look like.</p>
+
+<p>It works perfectly for a bead in the middle of the screen and fails
+progressively as you move outward. Here is why.</p>
+
+<figure>
+  <img src="images/fig-offaxis.png" alt="An eye, a sphere off to one side, the tangent cone, and a screen-parallel plane cut by the cone into a segment longer than the sphere's diameter."/>
+  <figcaption><strong>Figure 3.1</strong> &#8212; A sphere off to one side. The
+  silhouette cone is circular about the direction <em>to the sphere</em>, so a
+  plane parallel to the <em>screen</em> cuts it obliquely, and the slice is longer
+  than <code>2r</code>.</figcaption>
+</figure>
+
+<p>The rays that graze the sphere form a cone with its axis pointing at the
+sphere, not down the view axis. When you cut that cone with a screen-parallel
+plane, you cut it at an angle &#952;, and an oblique slice through a cone is longer
+than a perpendicular one &#8212; by a factor of about <code>1/cos&#160;&#952;</code> in the
+radial direction. The quad, sized <code>r</code>, is too short. The sphere's
+silhouette runs off the edge of its own quad, the fragment shader never gets
+those pixels, and the bead comes out with a straight bite taken out of it.</p>
+
+<p>Here is the shortfall, computed exactly (the exact expression includes a
+correction for the sphere's finite angular size; the last row is the
+small-bead limit):</p>
+
+<table>
+<tr><th>off-axis angle &#952;</th><th class="num">10&#176;</th><th class="num">20&#176;</th><th class="num">30&#176;</th><th class="num">40&#176;</th><th class="num">54&#176;</th></tr>
+<tr><td>a distant bead (<code>r/d = 0.04</code>)</td><td class="num">1.6%</td><td class="num">6.5%</td><td class="num">15.6%</td><td class="num">30.8%</td><td class="num">70%</td></tr>
+<tr><td>a close bead (<code>r/d = 0.2</code>)</td><td class="num">3.8%</td><td class="num">9.2%</td><td class="num">19.5%</td><td class="num">37.3%</td><td class="num">&#8212;</td></tr>
+<tr><td>the rule of thumb, <code>1/cos&#160;&#952; &#8722; 1</code></td><td class="num">1.5%</td><td class="num">6.4%</td><td class="num">15.5%</td><td class="num">30.5%</td><td class="num">70%</td></tr>
+</table>
+
+<p>Now put that against your own viewport. At <code>f = 444.4&#160;px</code> on an
+820&#215;900 view, the half-width subtends
+<code>atan(410/444.4) = 42.7&#176;</code> and the <em>corner</em> sits at
+<code>atan(&#8730;(410&#178;+450&#178;)/444.4) = 53.9&#176;</code>. A bead in the corner of your
+screen needs a quad <strong>70% larger</strong> than <code>r</code>. That is not
+a subtle artefact; that is a bead with a third of it missing.</p>
+
+<p>The code comment records the previous fix &#8212; "the old fix was a blanket
+1.15&#215; enlargement" &#8212; and why it was unsatisfying: 15% is far too little in the
+corners and pure waste in the middle, where every extra fragment is a
+ray-sphere test that will end in <code>discard</code>.</p>
+
+<h2>The exact construction</h2>
+
+<p>The clean fix is to stop fighting the geometry. Build the quad in the plane of
+the true silhouette &#8212; perpendicular to the direction <em>to the sphere</em> &#8212;
+and the ellipse problem disappears, because the cone is circular about exactly
+that axis.</p>
+
+<figure>
+  <img src="images/fig-billboard.png" alt="Eye at left, sphere at right, two tangent lines touching the sphere, the tangent circle drawn edge-on as a heavy segment slightly in front of the sphere's centre."/>
+  <figcaption><strong>Figure 3.2</strong> &#8212; The tangent circle. It is
+  <em>smaller</em> than the sphere and sits <em>nearer</em> the eye than the
+  centre. (Drawn with an exaggerated <code>r/d</code>; in the sheet the offset is
+  0.02&#160;&#963;.)</figcaption>
+</figure>
+
+<p>Consider a ray from the eye <code>O</code> that just grazes the sphere,
+touching it at <code>T</code>. Because it grazes, <code>OT</code> is tangent, so
+<code>OT &#8869; TC</code> and the triangle <code>OTC</code> has its right angle at
+<code>T</code>. Pythagoras gives the distance to the tangent point immediately:</p>
+
+<pre>t = &#8730;(d&#178; &#8722; r&#178;)</pre>
+
+<p>All such <code>T</code> form a circle around the axis <code>OC</code>. To place
+it, drop a perpendicular from <code>T</code> onto the axis. In a right triangle,
+the foot of the altitude from the right angle divides the hypotenuse into
+segments equal to the squares of the adjacent sides over the hypotenuse, and the
+altitude itself is the product of the legs over the hypotenuse. So:</p>
+
+<pre>circle centre, along the axis:   t&#178; / d
+circle radius:                   r &#183; t / d</pre>
+
+<p>Which is line for line what the shader does:</p>
+
+<pre>float d = length(C);
+vec3 fwd = C / d;
+float t = sqrt(max(d * d - r * r, 1e-6));
+float rc = r * t / d;              // silhouette circle radius
+vec3 Cc = fwd * (t * t / d);       // silhouette circle centre</pre>
+
+<h3>Why this covers the sphere exactly</h3>
+
+<p>Every ray from the eye that hits the sphere is inside the tangent cone. Every
+ray inside the cone passes through the disc bounded by the tangent circle. The
+quad, a square of half-size <code>rc</code> in that plane, contains that disc. So
+the quad's projection on screen contains the sphere's projection &#8212; at every
+angle, at every distance, with no fudge factor. And it is minimal, because the
+tangent circle is precisely the silhouette.</p>
+
+<p>The square wastes <code>4/&#960; &#8722; 1 = 27%</code> of its area on corners that
+will <code>discard</code>. That is the price of using a quad at all; a hexagon
+would trim it to 10% and cost you two more vertices per bead plus a more
+complicated corner table. Nobody does it.</p>
+
+<h3>The numbers, for the sheet</h3>
+
+<p>A bead at <code>d = 12&#160;&#963;</code> with <code>r = 0.5&#160;&#963;</code>:</p>
+
+<pre>t  = &#8730;(144 &#8722; 0.25)  = 11.98958
+rc = 0.5 &#215; 11.98958 / 12  =  0.499566     (0.09% smaller than r)
+Cc = 11.98958&#178; / 12       = 11.97917      (0.021 &#963; nearer than the centre)</pre>
+
+<p>Both corrections are <em>tiny</em>, and that is the point worth taking away:
+the size correction almost never matters for small beads. What matters is the
+<strong>orientation</strong> &#8212; that the quad is perpendicular to
+<code>fwd = C/d</code> rather than to the view axis. That single change is what
+buys you the 70% in the corner of the frame. The <code>rc</code> and
+<code>t&#178;/d</code> refinements are free once you are building the quad in that
+plane anyway, so you may as well be exact.</p>
+
+<h2>Building a basis out of thin air</h2>
+
+<p>You have a plane normal (<code>fwd</code>) and you need two perpendicular
+vectors to lay the corners out along. Any two will do &#8212; a square rotated about
+its own axis is still a square containing the same circle &#8212; so you just need
+<em>some</em> reproducible pair:</p>
+
+<pre>vec3 hint = abs(fwd.y) &lt; 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+vec3 right = normalize(cross(hint, fwd));
+vec3 up = cross(fwd, right);</pre>
+
+<p>The cross product of two vectors is perpendicular to both, so
+<code>cross(hint, fwd)</code> is perpendicular to <code>fwd</code> &#8212; exactly what
+we want &#8212; <em>unless</em> <code>hint</code> and <code>fwd</code> are parallel, in
+which case the cross product is the zero vector and <code>normalize</code> divides
+by zero. That is what the <code>abs(fwd.y) &lt; 0.99</code> test guards: if the bead
+happens to lie almost straight up in view space, swap to a different hint.</p>
+
+<p><code>up = cross(fwd, right)</code> needs no <code>normalize</code>, because
+<code>fwd</code> and <code>right</code> are already unit and perpendicular, so
+their cross product is automatically unit. One reciprocal square root saved per
+vertex, 3600 times a frame &#8212; not a lot, but it is free.</p>
+
+<blockquote class="aside">
+<p><strong>Does the branch cause a visible pop?</strong> No, and it is worth
+understanding why not, because the same trick recurs. When <code>fwd.y</code>
+crosses 0.99 the quad's rotation about its own axis jumps discontinuously. But
+the rotation is <em>unobservable</em>: the fragment shader tests each pixel
+against the sphere itself, and the sphere does not know how its quad was
+oriented. The discontinuity is in a quantity nothing downstream reads.</p>
+</blockquote>
+
+<h2>Handing the ray to the fragment shader</h2>
+
+<p>The last two lines are the ones that make the next chapter possible:</p>
+
+<pre>v_rayView = corner;
+gl_Position = proj * vec4(corner, 1.0);</pre>
+
+<p><code>gl_Position</code> is the required output &#8212; where this vertex lands.
+<code>v_rayView</code> is a <code>varying</code>: the GPU interpolates it linearly
+across the triangle, so each fragment receives the view-space position of
+<em>its own</em> point on the quad. And because the eye is at the origin in view
+space, that point <em>is</em> the ray direction, up to a scale factor. One
+<code>normalize</code> in the fragment shader and you have the ray from the eye
+through this exact pixel &#8212; without ever inverting a matrix.</p>
+
+<p>That is a pattern worth naming, because it recurs whenever a fragment shader
+needs to know "where am I, in 3D?": put the answer in a varying at the vertices
+and let the interpolator do the work.</p>
+
+<blockquote class="aside">
+<p><strong>A wrinkle worth knowing about.</strong> Perspective-correct
+interpolation of a varying divides by <code>w</code> per fragment, which is
+correct for a point on the quad &#8212; and the quad <em>is</em> a flat plane in
+view space, so the interpolated <code>v_rayView</code> is genuinely a point on
+it. The ray is then exact. If you had instead interpolated a normalised
+direction, you would get the normalised-then-interpolated vector, which is not
+the same as interpolated-then-normalised, and the beads would deform slightly
+near the frame edge.</p>
+</blockquote>
+
+</body>
+</html>
