@@ -11,6 +11,7 @@ from .. import units
 from .gl3d import GLScene, proj_matrix, view_matrix
 from .glcompositor import GLCompositor
 from .plotting import draw_plot
+from .scale import UI, auto_ui_scale, set_ui_scale
 from .widgets import Button
 from .theme import (
     ARROWHEAD_ANGLE, ARROWHEAD_LEN, ATOM_MAX_RADIUS, ATOM_MIN_RADIUS, BG,
@@ -102,7 +103,7 @@ class Renderer:
         # Per-species glyphs (e.g. "+"/"-" on ions) are stamped on a few
         # hundred atoms every frame, so each label string is rendered once and
         # cached rather than re-rasterized per atom.
-        self._glyph_font = pygame.font.SysFont(None, 17, bold=True)
+        self._glyph_font = UI.font(17, bold=True)
         self._glyph_cache = {}
 
         # A single high-res shaded WHITE sphere sprite, baked once from the
@@ -140,8 +141,9 @@ class Renderer:
         drawing targets, later composited over the GL scene (see GLCompositor); in
         the CPU fallback it is the display surface set by the caller's set_mode."""
         self.window_size = tuple(size)
-        self.sim_width = max(200, size[0] - PANEL_WIDTH)
-        self.panel_rect = pygame.Rect(self.sim_width, 0, PANEL_WIDTH, size[1])
+        self.panel_width = UI(PANEL_WIDTH)
+        self.sim_width = max(UI(200), size[0] - self.panel_width)
+        self.panel_rect = pygame.Rect(self.sim_width, 0, self.panel_width, size[1])
         self.box_x = self.box_y = None
         self.scale = self.ox = self.oy = None
         # Scratch surfaces for the puller's fading motion trail and the faint
@@ -328,7 +330,7 @@ class Renderer:
         -- called on startup and again whenever the active system changes
         (different systems can have different box dimensions)."""
         self.box_x, self.box_y = box_size
-        margin = 40
+        margin = UI(40)
         self.scale = min(
             (self.sim_width - 2 * margin) / self.box_x,
             (self.window_size[1] - 2 * margin) / self.box_y,
@@ -382,8 +384,9 @@ class Renderer:
         elif spec.atom_radius_A is not None:
             r_a = spec.atom_radius_A
         if r_a is None:
-            return CRYSTAL_RADIUS
-        return int(max(ATOM_MIN_RADIUS, min(ATOM_MAX_RADIUS, r_a * self.scale)))
+            return UI(CRYSTAL_RADIUS)
+        return int(max(UI(ATOM_MIN_RADIUS),
+                       min(UI(ATOM_MAX_RADIUS), r_a * self.scale)))
 
     def _crystal_trail_color(self, spec):
         """A single representative color for the (species-agnostic) motion
@@ -400,8 +403,9 @@ class Renderer:
         mag = math.hypot(vec_sim[0], vec_sim[1])
         if mag < 1e-6:
             return
-        length_px = VECTOR_MAX_PX * math.tanh(mag / knee)
-        if length_px < 2.0:
+        width = UI.w(width)
+        length_px = UI.f(VECTOR_MAX_PX) * math.tanh(mag / knee)
+        if length_px < UI.f(2.0):
             return
         # screen y is flipped relative to sim y (sim +y is up)
         ux, uy = vec_sim[0] / mag, -vec_sim[1] / mag
@@ -411,8 +415,8 @@ class Renderer:
         angle = math.atan2(vy, vx)
         for sign in (-1, 1):
             head_angle = angle + math.pi - sign * ARROWHEAD_ANGLE
-            hx = end[0] + ARROWHEAD_LEN * math.cos(head_angle)
-            hy = end[1] + ARROWHEAD_LEN * math.sin(head_angle)
+            hx = end[0] + UI(ARROWHEAD_LEN) * math.cos(head_angle)
+            hy = end[1] + UI(ARROWHEAD_LEN) * math.sin(head_angle)
             pygame.draw.line(self.screen, color, end, (hx, hy), width)
 
     def _draw_trails(self, trails, crystal_color, puller_color):
@@ -456,7 +460,8 @@ class Renderer:
                 r, g, b = puller_color if is_puller else crystal_color
                 p0 = self.sim_to_screen(x0, y0)
                 p1 = self.sim_to_screen(x1, y1)
-                pygame.draw.line(self.trail_surface, (r, g, b, alpha_i), p0, p1, 1)
+                pygame.draw.line(self.trail_surface, (r, g, b, alpha_i), p0, p1,
+                                 UI.w(1))
         self.screen.blit(self.trail_surface, (0, 0))
 
     def _draw_bonds(self, positions, bond_length):
@@ -506,7 +511,8 @@ class Renderer:
         r, g, b = BOND_COLOR
         for i, j, a in zip(iu, ju, alphas):
             for p0, p1 in self._bond_segments(pts[i][0], pts[i][1], pts[j][0], pts[j][1]):
-                pygame.draw.line(self.bond_surface, (r, g, b, int(a)), p0, p1, BOND_WIDTH)
+                pygame.draw.line(self.bond_surface, (r, g, b, int(a)), p0, p1,
+                                 UI.w(BOND_WIDTH))
         self.screen.blit(self.bond_surface, (0, 0))
 
     def _draw_dashed(self, p0, p1, color, width, dash):
@@ -534,17 +540,17 @@ class Renderer:
         over a faint backdrop (see get_hud_lines)."""
         if not lines:
             return
-        pad = 6
+        pad = UI(6)
         surfs = [self.font.render(t, True, HUD_TEXT_COLOR) for t in lines]
         h = sum(s.get_height() for s in surfs) + 2 * pad
         w = max(s.get_width() for s in surfs) + 2 * pad
-        y0 = self.window_size[1] - h - 10
+        y0 = self.window_size[1] - h - UI(10)
         bg = pygame.Surface((w, h), pygame.SRCALPHA)
         bg.fill(HUD_BG)
-        self.screen.blit(bg, (10, y0))
+        self.screen.blit(bg, (UI(10), y0))
         y = y0 + pad
         for s in surfs:
-            self.screen.blit(s, (10 + pad, y))
+            self.screen.blit(s, (UI(10) + pad, y))
             y += s.get_height()
 
     def _draw_debug_line(self, text):
@@ -554,9 +560,9 @@ class Renderer:
         if not text:
             return
         surf = self.small_font.render(text, True, (120, 235, 150))
-        pad = 5
-        x = self.sim_width - surf.get_width() - pad - 12
-        y = self.window_size[1] - surf.get_height() - pad - 10
+        pad = UI(5)
+        x = self.sim_width - surf.get_width() - pad - UI(12)
+        y = self.window_size[1] - surf.get_height() - pad - UI(10)
         bg = pygame.Surface((surf.get_width() + 2 * pad, surf.get_height() + 2 * pad), pygame.SRCALPHA)
         bg.fill(HUD_BG)
         self.screen.blit(bg, (x - pad, y - pad))
@@ -979,38 +985,45 @@ class Renderer:
         scale = max(1e-6, float(scale))
         rows = list(terms) + [("total", sum(v for _, v in terms))]
 
-        w, pad = 312, 10
-        row_h, title_h = 30, 20
-        y0 = 48
+        x = UI(x)
+        w, pad = UI(312), UI(10)
+        row_h, title_h = UI(30), UI(20)
+        y0 = UI(48)
         h = title_h + len(rows) * row_h + pad
         bg = pygame.Surface((w, h), pygame.SRCALPHA)
         bg.fill(POTENTIAL_PANEL_BG)
         self.screen.blit(bg, (x, y0))
-        pygame.draw.rect(self.screen, PANEL_DIVIDER, (x, y0, w, h), 1)
+        pygame.draw.rect(self.screen, PANEL_DIVIDER, (x, y0, w, h), UI.w(1))
 
-        self.screen.blit(self.small_font.render(title, True, HEADER_TEXT_COLOR), (x + pad, y0 + 6))
+        self.screen.blit(self.small_font.render(title, True, HEADER_TEXT_COLOR),
+                         (x + pad, y0 + UI(6)))
 
         cx = x + pad + (w - 2 * pad) / 2.0   # shared zero line
-        half = (w - 2 * pad) / 2.0 - 2
-        y = y0 + title_h + 6
+        half = (w - 2 * pad) / 2.0 - UI(2)
+        y = y0 + title_h + UI(6)
         for i, (label, val) in enumerate(rows):
             is_total = (i == len(rows) - 1)
             col = POTENTIAL_TOTAL_COLOR if is_total else POTENTIAL_COLORS[i % len(POTENTIAL_COLORS)]
             if is_total:
-                pygame.draw.line(self.screen, PANEL_DIVIDER, (x + pad, y - 4), (x + w - pad, y - 4), 1)
+                pygame.draw.line(self.screen, PANEL_DIVIDER, (x + pad, y - UI(4)),
+                                 (x + w - pad, y - UI(4)), UI.w(1))
             else:
-                pygame.draw.rect(self.screen, col, (x + pad, y + 2, 9, 9))
-            lx = x + pad + (0 if is_total else 15)
+                pygame.draw.rect(self.screen, col,
+                                 (x + pad, y + UI(2), UI(9), UI(9)))
+            lx = x + pad + (0 if is_total else UI(15))
             self.screen.blit(self.small_font.render(label, True, col if is_total else TEXT_COLOR), (lx, y))
             vs = self.small_font.render(f"{val:+.2f}", True, col)
             self.screen.blit(vs, (x + w - pad - vs.get_width(), y))
             # signed bar from the zero line
-            by = y + 16
-            pygame.draw.line(self.screen, POTENTIAL_TRACK_COLOR, (x + pad, by), (x + w - pad, by), 1)
-            pygame.draw.line(self.screen, (95, 99, 116), (cx, by - 3), (cx, by + 3), 1)
+            by = y + UI(16)
+            pygame.draw.line(self.screen, POTENTIAL_TRACK_COLOR, (x + pad, by),
+                             (x + w - pad, by), UI.w(1))
+            pygame.draw.line(self.screen, (95, 99, 116), (cx, by - UI(3)),
+                             (cx, by + UI(3)), UI.w(1))
             blen = max(-half, min(half, val / scale * half))
             if abs(blen) >= 1.0:
-                pygame.draw.line(self.screen, col, (cx, by), (cx + blen, by), 4 if not is_total else 5)
+                pygame.draw.line(self.screen, col, (cx, by), (cx + blen, by),
+                                 UI.w(4) if not is_total else UI.w(5))
             y += row_h
 
     def _draw_cone(self, base_screen, tip_screen, half_w, color):
@@ -1041,18 +1054,18 @@ class Renderer:
         dl = math.hypot(dirx, diry)
         if dl < 1e-6:
             return
-        length_px = VECTOR_MAX_PX * math.tanh(mag / knee)
-        if length_px < 2.0:
+        length_px = UI.f(VECTOR_MAX_PX) * math.tanh(mag / knee)
+        if length_px < UI.f(2.0):
             return
         ux, uy = dirx / dl, diry / dl
         end = (start[0] + ux * length_px, start[1] + uy * length_px)
-        pygame.draw.line(self.screen, color, start, end, 3)
+        pygame.draw.line(self.screen, color, start, end, UI.w(3))
         angle = math.atan2(uy, ux)
         for sign in (-1, 1):
             ha = angle + math.pi - sign * ARROWHEAD_ANGLE
-            hx = end[0] + ARROWHEAD_LEN * math.cos(ha)
-            hy = end[1] + ARROWHEAD_LEN * math.sin(ha)
-            pygame.draw.line(self.screen, color, end, (hx, hy), 3)
+            hx = end[0] + UI(ARROWHEAD_LEN) * math.cos(ha)
+            hy = end[1] + UI(ARROWHEAD_LEN) * math.sin(ha)
+            pygame.draw.line(self.screen, color, end, (hx, hy), UI.w(3))
 
     def _draw_torque_arc(self, center, radius, frac, color):
         """A circular arrow around `center` depicting a torque about the control-
@@ -1080,7 +1093,8 @@ class Renderer:
             # which on the transparent (0,0,0,0) overlay surface leaves dark fringe
             # pixels that composite as speckles over the bright GL beads. A plain
             # thick polyline writes solid, full-alpha color -- no fringe.
-            pygame.draw.lines(self.screen, color, False, pts, TORQUE_ARC_WIDTH)
+            pygame.draw.lines(self.screen, color, False, pts,
+                              UI.w(TORQUE_ARC_WIDTH))
         # Arrowhead at the moving end, pointing along the direction of travel.
         end = pts[-1]
         s = 1.0 if sweep >= 0 else -1.0
@@ -1088,9 +1102,10 @@ class Renderer:
         tangent = math.atan2(ty, tx)
         for sign in (-1, 1):
             ha = tangent + math.pi - sign * ARROWHEAD_ANGLE
-            hx = end[0] + TORQUE_ARC_HEAD_LEN * math.cos(ha)
-            hy = end[1] + TORQUE_ARC_HEAD_LEN * math.sin(ha)
-            pygame.draw.line(self.screen, color, end, (hx, hy), TORQUE_ARC_WIDTH)
+            hx = end[0] + UI(TORQUE_ARC_HEAD_LEN) * math.cos(ha)
+            hy = end[1] + UI(TORQUE_ARC_HEAD_LEN) * math.sin(ha)
+            pygame.draw.line(self.screen, color, end, (hx, hy),
+                             UI.w(TORQUE_ARC_WIDTH))
 
     def draw_sim_3d(self, positions3d, dipoles3d, is_puller, spec, camera, bonds,
                     input_force, reaction_force, control_grid, fps,
@@ -1153,7 +1168,8 @@ class Renderer:
                     cx, cy = int(screen[i][0]), int(screen[i][1])
                     pygame.draw.circle(self.screen,
                                        self._puller_ring_color(puller_attached),
-                                       (cx, cy), int(radii[i]) + 2, PULLER_RING_WIDTH)
+                                       (cx, cy), int(radii[i]) + UI(2),
+                                       UI.w(PULLER_RING_WIDTH))
         else:
             radii = np.clip(phys_r * scale, 3, 90)   # capped: matches CPU sprites
             self._draw_sim_3d_cpu(pts, dipoles3d, is_puller, spec, camera, bonds,
@@ -1544,7 +1560,7 @@ class Renderer:
             self.screen.blit(sprite, (cx - r, cy - r))
             if aug_pull[i]:
                 pygame.draw.circle(self.screen, self._puller_ring_color(puller_attached),
-                                   (cx, cy), r + 2, PULLER_RING_WIDTH)
+                                   (cx, cy), r + UI(2), UI.w(PULLER_RING_WIDTH))
 
         # Director spikes on top (batch-projected -- see the GL path), so the
         # 900-bead sheet's arrows don't cost thousands of per-bead projections.
@@ -1626,12 +1642,12 @@ class Renderer:
             f"{torque_str}fps: {fps:4.0f}",
             True, (200, 200, 200),
         )
-        self.screen.blit(label, (10, 10))
+        self.screen.blit(label, (UI(10), UI(10)))
         legend = self.font.render(
             "green = your pull/twist, red = membrane reaction   |   drag the center bead (WASD/mouse); twist / Q-E / L-R click rotates its director",
             True, (140, 140, 140),
         )
-        self.screen.blit(legend, (10, 30))
+        self.screen.blit(legend, (UI(10), UI(30)))
         # Puller-bead breakdown on the left; the whole-system total (if the system
         # supplies one) as a second panel just to its right.
         self._draw_potential_panel(potential_terms, x=12)
@@ -1649,7 +1665,8 @@ class Renderer:
 
         top_left = self.sim_to_screen(0, self.box_y)
         size = (self.box_x * self.scale, self.box_y * self.scale)
-        pygame.draw.rect(self.screen, BOX_OUTLINE, (*top_left, *size), width=1)
+        pygame.draw.rect(self.screen, BOX_OUTLINE, (*top_left, *size),
+                         width=UI.w(1))
 
         if atom_trails is not None:
             self._draw_trails(atom_trails, self._crystal_trail_color(spec), PULLER_RING_COLOR)
@@ -1676,13 +1693,14 @@ class Renderer:
         if hbond_pairs is not None:
             for a, b in hbond_pairs:
                 for p0, p1 in self._bond_segments(*positions[a], *positions[b]):
-                    self._draw_dashed(p0, p1, HBOND_COLOR, HBOND_WIDTH, HBOND_DASH)
+                    self._draw_dashed(p0, p1, HBOND_COLOR, UI.w(HBOND_WIDTH),
+                                      UI(HBOND_DASH))
 
         if bond_pairs is not None:
             for a, b in bond_pairs:
                 color = PULLER_BOND_COLOR if (is_puller[a] or is_puller[b]) else BOND_STICK_COLOR
                 for p0, p1 in self._bond_segments(*positions[a], *positions[b]):
-                    pygame.draw.line(self.screen, color, p0, p1, 2)
+                    pygame.draw.line(self.screen, color, p0, p1, UI.w(2))
         self.screen.set_clip(prev_clip)
 
         labels = spec.species_labels
@@ -1733,11 +1751,13 @@ class Renderer:
             # -- the orientation the user steers with yaw).
             for (sx, sy), sp in zip(puller_pts, puller_species):
                 is_head = (sp == 0)
-                r = self._atom_radius_px(spec, sp) + (PULLER_RADIUS_BOOST if is_head else 1)
+                r = self._atom_radius_px(spec, sp) + (UI(PULLER_RADIUS_BOOST)
+                                                     if is_head else UI(1))
                 pygame.draw.circle(self.screen, self._species_color(spec, sp), (sx, sy), r)
                 pygame.draw.circle(self.screen, self._puller_ring_color(puller_attached),
-                                   (sx, sy), r, PULLER_RING_WIDTH if is_head else 1)
-            label_r = self._atom_radius_px(spec, 0) + PULLER_RADIUS_BOOST
+                                   (sx, sy), r,
+                                   UI.w(PULLER_RING_WIDTH) if is_head else UI.w(1))
+            label_r = self._atom_radius_px(spec, 0) + UI(PULLER_RADIUS_BOOST)
         else:
             # Single-atom puller (Cu, Ar, NaCl), drawn in its true species/
             # material color -- a deposited Cu atom is Cu, a pulled Na+ is a
@@ -1746,10 +1766,10 @@ class Renderer:
             # already in its live simulated position, so it jitters on its own
             # exactly as much as the physics says it should.
             sp0 = puller_species[0] if puller_species else None
-            r = self._atom_radius_px(spec, sp0) + PULLER_RADIUS_BOOST
+            r = self._atom_radius_px(spec, sp0) + UI(PULLER_RADIUS_BOOST)
             pygame.draw.circle(self.screen, self._species_color(spec, sp0), puller_xy, r)
             pygame.draw.circle(self.screen, self._puller_ring_color(puller_attached),
-                               puller_xy, r, PULLER_RING_WIDTH)
+                               puller_xy, r, UI.w(PULLER_RING_WIDTH))
             # In a species system the puller is also (e.g.) an ion -- stamp its
             # glyph so its role is legible.
             if labels is not None and sp0 is not None:
@@ -1766,15 +1786,15 @@ class Renderer:
             e_lines = [f"KE = {units.format_energy(puller_energy[0], red)}",
                        f"PE = {units.format_energy(puller_energy[1], red)}"]
             surfs = [self.small_font.render(t, True, PULLER_LABEL_COLOR) for t in e_lines]
-            ey = int(puller_xy[1]) + label_r + 10
+            ey = int(puller_xy[1]) + label_r + UI(10)
             for surf in surfs:
                 rect = surf.get_rect(center=(int(puller_xy[0]), ey))
-                bg = rect.inflate(6, 2)
+                bg = rect.inflate(UI(6), UI(2))
                 pad = pygame.Surface(bg.size, pygame.SRCALPHA)
                 pad.fill(PULLER_LABEL_BG)
                 self.screen.blit(pad, bg.topleft)
                 self.screen.blit(surf, rect)
-                ey += surf.get_height() + 1
+                ey += surf.get_height() + UI(1)
 
         ix, iy = input_force
         rx, ry = reaction_force
@@ -1918,13 +1938,14 @@ class Renderer:
             # Clickable hit-box, padded a little for easy targeting; read back by
             # the app to flip self.show_advanced.
             self.advanced_toggle_rect = pygame.Rect(
-                x - 2, y - 2, toggle_surf.get_width() + 8, toggle_surf.get_height() + 6)
-            y += toggle_surf.get_height() + 8
+                x - UI(2), y - UI(2), toggle_surf.get_width() + UI(8),
+                toggle_surf.get_height() + UI(6))
+            y += toggle_surf.get_height() + UI(8)
             if self.show_advanced:
                 for extra in advanced:
-                    extra.rect = pygame.Rect(x, y, w, 4)
+                    extra.rect = pygame.Rect(x, y, w, UI(4))
                     extra.draw(self.screen, self.font)
-                    y += 34
+                    y += UI(34)
             else:
                 # Collapsed: park the hidden sliders off-screen so a stale rect
                 # from when they were last visible can't be clicked/dragged.
@@ -1945,7 +1966,7 @@ class Renderer:
             readout_str = f"instantaneous: T={temp:6.1f} K   P={press:9.1f} bar"
         readout = self.small_font.render(readout_str, True, DIM_TEXT_COLOR)
         self.screen.blit(readout, (x, y))
-        y += 18
+        y += UI(18)
 
         puller_ke, puller_pe = puller_energy
         if puller_ke is not None:
@@ -1964,17 +1985,17 @@ class Renderer:
                 puller_str = f"puller atom:   KE={puller_ke:7.4f} eV   PE={puller_pe:8.4f} eV{speed_bit}"
             puller_readout = self.small_font.render(puller_str, True, DIM_TEXT_COLOR)
             self.screen.blit(puller_readout, (x, y))
-        y += 20
+        y += UI(20)
 
-        pygame.draw.line(self.screen, PANEL_DIVIDER, (x, y), (x + w, y), 1)
-        y += 10
+        pygame.draw.line(self.screen, PANEL_DIVIDER, (x, y), (x + w, y), UI.w(1))
+        y += UI(10)
 
         # Four stacked plots share the space left below the readouts. Deriving the
         # per-plot height from what's actually left (rather than a fixed 140) keeps
         # all four on-screen whatever the slider count -- the MesoMem systems add
         # up to five extra sliders, which at a fixed height pushed the RDF plot off
         # the bottom of the default window.
-        plot_h = int(max(96, min(140, (self.window_size[1] - y - 40) / 4)))
+        plot_h = int(max(UI(96), min(UI(140), (self.window_size[1] - y - UI(40)) / 4)))
         draw_plot(
             self.screen, self.small_font, pygame.Rect(x, y, w, plot_h),
             "Temperature (reduced T*)" if reduced else "Temperature",
@@ -1983,7 +2004,7 @@ class Renderer:
             y_range=(0.0, spec.temperature.vmax * 1.05),
             ref_lines=[(spec.melt_temp, MELT_MARK_COLOR, "melt")],
         )
-        y += plot_h + 10
+        y += plot_h + UI(10)
 
         # LAMMPS reports this as a real 3D-style pressure using the box's
         # tiny, arbitrary out-of-plane thickness (~0.5*lattice spacing) as
@@ -1998,7 +2019,7 @@ class Renderer:
             "P*" if reduced else "bar",
             list(history.t), [("P", PLOT_COLORS["press"], list(history.series["press"]))],
         )
-        y += plot_h + 10
+        y += plot_h + UI(10)
 
         draw_plot(
             self.screen, self.small_font, pygame.Rect(x, y, w, plot_h),
@@ -2011,16 +2032,16 @@ class Renderer:
                 ("E_tot", PLOT_COLORS["etotal"], list(history.series["etotal"])),
             ],
         )
-        y += plot_h + 10
+        y += plot_h + UI(10)
 
         rdf_rect = pygame.Rect(x, y, w, plot_h)
         if rdf is None:
             pygame.draw.rect(self.screen, (30, 30, 36), rdf_rect)
-            pygame.draw.rect(self.screen, PANEL_DIVIDER, rdf_rect, width=1)
+            pygame.draw.rect(self.screen, PANEL_DIVIDER, rdf_rect, width=UI.w(1))
             title_surf = self.small_font.render("Radial distribution g(r)", True, TEXT_COLOR)
-            self.screen.blit(title_surf, (rdf_rect.x + 6, rdf_rect.y + 4))
+            self.screen.blit(title_surf, (rdf_rect.x + UI(6), rdf_rect.y + UI(4)))
             warm = self.small_font.render("warming up...", True, DIM_TEXT_COLOR)
-            self.screen.blit(warm, (rdf_rect.x + 6, rdf_rect.y + plot_h // 2))
+            self.screen.blit(warm, (rdf_rect.x + UI(6), rdf_rect.y + plot_h // 2))
         else:
             r, g = rdf
             draw_plot(

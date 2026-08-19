@@ -4,6 +4,7 @@ from collections import deque
 
 import pygame
 
+from .scale import UI
 from .theme import DIM_TEXT_COLOR, GRID_COLOR, PANEL_DIVIDER, TEXT_COLOR
 
 
@@ -39,11 +40,12 @@ def draw_plot(screen, font, rect, title, y_label, x_vals, series, y_range=None, 
     """series: list of (label, color, values). y_range: (lo, hi) or None to
     auto-fit with padding. ref_lines: list of (value, color, label)."""
     pygame.draw.rect(screen, (30, 30, 36), rect)
-    pygame.draw.rect(screen, PANEL_DIVIDER, rect, width=1)
+    pygame.draw.rect(screen, PANEL_DIVIDER, rect, width=UI.w(1))
     title_surf = font.render(title, True, TEXT_COLOR)
-    screen.blit(title_surf, (rect.x + 6, rect.y + 4))
+    screen.blit(title_surf, (rect.x + UI(6), rect.y + UI(4)))
 
-    plot_rect = pygame.Rect(rect.x + 44, rect.y + 22, rect.width - 56, rect.height - 34)
+    plot_rect = pygame.Rect(rect.x + UI(44), rect.y + UI(22),
+                            rect.width - UI(56), rect.height - UI(34))
 
     all_vals = [v for _, _, vals in series for v in vals]
     for v, _, _ in ref_lines:
@@ -61,23 +63,25 @@ def draw_plot(screen, font, rect, title, y_label, x_vals, series, y_range=None, 
 
     for frac in (0.0, 0.5, 1.0):
         gy = plot_rect.bottom - frac * plot_rect.height
-        pygame.draw.line(screen, GRID_COLOR, (plot_rect.x, gy), (plot_rect.right, gy), 1)
+        pygame.draw.line(screen, GRID_COLOR, (plot_rect.x, gy),
+                         (plot_rect.right, gy), UI.w(1))
         val_lbl = font.render(f"{lo + frac * (hi - lo):.3g}", True, DIM_TEXT_COLOR)
-        screen.blit(val_lbl, (rect.x + 2, gy - 6))
+        screen.blit(val_lbl, (rect.x + UI(2), gy - UI(6)))
 
     for value, color, label in ref_lines:
         if hi == lo:
             continue
         gy = plot_rect.bottom - (value - lo) / (hi - lo) * plot_rect.height
-        for dash_x in range(plot_rect.x, plot_rect.right, 6):
-            pygame.draw.line(screen, color, (dash_x, gy), (dash_x + 3, gy), 1)
+        for dash_x in range(plot_rect.x, plot_rect.right, UI(6)):
+            pygame.draw.line(screen, color, (dash_x, gy), (dash_x + UI(3), gy),
+                             UI.w(1))
         if label:
             lbl = font.render(label, True, color)
-            screen.blit(lbl, (plot_rect.right - lbl.get_width(), gy - 12))
+            screen.blit(lbl, (plot_rect.right - lbl.get_width(), gy - UI(12)))
 
     if not x_vals or len(x_vals) < 2:
         y_label_surf = font.render(y_label, True, DIM_TEXT_COLOR)
-        screen.blit(y_label_surf, (plot_rect.x, rect.bottom - 14))
+        screen.blit(y_label_surf, (plot_rect.x, rect.bottom - UI(14)))
         return
     x_lo, x_hi = x_vals[0], x_vals[-1]
     x_span = max(1e-9, x_hi - x_lo)
@@ -93,14 +97,16 @@ def draw_plot(screen, font, rect, title, y_label, x_vals, series, y_range=None, 
             y = plot_rect.bottom - (yv - lo) / (hi - lo) * plot_rect.height if hi != lo else plot_rect.centery
             pts.append((x, y))
         if len(pts) >= 2:
-            pygame.draw.lines(screen, color, False, pts, 2)
+            pygame.draw.lines(screen, color, False, pts, UI.w(2))
 
     legend_x = plot_rect.x
     for label, color, _ in series:
-        pygame.draw.line(screen, color, (legend_x, rect.bottom - 8), (legend_x + 14, rect.bottom - 8), 3)
+        pygame.draw.line(screen, color, (legend_x, rect.bottom - UI(8)),
+                         (legend_x + UI(14), rect.bottom - UI(8)), UI.w(3))
         lbl = font.render(label, True, DIM_TEXT_COLOR)
-        screen.blit(lbl, (legend_x + 18, rect.bottom - 16))
-        legend_x += 18 + lbl.get_width() + 12
+        screen.blit(lbl, (legend_x + UI(18), rect.bottom - UI(16)))
+        legend_x += UI(18) + lbl.get_width() + UI(12)
 
     y_label_surf = font.render(y_label, True, DIM_TEXT_COLOR)
-    screen.blit(y_label_surf, (plot_rect.x, rect.y + 4 + title_surf.get_height()))
+    screen.blit(y_label_surf, (plot_rect.x,
+                               rect.y + UI(4) + title_surf.get_height()))

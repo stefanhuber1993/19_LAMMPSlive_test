@@ -42,6 +42,13 @@ def build_parser():
                              "(see --list-presets)")
     parser.add_argument("--fullscreen", action="store_true",
                         help="start in fullscreen (toggle any time with F11)")
+    parser.add_argument("--ui-scale", type=float, default=None, metavar="FACTOR",
+                        help="how big to draw the 2D UI (text, panel, plots): 1 = "
+                             "the classic pixel sizes, 2 = double, which is what a "
+                             "4K screen at its NATIVE resolution wants -- the fonts "
+                             "are rasterized at that size, so the UI is sharp "
+                             "rather than magnified. Default: 2 on a screen taller "
+                             "than 1800 px, else 1")
     parser.add_argument("--debug", action="store_true",
                         help="show a per-frame timing breakdown (sim vs. analysis "
                              "vs. render vs. device I/O) in the GUI header")
