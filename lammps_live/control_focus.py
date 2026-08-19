@@ -139,7 +139,7 @@ class Choice:
 
 
 class ControlFocus:
-    """The cycle `[viewport, *sliders]` and where in it the focus sits.
+    """The cycle `[viewport, *choices, *sliders]` and where in it the focus sits.
 
     Geometry-free and device-free: it holds Slider objects and an index, and the
     app decides what a focused viewport or slider means. That keeps the one
@@ -148,16 +148,17 @@ class ControlFocus:
     """
 
     def __init__(self):
-        self._stops = []          # everything after the viewport, in panel order
+        self._stops = []          # choices, then the sliders in panel order
         self.index = 0
 
     def set_stops(self, sliders, choices=()):
         """(Re)declare what is in the cycle, and put the focus back on the
         viewport. Called on every system switch: the slider objects themselves are
         rebuilt there, and a stale index would leave the focus on a parameter the
-        new playground does not have. Choices come last, after the sliders, because
-        that is where the panel draws them."""
-        self._stops = [*sliders, *choices]
+        new playground does not have. Choices come first, right after the viewport:
+        the colouring is one push away from the scene, and the sliders -- which are
+        the long tail of the cycle -- follow in panel order."""
+        self._stops = [*choices, *sliders]
         self.index = 0
 
     @property

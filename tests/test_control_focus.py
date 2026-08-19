@@ -206,14 +206,14 @@ def _focus_on_the_viewport(request):
             app._prev_buttons = frozenset()
 
 
-def test_the_cycle_is_the_viewport_the_everyday_sliders_and_the_colouring(sim_app):
+def test_the_cycle_is_the_viewport_the_colouring_and_the_everyday_sliders(sim_app):
     labels = ["viewport"]
     for _ in range(5):
         _flick(sim_app, 1)
         labels.append(sim_app.focus.label)
-    assert labels == ["viewport", "Temperature", "k_tilt", "k_splay",
-                      "zeta (attraction falloff, higher=shorter reach)",
-                      "bead colour (director)"]
+    assert labels == ["viewport", "bead colour (director)", "Temperature",
+                      "k_tilt", "k_splay",
+                      "zeta (attraction falloff, higher=shorter reach)"]
     # ... and it wraps back, rather than stopping at the end.
     _flick(sim_app, 1)
     assert sim_app.focus.on_viewport
@@ -221,12 +221,12 @@ def test_the_cycle_is_the_viewport_the_everyday_sliders_and_the_colouring(sim_ap
 
 def test_the_hat_moves_one_stop_per_flick_in_the_direction_flicked(sim_app):
     _flick(sim_app, 1)
-    assert sim_app.focus.label == "Temperature"
+    assert sim_app.focus.label.startswith("bead colour")
     _flick(sim_app, -1)
     assert sim_app.focus.on_viewport
     # Left from the viewport wraps to the far end of the cycle.
     _flick(sim_app, -1)
-    assert sim_app.focus.label.startswith("bead colour")
+    assert sim_app.focus.label.startswith("zeta")
 
 
 def test_a_held_hat_does_not_sweep_the_cycle(sim_app):
@@ -238,7 +238,8 @@ def test_a_held_hat_does_not_sweep_the_cycle(sim_app):
 
 
 def test_the_focused_slider_is_what_the_stick_moves(sim_app):
-    _flick(sim_app, 1)                       # -> Temperature
+    for _ in range(2):                       # -> bead colour -> Temperature
+        _flick(sim_app, 1)
     slider = sim_app.focus.slider
     slider.value = 0.2
     span = slider.vmax - slider.vmin
@@ -334,7 +335,8 @@ def test_shift_drag_pans_the_scene_and_the_camera_follows_the_target(sim_app):
 
 def test_the_camera_stops_moving_once_a_slider_has_the_focus(sim_app):
     cam = sim_app.orbit_cam
-    _flick(sim_app, 1)                       # -> Temperature
+    for _ in range(2):                       # -> bead colour -> Temperature
+        _flick(sim_app, 1)
     cam.auto = False
     azimuth = cam.azimuth
     for _ in range(60):
@@ -376,27 +378,30 @@ def test_buttons_3_and_4_step_through_the_playgrounds(sim_app, monkeypatch):
     assert steps == [-1, 1]
 
 
-def test_nothing_fires_while_the_connect_panel_is_up(sim_app, monkeypatch):
-    """The panel is modal and waiting for a login code; a button that switched
-    playground mid-login would cancel the allocation it is asking for."""
+def test_only_the_playground_buttons_fire_while_the_connect_panel_is_up(sim_app, monkeypatch):
+    """The panel is modal -- the scene behind it is not running, so the focus
+    cycle and the run switch have nothing to do. 3/4 are the exception: switching
+    away is how the joystick leaves the card, and the session survives it."""
     steps = []
     monkeypatch.setattr(sim_app, "_cycle_system", steps.append)
     monkeypatch.setattr(sim_app.remote_panel, "visible", True)
 
     _flick(sim_app, 1)
     _press(sim_app, config.JOYSTICK_PLAY_PAUSE_BUTTON)
-    _press(sim_app, config.JOYSTICK_NEXT_PLAYGROUND_BUTTON)
 
     assert sim_app.focus.on_viewport
     assert not sim_app.sim_playing
     assert steps == []
 
+    _press(sim_app, config.JOYSTICK_PREV_PLAYGROUND_BUTTON)
+    _press(sim_app, config.JOYSTICK_NEXT_PLAYGROUND_BUTTON)
+    assert steps == [-1, 1]
+
 
 def test_the_colouring_stop_drives_the_renderer_and_the_mouse_toggle_agrees(sim_app):
     """One state, two ways to move it: a click that changed the colouring behind
     the Choice's back would make the next stick push step from the wrong option."""
-    for _ in range(5):                       # -> bead colour
-        _flick(sim_app, 1)
+    _flick(sim_app, 1)                       # -> bead colour
     assert sim_app.focus.choice is not None
     assert not sim_app.renderer.bead_color_energy
 
@@ -427,7 +432,8 @@ def test_a_stick_that_holds_nothing_gets_a_strong_centring_spring(sim_app):
         dt = sim_app._tick(dt)
     assert sent[-1] == (0.0, 0.0, SPRING_STIFFNESS_MAX)
 
-    _flick(sim_app, 1)                       # -> Temperature
+    for _ in range(2):                       # -> bead colour -> Temperature
+        _flick(sim_app, 1)
     for _ in range(2):
         dt = sim_app._tick(dt)
     assert sent[-1] == (0.0, 0.0, SPRING_STIFFNESS_MAX)
@@ -451,7 +457,8 @@ def test_the_colouring_is_a_stop_here_too(game_app):
 def test_focusing_a_slider_releases_the_puller_and_the_viewport_takes_it_back(game_app):
     assert game_app.system.puller_attached(), "the patch comes up holding its bead"
 
-    _flick(game_app, 1)                      # -> Temperature
+    for _ in range(2):                       # -> bead colour -> Temperature
+        _flick(game_app, 1)
     assert not game_app.system.puller_attached(), (
         "the stick cannot hold a bead and set a number at the same time")
     # ... and the stick drives the slider instead of the bead.
@@ -460,7 +467,8 @@ def test_focusing_a_slider_releases_the_puller_and_the_viewport_takes_it_back(ga
     game_app._route_stick(1.0, 0.0, 0.0, FRAME)
     assert slider.value != before
 
-    _flick(game_app, -1)                     # back to the viewport
+    for _ in range(2):                       # back to the viewport
+        _flick(game_app, -1)
     assert game_app.system.puller_attached()
 
 

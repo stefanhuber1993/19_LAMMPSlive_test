@@ -341,10 +341,10 @@ class App:
         self.extra_slider_keys = [ss.key for ss in spec.extra_sliders]
 
         # What the joystick can drive here, and where its cycle starts: the
-        # viewport, then every EVERYDAY slider in panel order, then the bead
-        # colouring. The advanced group is deliberately left out -- see
-        # control_focus.py. On the MesoMem playgrounds this is viewport,
-        # Temperature, k_tilt, k_splay, zeta, bead colour. The colouring is only a
+        # viewport, then the bead colouring, then every EVERYDAY slider in panel
+        # order. The advanced group is deliberately left out -- see
+        # control_focus.py. On the MesoMem playgrounds this is viewport, bead
+        # colour, Temperature, k_tilt, k_splay, zeta. The colouring is only a
         # stop on the scenes that have one (the 2D crystals colour by species,
         # which is not a choice), and it follows whatever the toggle is set to
         # rather than resetting it -- the colouring is the viewer's preference, not
@@ -688,11 +688,13 @@ class App:
             2                  Reset the run to a fresh state
             3 / 4              previous / next playground
 
-        Nothing fires while the remote connect panel is up: it is modal and
-        waiting for a login code, and a stray button that switched playground
-        mid-login would cancel the allocation it is in the middle of asking for.
-        The device state is still recorded, so a button held through the panel
-        does not fire the moment the panel closes.
+        The remote connect panel is modal, so while it is up the only buttons that
+        still fire are 3/4: switching away is how you leave the card, and it costs
+        the session nothing (the job, the tunnel and the server survive, see
+        RemotePanel.detach_system). Everything else -- the focus cycle, the trigger,
+        reset -- belongs to a scene that is not running yet. The device state is
+        still recorded, so a button held through the panel does not fire the moment
+        the panel closes.
         """
         buttons = self.source.poll_buttons()
         hat = self.source.poll_hat()
@@ -701,6 +703,7 @@ class App:
         self._prev_buttons = buttons
         self._prev_hat = hat
         if self.remote_panel.visible:
+            self._cycle_system_buttons(fired)
             return
 
         if hat_moved and hat[0]:
@@ -716,6 +719,11 @@ class App:
             self._toggle_puller_attached()
         # Last, and it returns: switching playground rebuilds the system out from
         # under everything above (and under the caller's `spec`).
+        self._cycle_system_buttons(fired)
+
+    def _cycle_system_buttons(self, fired):
+        """Buttons 3/4 -> previous / next playground. Split out because these two
+        are the one pair that still works behind the connect panel."""
         if config.JOYSTICK_PREV_PLAYGROUND_BUTTON in fired:
             self._cycle_system(-1)
         elif config.JOYSTICK_NEXT_PLAYGROUND_BUTTON in fired:
