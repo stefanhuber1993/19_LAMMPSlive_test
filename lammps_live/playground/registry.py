@@ -52,7 +52,9 @@ def _playground_of(module, fallback_key):
 # (one patch -> a sheet of them -> a box that assembles itself), so they come
 # first and in that order. Anything not named here follows, alphabetically, so a
 # new playground file appears without editing this list.
-_ORDER = ("mesomem_patch", "mesomem_sheet", "mesomem_assembly")
+# mesomem_remote is the same assembly run on a cluster GPU, so it comes straight
+# after the local one it scales up.
+_ORDER = ("mesomem_patch", "mesomem_sheet", "mesomem_assembly", "mesomem_remote")
 
 
 def bundled_keys():
@@ -90,10 +92,22 @@ def list_playgrounds():
     return [(key, make_spec(pg, pg.mode)) for key, pg in all_playgrounds()]
 
 
-def build(ref, mode=None, preset=None):
-    """Construct a running PlaygroundSystem."""
+def build(ref, mode=None, preset=None, remote_override=None):
+    """Construct a running system for a playground.
+
+    A playground that declares a `remote` target gets a `RemoteSystem` instead of
+    a `PlaygroundSystem`: it builds no LAMMPS here, because its simulation runs on
+    a cluster GPU and this process only draws it. Both satisfy MDSystem3D, so the
+    app above this line cannot tell them apart -- which is the whole reason the
+    remote demo needed no changes to the control loop or the renderer.
+    """
+    playground = load(ref)
+    if playground.remote is not None:
+        from ..remote.client import RemoteSystem
+        return RemoteSystem(playground, preset=preset,
+                            target=remote_override or playground.remote)
     from .system import PlaygroundSystem
-    return PlaygroundSystem(load(ref), mode_name=mode, preset=preset)
+    return PlaygroundSystem(playground, mode_name=mode, preset=preset)
 
 
 def resolve(ref):

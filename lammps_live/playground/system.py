@@ -18,6 +18,7 @@ from lammps import lammps
 from ..mdsystem import MDSystem3D, SliderSpec, SystemSpec
 from . import forcefield as ff_registry
 from .modes import GameMode, SimMode, select_controlled
+from .faults import Fault
 from .observables import Analysis
 from .rdf import InPlaneRDF, RadialRDF3D
 from .scenario import Scenario
@@ -122,11 +123,22 @@ def smoothing_slider_specs(playground, scenario):
 class PlaygroundSystem(MDSystem3D):
     """A playground, running."""
 
-    def __init__(self, playground, mode_name=None, preset=None):
+    def __init__(self, playground, mode_name=None, preset=None, host_profile=None,
+                 analysis=True):
         self.playground = playground
         self.preset = preset
         self.force_field = ff_registry.get(playground.force_field)(
             **playground.force_field_options)
+        # A HOST PROFILE is how the same playground runs on a LAMMPS that is not
+        # the pip wheel this app was written against -- specifically the cluster's
+        # Kokkos/CUDA build, where the MesoMem pair style is compiled in rather
+        # than loaded as a plugin and the atom style has a different name. It
+        # adapts the force field in place and contributes command-line arguments
+        # (`-k on g 1 -sf kk`). None -- every local playground -- changes nothing.
+        # See remote/hosts.py.
+        self.host_profile = host_profile
+        if host_profile is not None:
+            host_profile.adapt(self.force_field)
         self.scenario = playground.scenario
         self.params = self.force_field.new_params(playground.resolved_params(preset))
         self.scenario_params = self.scenario.new_params()
@@ -138,7 +150,12 @@ class PlaygroundSystem(MDSystem3D):
         self.has_directors = self.force_field.has_directors
         self._target_temp = self.spec.temperature.default
         self._sim_time = 0.0
-        self.analysis = Analysis(self.force_field, playground.observables)
+        # Kept so `reset` can rebuild an identically-configured Analysis rather
+        # than silently reverting to the defaults.
+        self._analysis_kwargs = dict(energy_every=playground.analysis_energy_every,
+                                     enabled=bool(analysis))
+        self.analysis = Analysis(self.force_field, playground.observables,
+                                 **self._analysis_kwargs)
         # Frame-state cache: several readouts want the same id-ordered gather over
         # every particle, and rebuilding it per readout is what made the old code
         # walk the whole system several times a frame.
@@ -166,6 +183,19 @@ class PlaygroundSystem(MDSystem3D):
         # plus the last finite thermo reading to fall back on.
         self._unstable = None
         self._last_thermo = None
+        # The last event that destroyed the simulation, waiting to be shown once
+        # (see take_fault). Not the same thing as `_unstable`: that says "stepping
+        # has stopped", this says "somebody should be told why".
+        self._fault = None
+        # PARAMETER VALUES KNOWN TO BUILD. Two snapshots, because a rebuild that
+        # fails needs somewhere to fall back TO -- and a slider is allowed to reach
+        # a value that only turns out to be impossible when the next build validates
+        # it, at which point the value that was fine is already overwritten.
+        #   _built_params    what was in force the last time a build succeeded
+        #   _initial_params  the playground's own values, before anyone touched a
+        #                    slider -- the last resort
+        self._initial_params = self._snapshot_params()
+        self._built_params = None
         # Whether this scenario overrides housekeeping at all -- checked once so
         # the per-frame path can skip the gather entirely.
         self._has_housekeeping = (
@@ -182,6 +212,29 @@ class PlaygroundSystem(MDSystem3D):
         self._setup_dirty = True
         self.lmp = None
         self._setup(self._new_seed())
+
+    # ---- parameter snapshots -------------------------------------------------
+
+    def _snapshot_params(self):
+        """The raw values of both parameter sets, copied.
+
+        Raw, not effective: a clamp is re-applied on read, so storing the clamped
+        value would quietly make a restore lossy the moment a clamp's dependency
+        moved.
+        """
+        return (dict(self.params.values), dict(self.scenario_params.values))
+
+    def _restore_params(self, snapshot):
+        """Put both parameter sets back, and report what actually moved."""
+        ff_values, scenario_values = snapshot
+        changed = {}
+        for name, value in ff_values.items():
+            if self.params.has(name) and self.params.set(name, value):
+                changed[name] = value
+        for name, value in scenario_values.items():
+            if self.scenario_params.has(name):
+                self.scenario_params.set(name, value)
+        return changed
 
     def _new_seed(self):
         if self.playground.seed is not None:
@@ -209,7 +262,32 @@ class PlaygroundSystem(MDSystem3D):
         self.bonds = list(build.bonds)
         self.brightness = build.brightness
 
-        self.lmp = lammps(cmdargs=["-log", "none", "-screen", "none"])
+        cmdargs = ["-log", "none", "-screen", "none"]
+        if self.host_profile is not None:
+            cmdargs += list(self.host_profile.lammps_args)
+        self.lmp = lammps(cmdargs=cmdargs)
+        try:
+            self._issue_setup(seed, rng, build, params, sparams)
+        except BaseException:
+            # A DECK THAT FAILS MUST NOT TAKE THE PROCESS WITH IT. Whatever went
+            # wrong (a command this build does not accept, a pair style that is not
+            # there), the instance we just made is still holding a GPU context; left
+            # for the garbage collector, its destructor runs during interpreter
+            # shutdown, when CUDA has already begun unloading. Kokkos then throws
+            # from a destructor and the process dies of SIGABRT with a core dump,
+            # burying the actual error under sixty lines of backtrace -- which is
+            # exactly how the `mass` failure above arrived from the cluster.
+            #
+            # Closing it here finalises Kokkos while CUDA is still alive, so the
+            # error propagates as itself and the caller can report it.
+            self.close()
+            raise
+        # It built, so these values are the ones to come back to.
+        self._built_params = self._snapshot_params()
+
+    def _issue_setup(self, seed, rng, build, params, sparams):
+        """The deck itself, on the instance `_setup` has just created."""
+        ff, scenario = self.force_field, self.scenario
         lmp = self.lmp
         c = lmp.command
         ff.ensure_available(lmp)
@@ -383,12 +461,56 @@ class PlaygroundSystem(MDSystem3D):
 
     def reset(self):
         """Rebuild from a fresh random state, keeping the current live parameters.
-        Used by sim mode's Reset."""
+        Used by sim mode's Reset.
+
+        A PARAMETER VALUE CANNOT MAKE THIS RAISE. That is the whole point: Reset is
+        the way out of a simulation the sliders destroyed, so if Reset itself dies
+        on the same value there is no way back and the app (or, on the cluster, the
+        server holding an A100) goes down with it. Which is exactly what happened:
+        a `zeta` below 1 is fine to the CPU pair style and rejected by the Kokkos
+        one, so it streamed happily -- the per-chunk `run ... pre no` never
+        re-validates coefficients -- until Reset rebuilt, `run 0` validated them,
+        and the exception took out the server and its allocation.
+
+        So a rebuild falls back: the current values, then the ones that built last
+        time, then the playground's own. What it fell back to is recorded as a
+        `Fault` for the caller to show, along with the parameters it had to put
+        back, so the sliders can be moved to where the simulation actually is.
+        """
         if self.lmp is not None:
             self.lmp.close()
-        self.analysis = Analysis(self.force_field, self.playground.observables)
+            self.lmp = None
+        self.analysis = Analysis(self.force_field, self.playground.observables,
+                                 **self._analysis_kwargs)
         self._unstable = None      # a rebuild is the way out of an unstable state
-        self._setup(self._new_seed())
+        self._rebuild()
+
+    def _rebuild(self):
+        """`_setup`, with the two fallbacks. Raises only if all three fail."""
+        ladder = [(None, None)]
+        if self._built_params is not None:
+            ladder.append((self._built_params, "the values it last built with"))
+        ladder.append((self._initial_params, "this playground's own values"))
+        failure = None
+        for snapshot, note in ladder:
+            reverted = self._restore_params(snapshot) if snapshot else {}
+            try:
+                self._setup(self._new_seed())
+            except Exception as exc:                  # noqa: BLE001 -- reported
+                failure = failure or exc
+                continue
+            if failure is not None:
+                # It came back, on the second or third try. The fault is not fatal:
+                # there IS a running simulation now, it is just not the one the
+                # sliders were asking for.
+                self._fault = Fault.from_error(failure, reverted=reverted,
+                                               fatal=False)
+                self._fault.summary += f" Restarted with {note}."
+            return
+        # Nothing builds, not even the playground's own values -- so this is not a
+        # parameter problem and there is nothing left to fall back to.
+        self._fault = Fault.from_error(failure)
+        raise failure
 
     # ---- mid-flight commands ------------------------------------------------
 
@@ -559,8 +681,11 @@ class PlaygroundSystem(MDSystem3D):
         setup = "" if self._setup_dirty else " pre no post no"
         try:
             self.lmp.command(f"run {n}{setup}")
-        except Exception as exc:
+        except Exception as exc:                      # noqa: BLE001 -- latched
             self._unstable = str(exc).strip().splitlines()[0]
+            # Reported once, as well as latched: the HUD line says the state, the
+            # fault says the event, and only the event can be shown as it happens.
+            self._fault = Fault.from_error(exc)
             return
         # Only now: a run that threw leaves the instance in an unknown state, and
         # the next one (after a rebuild) should set up in full.
@@ -679,6 +804,32 @@ class PlaygroundSystem(MDSystem3D):
     def get_sim_time(self):
         return self._sim_time
 
+    def take_fault(self):
+        """The last simulation-destroying event, once. None if there was none.
+
+        Popped rather than read, so the caller does not have to remember which ones
+        it has already shown -- and so two callers cannot both decide to reset.
+        """
+        fault, self._fault = self._fault, None
+        return fault
+
+    def live_param_values(self):
+        """The effective value of every live parameter, for the sliders to follow.
+
+        Needed because a rebuild may have put a parameter back: the app pushes its
+        slider values into the system every frame, so a slider left pointing at the
+        value that destroyed the simulation would push it straight back in.
+        """
+        return {p.name: float(self.params[p.name])
+                for p in self.params.live_params()}
+
+    @property
+    def unstable(self):
+        """The message latched when these parameters destroyed the simulation, or
+        None. Read by the HUD locally and sent down the wire by the remote server,
+        so a blow-up on the cluster reads the same as a blow-up here."""
+        return self._unstable
+
     def get_rdf(self):
         state = self._analysis_state()
         if all(self.box.periodic):
@@ -686,6 +837,16 @@ class PlaygroundSystem(MDSystem3D):
         else:
             self._rdf.add(state.positions[:, :2])
         return self._rdf.get()
+
+    def current_state(self):
+        """This frame's FrameState, built at most once per frame.
+
+        The public form of `_analysis_state`, for a caller that wants the frame
+        rather than a readout derived from it -- the remote server, which sends it
+        down the wire (remote/server.py). Sharing the cache is the point: a second
+        `frame_state()` call would re-gather every position and director.
+        """
+        return self._analysis_state()
 
     def _analysis_state(self):
         """The frame state, rebuilt at most once per frame.

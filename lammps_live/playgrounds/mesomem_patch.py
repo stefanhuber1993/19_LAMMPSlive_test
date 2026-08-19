@@ -57,7 +57,9 @@ PLAYGROUND = Playground(
     # than large and arbitrary. 4.2 sigma leaves 0.1 of clearance outside the
     # 2.0-sigma leash below, which is all the room the constraint needs -- the
     # walls are there to catch a particle that escapes, not to be seen.
-    scenario=hex_patch(n_rings=1, a=1.0, box=4.2, settle_steps=300),
+    scenario=hex_patch(n_rings=1, a=1.0, box=4.2, 
+                       view_center_z=0.0,
+                       settle_steps=300),
     mode="game",
     control=Control(
         atom="first",           # hex_patch orders the centre site first
@@ -69,7 +71,7 @@ PLAYGROUND = Playground(
         # release -- which is the thing worth feeling. (It was 2.8, far enough out
         # that the bond had already let go.)
         leash=(2.0, 2.0),
-        max_input_force=9.0,
+        max_input_force=4.0,
         grid_step=0.5,
     ),
     observables=["mean_tilt_deg", "thickness", "coordination"],

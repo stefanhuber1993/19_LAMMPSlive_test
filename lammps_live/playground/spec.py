@@ -160,6 +160,20 @@ class Playground:
     # interest IS a slow collective change (assembly, a healing membrane);
     # pointless on a handful of beads whose individual motion is the subject.
     trajectory_smoothing: bool = False
+    # Cadence of the energy-panel evaluation, in analysis frames (default 4, see
+    # observables.Analysis). The one dial that matters on a big system: the panels
+    # are a pass over every pair, measured at 2.5 us/bead, so a playground running
+    # 10k beads instead of 1500 buys its frame budget back here.
+    analysis_energy_every: int = None
+    # Set to run the simulation somewhere else -- a cluster GPU -- and only draw it
+    # here. A remote playground builds no local LAMMPS: `registry.build` hands back
+    # a remote.client.RemoteSystem, which takes its frames off a socket and runs
+    # this same file's analysis on them. Everything else on this declaration
+    # (sliders, observables, render style, camera) is used exactly as it is, by
+    # both ends -- the server builds the very same Playground to decide what to
+    # integrate. See remote/session.py for the connection it describes.
+    remote: object = None
+
     element_label: str = ""            # legend text, e.g. "Ar (LJ)"
     lattice_spacing: float = 1.0       # informational, and the bond-overlay optimum
     # Flat draw colour for a single-species 2D system, so different materials read

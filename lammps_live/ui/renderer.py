@@ -29,7 +29,7 @@ from .theme import (
     POTENTIAL_COLORS, POTENTIAL_PANEL_BG, POTENTIAL_TOTAL_COLOR, POTENTIAL_TRACK_COLOR,
     PULLER_BOND_COLOR, PULLER_LABEL_BG, PULLER_LABEL_COLOR, PULLER_RADIUS_BOOST,
     PULLER_RING_COLOR, PULLER_RING_FREE_COLOR, PULLER_RING_WIDTH,
-    REACTION_VEC_COLOR, SPHERE_AMBIENT,
+    REACTION_VEC_COLOR, SLIDER_HANDLE_ACTIVE, SPHERE_AMBIENT,
     SPHERE_LIGHT_DIR, TEXT_COLOR, TORQUE_ARC_APPLIED_RADIUS,
     TORQUE_ARC_HEAD_LEN, TORQUE_ARC_REACTION_RADIUS, TORQUE_ARC_WIDTH,
     VECTOR_MAX_PX,
@@ -59,20 +59,44 @@ KEY_HINTS = (
 ORBIT_KEY_HINTS = "   drag: orbit camera   wheel: zoom   C: auto-orbit"
 
 
+def _wrap_items(items, font, width, separator="  "):
+    """`items` packed into as few lines as fit `width` pixels, in order."""
+    rows, current = [], ""
+    for item in items:
+        trial = f"{current}{separator}{item}" if current else item
+        if current and font.size(trial)[0] > width:
+            rows.append(current)
+            current = item
+        else:
+            current = trial
+    if current:
+        rows.append(current)
+    return rows
+
+
 class Renderer:
-    def __init__(self, window_size, fullscreen=False):
+    def __init__(self, window_size, fullscreen=False, ui_scale=None):
         pygame.display.set_caption("LAMMPS live")
         # Desktop resolution, captured before the first set_mode so it's the true
         # screen size (not a prior window's) -- used as the fullscreen size.
         info = pygame.display.Info()
         self.desktop_size = (info.current_w, info.current_h)
-        self.windowed_size = tuple(window_size)
+        # How big the 2D UI is drawn (see ui/scale.py). Resolved first, because
+        # every font and layout size below is quoted at scale 1 and passed
+        # through it. None -> pick from the screen.
+        self.ui_scale = set_ui_scale(auto_ui_scale(self.desktop_size)
+                                     if ui_scale is None else ui_scale)
+        # The default window size is quoted at scale 1 too: a UI drawn twice as
+        # big needs twice the window to hold the same layout -- but never more
+        # than the screen has.
+        self.windowed_size = (min(self.desktop_size[0], UI(window_size[0])),
+                              min(self.desktop_size[1], UI(window_size[1])))
         self.fullscreen = fullscreen
         self._init_display()   # sets screen + all size-dependent layout state
 
-        self.font = pygame.font.SysFont(None, 18)
-        self.small_font = pygame.font.SysFont(None, 15)
-        self.header_font = pygame.font.SysFont(None, 22, bold=True)
+        self.font = UI.font(18)
+        self.small_font = UI.font(15)
+        self.header_font = UI.font(22, bold=True)
 
         # Collapsible "Advanced" slider group: the app owns the open/closed state
         # (self.show_advanced, set before each draw) and reads back the clickable
@@ -1600,18 +1624,23 @@ class Renderer:
                           torque_signals, hud_lines, debug_line,
                           total_potential_terms=None):
         # Force arrows at the puller (map control-plane (x,z) -> world x,z).
+        # Everything anchored ON a particle is skipped for a scene that has none --
+        # which is a real state, not a degenerate one: a remote playground holds an
+        # empty scene until its first frame arrives. Without the guard this indexes
+        # pts[0] of an empty array and takes the app down with it.
         puller_idx = int(np.argmax(is_puller)) if np.any(is_puller) else 0
-        anchor = pts[puller_idx]
-        knee = spec.force_feedback.ff_knee
-        ivec = np.array([input_force[0], 0.0, input_force[1]])
-        rvec = np.array([reaction_force[0], 0.0, reaction_force[1]])
-        self._draw_arrow_3d(camera, anchor, rvec, REACTION_VEC_COLOR, knee)
-        self._draw_arrow_3d(camera, anchor, ivec, INPUT_VEC_COLOR, knee)
+        if len(pts):
+            anchor = pts[puller_idx]
+            knee = spec.force_feedback.ff_knee
+            ivec = np.array([input_force[0], 0.0, input_force[1]])
+            rvec = np.array([reaction_force[0], 0.0, reaction_force[1]])
+            self._draw_arrow_3d(camera, anchor, rvec, REACTION_VEC_COLOR, knee)
+            self._draw_arrow_3d(camera, anchor, ivec, INPUT_VEC_COLOR, knee)
         # Circular torque arrows around the puller, both about the control-plane
         # normal (in-plane director rotation): green = the user's steering torque,
         # red = the membrane's restoring torque. Both signals are the component
         # already projected onto the net's plane (see get_torque_signals).
-        if torque_signals is not None:
+        if torque_signals is not None and len(pts):
             pcx, pcy = int(screen[puller_idx][0]), int(screen[puller_idx][1])
             r_px = float(radii[puller_idx])
             applied, reaction = torque_signals
@@ -1806,13 +1835,13 @@ class Renderer:
             f"interaction force: ({rx:5.1f}, {ry:5.1f}){fu}   fps: {fps:4.0f}",
             True, (200, 200, 200),
         )
-        self.screen.blit(label, (10, 10))
+        self.screen.blit(label, (UI(10), UI(10)))
 
         legend = self.font.render(
             f"green = your input force, red = {spec.element_label} interaction (reaction) force",
             True, (140, 140, 140),
         )
-        self.screen.blit(legend, (10, 30))
+        self.screen.blit(legend, (UI(10), UI(30)))
 
         self._draw_hud(hud_lines)
         self._draw_debug_line(debug_line)
@@ -1822,10 +1851,10 @@ class Renderer:
         (playback systems only). The button matching the current run state is
         highlighted: Play while running, Pause while stopped. Reset never latches.
         Positions the button rects so the app can hit-test clicks (playback_hit)."""
-        bw, bh, gap = 96, 34, 12
+        bw, bh, gap = UI(96), UI(34), UI(12)
         total = 3 * bw + 2 * gap
         x0 = (self.sim_width - total) // 2
-        y0 = self.window_size[1] - bh - 16
+        y0 = self.window_size[1] - bh - UI(16)
         active = {"play": playing, "pause": not playing, "reset": False}
         for i, btn in enumerate(self.playback_buttons):
             btn.rect = pygame.Rect(x0 + i * (bw + gap), y0, bw, bh)
@@ -1852,7 +1881,7 @@ class Renderer:
             return y
         self._bead_color_visible = True
         energy = self.bead_color_energy
-        self.bead_color_button.rect = pygame.Rect(x, y, 210, 26)
+        self.bead_color_button.rect = pygame.Rect(x, y, UI(210), UI(26))
         self.bead_color_button.label = ("bead colour: ENERGY" if energy
                                         else "bead colour: DIRECTOR")
         self.bead_color_button.draw(self.screen, self.font, active=energy)
@@ -1863,26 +1892,26 @@ class Renderer:
                     "dark = tightly bound, bright = strained or free"] if energy else
                    ["director bands: yellow hydrophobic equator, blue poles",
                     "the band tilts with the director, so tilt and splay show"])
-        cy = y + 29
+        cy = y + UI(29)
         for line in caption + ["white cap marks the +director pole, either way"]:
             self.screen.blit(self.small_font.render(line, True, DIM_TEXT_COLOR),
                              (x, cy))
-            cy += 14
-        return cy + 6
+            cy += UI(14)
+        return cy + UI(6)
 
     def bead_color_hit(self, pos):
         """True if `pos` is on the bead-colouring toggle (and it is on screen)."""
         return self._bead_color_visible and self.bead_color_button.hit(pos)
 
     def draw_panel(self, systems, current_key, sliders, thermo_now, puller_energy,
-                    history, rdf, spec, puller_speed_m_s=None):
+                    history, rdf, spec, puller_speed_m_s=None, remote_note=None):
         pygame.draw.rect(self.screen, PANEL_BG, self.panel_rect)
         pygame.draw.line(self.screen, PANEL_DIVIDER, (self.panel_rect.x, 0),
-                          (self.panel_rect.x, self.window_size[1]), 1)
+                          (self.panel_rect.x, self.window_size[1]), UI.w(1))
 
-        x = self.panel_rect.x + PANEL_PAD
-        w = PANEL_WIDTH - 2 * PANEL_PAD
-        y = 10
+        x = self.panel_rect.x + UI(PANEL_PAD)
+        w = self.panel_width - 2 * UI(PANEL_PAD)
+        y = UI(10)
 
         # Compact picker: number + short key (the full name of the active
         # system is shown in the header just below), so all systems fit on one
@@ -1890,45 +1919,63 @@ class Renderer:
         picker_bits = []
         for i, (key, sys_spec) in enumerate(systems, start=1):
             picker_bits.append(f"[{i}>{key}]" if key == current_key else f"{i}:{key}")
-        picker_surf = self.small_font.render("  ".join(picker_bits), True, DIM_TEXT_COLOR)
-        self.screen.blit(picker_surf, (x, y))
-        y += 18
+        # Wrapped, not one line: past about six playgrounds the row runs off the
+        # panel and the last few become unfindable (which is what adding the remote
+        # one did to `cu_deposition`).
+        for row in _wrap_items(picker_bits, self.small_font, w, "  "):
+            self.screen.blit(self.small_font.render(row, True, DIM_TEXT_COLOR), (x, y))
+            y += UI(15)
+        y += UI(3)
 
         name_surf = self.header_font.render(spec.name, True, HEADER_TEXT_COLOR)
         self.screen.blit(name_surf, (x, y))
-        y += name_surf.get_height() + 2
+        y += name_surf.get_height() + UI(2)
 
         desc_surf = self.small_font.render(spec.description, True, DIM_TEXT_COLOR)
         self.screen.blit(desc_surf, (x, y))
-        y += 16
+        y += UI(16)
 
         # The turntable keys are only listed for the systems that have one --
         # a hint for a key that does nothing is worse than no hint.
         hints = KEY_HINTS + (ORBIT_KEY_HINTS if spec.camera_orbit else "")
-        hint_surf = self.small_font.render(hints, True, DIM_TEXT_COLOR)
-        self.screen.blit(hint_surf, (x, y))
-        y += 20
+        # Wrapped rather than one line: the hints are wider than the panel, so a
+        # single surface loses its tail (the temperature and fullscreen keys) off
+        # the right edge -- at every UI scale, since both grow together.
+        for row in _wrap_items(hints.split("   "), self.small_font, w, "   "):
+            self.screen.blit(self.small_font.render(row, True, DIM_TEXT_COLOR), (x, y))
+            y += UI(15)
+        y += UI(5)
+
+        # A cluster GPU still allocated behind another playground. Amber, and above
+        # everything else: an allocation nobody can see is the expensive thing to
+        # forget, and the line is how you know it is there to go back to.
+        if remote_note:
+            for row in _wrap_items(remote_note.split(" "), self.small_font, w, " "):
+                self.screen.blit(self.small_font.render(row, True, SLIDER_HANDLE_ACTIVE),
+                                 (x, y))
+                y += UI(15)
+            y += UI(3)
 
         y = self._draw_bead_color_toggle(x, y, w, spec)
 
-        pygame.draw.line(self.screen, PANEL_DIVIDER, (x, y), (x + w, y), 1)
-        y += 12
+        pygame.draw.line(self.screen, PANEL_DIVIDER, (x, y), (x + w, y), UI.w(1))
+        y += UI(12)
 
         # sliders = (temperature, damping, *extra_sliders). Temperature (always
         # sliders[0], never advanced) carries the melt marker and is drawn first.
         # The rest split into "basic" (drawn in order right after temperature) and
         # "advanced" (hidden behind a collapsible toggle -- see self.show_advanced).
         temp_slider = sliders[0]
-        temp_slider.rect = pygame.Rect(x, y, w, 4)
+        temp_slider.rect = pygame.Rect(x, y, w, UI(4))
         temp_slider.draw(self.screen, self.font, mark_value=spec.melt_temp, mark_label="melt")
-        y += 46
+        y += UI(46)
 
         basic = [s for s in sliders[1:] if not s.advanced]
         advanced = [s for s in sliders[1:] if s.advanced]
         for extra in basic:
-            extra.rect = pygame.Rect(x, y, w, 4)
+            extra.rect = pygame.Rect(x, y, w, UI(4))
             extra.draw(self.screen, self.font)
-            y += 34
+            y += UI(34)
 
         if advanced:
             arrow = "v" if self.show_advanced else ">"
@@ -2052,12 +2099,38 @@ class Renderer:
                 ref_lines=[(1.0, DIM_TEXT_COLOR, "gas")],
             )
 
+    def draw_splash(self, message, detail=None):
+        """One frame saying the app is still coming up.
+
+        Startup costs a second or two -- the GL context, the force-feedback
+        handshake, building the first LAMMPS system -- and none of it can go
+        through draw(), which needs a system that does not exist yet. Without a
+        frame of its own the window is up but blank and, worse, unpumped: see
+        App._startup_frame for why that matters.
+        """
+        if self.gl_enabled:
+            self.gl.screen.use()
+            self.gl.clear(*(c / 255.0 for c in BG))
+            self.screen.fill((0, 0, 0, 0))
+        else:
+            self.screen.fill(BG)
+        cx, cy = self.window_size[0] // 2, self.window_size[1] // 2
+        surf = self.header_font.render(message, True, TEXT_COLOR)
+        self.screen.blit(surf, surf.get_rect(center=(cx, cy)))
+        if detail:
+            sub = self.small_font.render(detail, True, DIM_TEXT_COLOR)
+            self.screen.blit(sub, sub.get_rect(center=(cx, cy + UI(22))))
+        if self.gl_enabled:
+            self.compositor.present(self.screen)
+        pygame.display.flip()
+
     def draw(self, positions, is_puller, puller_pos, input_force, reaction_force, fps,
               spec, systems, current_key, sliders, thermo_now, puller_energy,
               history, rdf, heat_fraction=0.0, sim_time_ps=0.0, puller_speed_m_s=None,
               atom_trails=None, species=None, bond_pairs=None, hbond_pairs=None,
               hud_lines=None, scene_3d=None, total_steps=0, steps_per_frame=1,
-              debug_line=None, playback_playing=None, puller_attached=True):
+              debug_line=None, playback_playing=None, puller_attached=True,
+              overlay=None, remote_note=None):
         # In GL mode the default framebuffer is cleared to BG first; the 3D scene
         # (if any) is drawn straight into its sim viewport, and every 2D surface
         # is composited over it at the end. In CPU mode self.screen IS the display
@@ -2090,11 +2163,18 @@ class Renderer:
                            debug_line=debug_line,
                            puller_attached=puller_attached)
         self.draw_panel(systems, current_key, sliders, thermo_now, puller_energy,
-                         history, rdf, spec, puller_speed_m_s)
+                         history, rdf, spec, puller_speed_m_s,
+                         remote_note=remote_note)
         # Play / Pause / Reset controls for playback systems, over the sim view.
         self._playback_visible = False
         if spec.playback_controls and playback_playing is not None:
             self.draw_playback_controls(playback_playing)
+        # A modal card over the sim view (the remote connect panel). Drawn here
+        # rather than by the caller after draw() returns, because in GL mode every
+        # 2D surface has to be on self.screen before it is composited -- and
+        # because draw() is what flips.
+        if overlay is not None:
+            overlay(self)
         if self.gl_enabled:
             self.compositor.present(self.screen)
         pygame.display.flip()

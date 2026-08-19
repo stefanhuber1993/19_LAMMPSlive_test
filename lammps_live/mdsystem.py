@@ -294,6 +294,22 @@ class MDSystem(ABC):
         sliders. Called every frame with the slider's current value, so
         implementations should cheaply no-op when the value is unchanged."""
 
+    def take_fault(self):
+        """Optional: the last event that destroyed the simulation, once, then None.
+
+        A `playground.faults.Fault` -- what happened, in a sentence and verbatim,
+        and any parameter the recovery had to put back. Popped rather than read, so
+        the app shows each one exactly once (App._handle_faults). None for a system
+        that cannot be destroyed by its own parameters, which is the default."""
+        return None
+
+    def live_param_values(self):
+        """Optional: the effective value of every live parameter, keyed by slider
+        key. The app pushes sliders INTO the system every frame, so this is how a
+        value the system chose for itself -- a clamp, or a rebuild falling back off
+        a value LAMMPS refused -- gets back out to the slider."""
+        return {}
+
     def get_bead_brightness(self):
         """Optional (3D): a per-bead albedo brightness multiplier aligned with
         get_positions_3d's ordering (1.0 = normal). Used to spotlight a tagged
@@ -345,6 +361,15 @@ class MDSystem(ABC):
     def puller_attached(self):
         """Whether the input device is currently holding the puller."""
         return False
+
+    def set_playing(self, playing):
+        """Tell the system whether the run is going (Play/Pause).
+
+        A no-op for a system this process integrates itself -- the app simply stops
+        calling `step`. It matters for one whose simulation is elsewhere: that one
+        has to say so, or the far end keeps integrating for a client that is not
+        reading (see remote/client.py).
+        """
 
     def puller_bead_count(self):
         """Number of LAMMPS atoms the puller is made of: 1 for a single-atom

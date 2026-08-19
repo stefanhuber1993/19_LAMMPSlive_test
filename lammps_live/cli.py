@@ -9,6 +9,7 @@ path).
     lammps-live --list                          # everything runnable
     lammps-live --playground mesomem_sheet      # drag one bead out of a membrane
     lammps-live --playground mesomem_assembly   # watch 1500 beads self-assemble
+    lammps-live --playground mesomem_remote      # 10k beads on a cluster GPU
     lammps-live --playground mesomem_assembly --mode game   # ... then poke it
     lammps-live --playground mesomem_sheet --preset buckled --input joystick
     lammps-live --verify                        # check the force fields' energy
@@ -63,6 +64,14 @@ def build_parser():
                              "the compiled pair style, then exit")
     parser.add_argument("--calibrate", action="store_true",
                         help="print live joystick state for a few seconds and exit")
+    parser.add_argument("--remote", default=None, metavar="HOST:PORT",
+                        help="for a remote playground: connect straight to an "
+                             "already-running server instead of allocating one. "
+                             "This is the loopback path -- run the server yourself "
+                             "(python -m lammps_live.remote.server) and skip the "
+                             "SSH and Slurm machinery entirely")
+    parser.add_argument("--token", default="", metavar="SECRET",
+                        help="shared secret for --remote (the server's --token)")
     return parser
 
 
@@ -141,10 +150,19 @@ def main(argv=None):
             parser.error("no playgrounds found")
         initial_key = keys[0]
 
+    remote_address = None
+    if args.remote:
+        host, _, port = args.remote.rpartition(":")
+        if not host or not port.isdigit():
+            parser.error("--remote wants HOST:PORT, e.g. 127.0.0.1:5723")
+        remote_address = (host, int(port))
+
     from .app import App
     app = App(input_mode=args.input, initial_system_key=initial_key,
               fullscreen=args.fullscreen, debug=args.debug,
-              mode=args.mode, preset=args.preset)
+              mode=args.mode, preset=args.preset,
+              remote_address=remote_address, remote_token=args.token,
+              ui_scale=args.ui_scale)
     app.run()
     return 0
 

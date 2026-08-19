@@ -22,10 +22,13 @@ gain evaporates. Kokkos coverage of the DIPOLE package is thin.
 - Read the timing breakdown for host/device sync. **No sync = green light.**
 - Kokkos means a real in-tree build, not the runtime-plugin path used now.
 
-## 2. Split sim from render (do on the laptop, no GPU needed)
+## 2. Split sim from render -- DONE
 
-De-risks the whole pipeline before any kernel work, and is what makes the demo
-possible at all.
+Built as `lammps_live/remote/` and the `mesomem_remote` playground:
+[remote-gpu.md](remote-gpu.md) is the full write-up of how and why, and
+docs/snellius/README.md is how to run it. Both ends build the same `Playground`
+file, so there is one definition of the demo and no deck to keep in sync. The
+original reasoning, which held up:
 
 - Server = headless LAMMPS; client = this app, rendering received frames.
 - **Already in our favour:** every readout hands back copies (the `stepper.py`
@@ -46,6 +49,38 @@ throttled live, linear to 100k (a full update at 100k = 275 ms). This caps N at
 | as-is | ~10,600 |
 | 10x cheaper (cadence / subsample) | ~60,000 |
 | off, or from GPU-side computes | ~125,000 |
+
+### Re-measured at 10k, on the real thing (2026-08-18)
+
+Against a *coarsened* 10k configuration -- 22.8 neighbours per bead, not the 11.5
+of the initial gas the extrapolation above was based on:
+
+| | measured |
+|---|---|
+| `build_pairs` (cKDTree, rc = 2.5) | **21.7 ms** |
+| `energy_terms` over 113k pairs | 9.7 ms |
+| all three observables together | 0.8 ms |
+| one full `Analysis.update` | 31.7 ms |
+| throttled average per frame, as shipped | **6.8 ms** |
+
+So the estimate was right about the size of the wall (1.74 us/bead/chunk against
+1.5 predicted) and the throttled average is now well inside a 60 fps frame -- but
+only after **the scheduler was fixed**, which was worth 2.6x on its own and cost
+nothing:
+
+- The observables' phases were deliberately *staggered* so they would not land on
+  the same frame. With a shared pair list that is backwards: the list is the
+  expensive part, and three every-4-frames observables spread over three frames
+  built it three times instead of once. They are now aligned.
+- Two of the three never look at the pair list at all (`nematic_S`, `thickness`).
+  They now declare that (`needs_pairs=False`) and cannot trigger a build.
+
+What remains is a **31.7 ms peak** on the one frame in eight where the pair build
+and the energy panel coincide -- a visible dip to ~31 fps at 7.5 Hz. The next
+things to do about it, cheapest first: build the pair list with
+`query_ball_point(..., workers=-1)` (multithreaded, unlike `query_pairs`);
+subsample `coordination`, which only needs a mean; or move the energy decomposition
+to a GPU-side compute and off this machine entirely.
 
 ## 4. Budget table
 
@@ -118,6 +153,22 @@ Ways to actually fit a thin link, in order of payoff:
 
 Check the actual link first: 100k @ 60 fps needs ~200 Mb/s sustained. Trivial on a
 wired research network, not happening over a home VPN.
+
+### What shipped (2026-08-18)
+
+`lammps_live/remote/protocol.py` implements the second row of that table, with one
+deliberate difference: **octahedral-16 directors, not octahedral-8**, so 10 B/bead
+rather than 8. The extra 2 bytes buy 0.0037 deg worst-case angular error instead of
+0.87, and the reason is not the picture -- it is that the client MEASURES from
+these directors as well as drawing them (`nematic_S` is the number the k_tilt
+transition shows up in), and an order parameter should not carry a codec's error.
+At the 10k demo size that is 100 kB/frame, 6 MB/s at 60 fps, 48 Mb/s -- fine on
+any real link, and `--fps 30` halves it.
+
+Everything below the second row is deliberately NOT built. Delta coding and
+entropy coding both need a stateful decoder that a dropped frame invalidates, and
+the client drops frames on purpose (see remote/client.py). At 10k the link is not
+the bottleneck; when 100k is, the order to add them in is the order above.
 
 ## 6. Validation
 

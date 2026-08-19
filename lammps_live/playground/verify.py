@@ -99,7 +99,12 @@ def verify_playground(ref, mode=None, preset=None, params=None, tolerance=1e-6,
     splay term vanish, for instance), so a thermalized, disordered configuration is
     the stronger test.
     """
-    from .registry import build
+    from .registry import build, load
+    # A remote playground has no local LAMMPS to check the expression against --
+    # its simulation is on a cluster. The force field it uses is verified through
+    # whichever local playground uses it, which is the same expression.
+    if load(ref).remote is not None:
+        return None
     system = build(ref, mode=mode, preset=preset)
     try:
         for name, value in (params or {}).items():

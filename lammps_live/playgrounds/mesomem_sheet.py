@@ -74,7 +74,7 @@ PLAYGROUND = Playground(
         leash=(5.0, 3.5),
         # A large cohesive membrane barely tented under the patch's forces, so
         # pull authority is raised here.
-        max_input_force=12.0,
+        max_input_force=7.0,
         grid_step=0.8,
     ),
     observables=["nematic_S", "thickness", "area_per_particle"],

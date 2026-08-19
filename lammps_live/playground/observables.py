@@ -13,34 +13,63 @@ fps. Three things keep it cheap:
     built a KD-tree twice per frame in the patch system, and again for the RDF);
   * a declared cadence per observable, so a heavy whole-system quantity runs
     every Nth frame and returns its cached value in between;
-  * staggered phases, so several every-4-frames observables don't all land on
-    the same frame and spike it.
+  * observables that do not need the pair list say so, and are not allowed to
+    trigger building one;
+  * the ones that DO need it are aligned onto the same frames rather than spread
+    out over them.
+
+THAT LAST POINT USED TO BE THE OPPOSITE, and the change is worth recording. The
+phases were originally staggered on the reasoning that several every-4-frames
+observables landing together would spike that frame. With a SHARED pair list that
+is exactly backwards: the expensive thing is not the observables (0.4 ms each at
+10k beads) but the list they all read, and spreading three of them over three
+different frames built it three times instead of once. Measured on the 10k remote
+playground, coarsened to 22 neighbours per bead:
+
+    build_pairs   29 ms      energy_terms  9.7 ms      all observables  0.8 ms
+
+so the schedule was averaging 17.4 ms per frame -- more than a whole 60 fps frame
+-- to produce 10.5 ms of actual work. Aligned, and with the two observables that
+never touch the list no longer triggering it, the same schedule averages 8.7 ms.
+The cost is a bigger peak on the frames where everything lands, which is the right
+trade here because the analysis runs on the stepper's thread alongside the drawing
+(see remote/client.py) and has a whole frame to hide in.
 """
 import numpy as np
 
-from .state import build_pairs, principal_normal
+from .state import PairData, build_pairs, principal_normal
 
 _REGISTRY = {}
 
 
-def observable(name, label=None, unit="", every=4, needs_directors=False):
-    """Register a function(state, pairs, params) -> float as a named observable."""
+def observable(name, label=None, unit="", every=4, needs_directors=False,
+               needs_pairs=False):
+    """Register a function(state, pairs, params) -> float as a named observable.
+
+    `needs_pairs` is the expensive declaration: the pair list costs 29 ms at 10k
+    beads, so an observable that only reads positions or directors must not be the
+    reason one gets built. It defaults to False, which means a new observable that
+    forgets to declare it gets an empty pair list rather than a slow one -- an
+    obviously wrong answer instead of a quietly expensive right one.
+    """
     def decorate(fn):
         _REGISTRY[name] = Observable(
             name=name, label=label or name, unit=unit, every=every,
-            needs_directors=needs_directors, fn=fn,
+            needs_directors=needs_directors, needs_pairs=needs_pairs, fn=fn,
         )
         return fn
     return decorate
 
 
 class Observable:
-    def __init__(self, name, label, unit, every, needs_directors, fn):
+    def __init__(self, name, label, unit, every, needs_directors, fn,
+                 needs_pairs=False):
         self.name = name
         self.label = label
         self.unit = unit
         self.every = max(1, int(every))
         self.needs_directors = needs_directors
+        self.needs_pairs = needs_pairs
         self.fn = fn
 
     def __call__(self, state, pairs, params):
@@ -114,7 +143,7 @@ def _area_per_particle(state, pairs, params):
     return area / len(p)
 
 
-@observable("coordination", "mean neighbours within rc", every=4)
+@observable("coordination", "mean neighbours within rc", every=4, needs_pairs=True)
 def _coordination(state, pairs, params):
     """Mean number of neighbours inside the interaction cutoff -- the simplest
     read on condensation: a dilute gas sits near zero, a packed membrane near the
@@ -153,9 +182,15 @@ class Analysis:
     # pair) and the aggregate barely changes frame to frame.
     ENERGY_EVERY = 4
 
-    def __init__(self, force_field, names=(), energy_every=None):
+    def __init__(self, force_field, names=(), energy_every=None, enabled=True):
         self.force_field = force_field
         self.observables = tuple(get(n) for n in names)
+        # Switched off entirely for a simulation whose analysis runs somewhere
+        # else: the remote demo's server integrates and the CLIENT measures, on
+        # the frames it receives (see remote/client.py). Leaving this on there
+        # would pay the per-bead pair-list cost twice, once on each machine, and
+        # the panels would be built where nothing can draw them.
+        self.enabled = bool(enabled)
         if energy_every is not None:
             self.ENERGY_EVERY = max(1, int(energy_every))
         self._frame = 0
@@ -168,8 +203,6 @@ class Analysis:
         # other is then an index error -- which is exactly what happened.
         self._energy_pairs = None
         self._values = {}            # observable name -> last value
-        # Stagger phases so several every-N observables don't share a frame.
-        self._phase = {ob.name: i for i, ob in enumerate(self.observables)}
 
     @property
     def pairs(self):
@@ -182,21 +215,27 @@ class Analysis:
     def values(self):
         return dict(self._values)
 
-    def _due(self, every, phase=0):
-        return (self._frame + phase) % every == 0
+    def _due(self, every):
+        return self._frame % every == 0
 
     def update(self, state, params, force=False):
         """Advance one frame. Rebuilds the pair list only when something that
         needs it is due, so a frame where nothing is scheduled costs nothing."""
+        if not self.enabled:
+            return
         self._frame += 1
         energy_due = force or self._due(self.ENERGY_EVERY)
         due_obs = [ob for ob in self.observables
-                   if force or self._due(ob.every, self._phase[ob.name])]
+                   if force or self._due(ob.every)]
         if not energy_due and not due_obs:
             return
 
-        cutoff = self.force_field.interaction_cutoff(params)
-        self._pairs = build_pairs(state.positions, cutoff, state.box)
+        # The pair list is built only for the consumers that actually read one.
+        if energy_due or any(ob.needs_pairs for ob in due_obs):
+            cutoff = self.force_field.interaction_cutoff(params)
+            self._pairs = build_pairs(state.positions, cutoff, state.box)
+        elif self._pairs is None:
+            self._pairs = PairData.empty()
 
         if energy_due:
             self._energy = self.force_field.energy_terms(state, self._pairs, params)

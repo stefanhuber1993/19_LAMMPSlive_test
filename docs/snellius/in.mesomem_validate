@@ -1,0 +1,90 @@
+# ---------------------------------------------------------------------------
+# Correctness gate for the scaled/ported run (docs/a100-plan.md §6).
+#
+# Deliberately NOT a benchmark. Same system as in.mesomem_100k but Langevin is
+# replaced by plain NVE, because a Langevin bath draws per-rank RNG streams and
+# its trajectories diverge with rank count by design -- that is expected, not a
+# bug, and it makes the comparison useless. Under NVE the pair style is
+# decomposition-exact (its ghost and dipole exchange were verified bit-identical
+# across 1/2/4/8 MPI ranks), so every CPU configuration below must print the SAME
+# digits.
+#
+# The GPU run is the exception and must NOT be held to that. mesomem/kk uses a
+# full neighbour list with newton off, so each pair is evaluated twice and summed
+# in a different order; the result differs at the level of floating-point
+# roundoff by construction. What to require instead:
+#   - pe(t=0) agreeing with the CPU value to ~1e-12 relative. A larger gap is a
+#     real difference -- a coefficient, a cutoff, or a missing pair.
+#   - etotal over the 500-step NVE conserved as well as the CPU run conserves it.
+#     Trajectories will separate (chaos amplifies roundoff); the conserved
+#     quantity is what stays comparable.
+#
+# Run all of these and diff the printed energies:
+#   lmp                            -in in.mesomem_validate -log v.cpu1.log
+#   srun -n  8 lmp                 -in in.mesomem_validate -log v.cpu8.log
+#   srun -n 64 lmp                 -in in.mesomem_validate -log v.cpu64.log
+#   lmp -k on g 1 -sf kk           -in in.mesomem_validate -log v.gpu.log
+#
+# Default N is 10000 so this takes seconds; raise it to 100000 to gate the size
+# you actually intend to ship.
+# ---------------------------------------------------------------------------
+
+variable nbeads index 10000
+variable seed   index 87287
+variable phi    index 0.1
+variable L equal (v_nbeads*(PI/6.0)/v_phi)^(1.0/3.0)
+
+units           lj
+dimension       3
+atom_style      dipole_sphere_angle
+boundary        p p p
+atom_modify     map array
+
+region          box block 0 ${L} 0 ${L} 0 ${L} units box
+create_box      1 box
+# Rank-independent: create_atoms random loops over all N from the one seed and
+# hands each coordinate to whichever rank owns it, so the configuration does not
+# depend on the decomposition.
+create_atoms    1 random ${nbeads} ${seed} box overlap 0.9 maxtry 200 units box
+
+set             group all diameter 1.0
+set             group all density  1.0
+set             group all dipole/random ${seed} 1.0
+
+pair_style      mesomem 2.5
+pair_coeff      * * 1.0 1.0 12.0 1.0 2.5 2.0 5.0 0.0
+
+neighbor        0.6 bin
+neigh_modify    every 1 delay 0 check yes
+
+# NVE only -- no thermostat. `loop geom` assigns velocities from each atom's
+# coordinates rather than its index, so this too is decomposition-independent.
+fix             nve all nve/sphere update dipole
+velocity        all create 0.2 ${seed} loop geom mom yes rot yes dist gaussian
+timestep        0.01
+
+thermo_style    custom step temp pe ke etotal press
+thermo_modify   norm no format float %.15g
+thermo          50
+
+# --- 1. t = 0 energy: is the force field itself the same? -------------------
+# A mismatch here is a coefficient, cutoff, or neighbour-list difference, before
+# any dynamics are involved. Fix this first -- nothing downstream is meaningful
+# until it matches.
+run             0
+variable        pe0 equal pe
+print           "VALIDATE pe(t=0)  = ${pe0}"
+
+# --- 2. short NVE: is the integration the same? -----------------------------
+# Divergence that only shows up here is a ghost/dipole exchange or a
+# torque-accumulation difference. Total energy must also be conserved (no drift
+# in etotal), which catches a timestep or moment-of-inertia mistake.
+run             500
+variable        pe1 equal pe
+variable        et1 equal etotal
+print           "VALIDATE pe(500)  = ${pe1}"
+print           "VALIDATE etot(500)= ${et1}"
+
+# Must be 0. Anything else means the skin is too small for how far beads move
+# between rebuilds and some pair interactions were silently missed.
+print           "VALIDATE check the 'Dangerous builds' count in the log tail"

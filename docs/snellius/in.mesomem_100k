@@ -1,0 +1,143 @@
+# ---------------------------------------------------------------------------
+# MesoMem spontaneous assembly, scaled to ~100k beads.
+#
+# The paper's first validation experiment (Sillano, Marrink & Idema 2026) at the
+# size docs/a100-plan.md targets: N directored beads dropped at random positions
+# and random orientations into a fully periodic cube at reduced volume fraction
+# phi = N*(pi/6)/L^3 = 0.1, coarsening under Langevin dynamics into planar
+# lamellae. 100k @ phi = 0.1 is an L = 80.6 sigma cell, which holds many
+# independent membranes rather than the single one the 1500-bead run manages.
+#
+# This is the live app's own deck (lammps_live/playgrounds/mesomem_assembly.py
+# + playground/scenario.py:RandomFill), written out by hand and scaled up.
+# Every number below is the app's value, so timings here transfer directly.
+#
+#   lmp -in in.mesomem_100k -log cpu1.log
+#   srun -n 128 lmp -in in.mesomem_100k -log cpu128.log
+#   lmp -k on g 1 -sf kk -pk kokkos newton on neigh half \
+#       -in in.mesomem_100k -log gpu.log
+#
+# Sweep the size without editing the file:
+#   lmp -var nbeads 25000 -in in.mesomem_100k
+# ---------------------------------------------------------------------------
+
+variable nbeads index 100000     # bead count
+variable seed   index 87287      # one seed drives placement, orientation, bath
+variable phi    index 0.1        # reduced volume fraction, N*(pi/6)/L^3
+
+# Cell side that puts nbeads at volume fraction phi, with Vp = (pi/6) sigma^3.
+# 100k @ 0.1 -> 80.600 sigma; 25k -> 50.775; 1500 (the paper's run) -> 19.878,
+# which is the 20-sigma box the app actually uses.
+variable L equal (v_nbeads*(PI/6.0)/v_phi)^(1.0/3.0)
+
+# --- MesoMem coefficients: the paper's standard conditions ------------------
+# k_tilt is the critical control parameter -- below ~10 the aggregates stay
+# compact and isotropic, above it they flatten into membranes. 12 is the
+# paper's recommended value and the app's default.
+variable ktilt  index 12.0
+variable ksplay index 1.0
+variable zeta   index 5.0        # steepness of the cos^2zeta attractive branch
+variable rc     index 2.5        # isotropic cutoff; >= 2.5 needed to aggregate
+variable wc     index 2.0        # orientational (tilt/splay) cutoff, capped at rc
+variable temp   index 0.2        # in the fluid-membrane window, below the ~eps well
+
+units           lj
+dimension       3
+atom_style      dipole_sphere_angle
+boundary        p p p
+# The demo server gathers positions and directors by atom id every frame, so
+# keep the map -- and benchmark with it on, since the real run pays for it.
+atom_modify     map array
+
+region          box block 0 ${L} 0 ${L} 0 ${L} units box
+create_box      1 box
+
+# LAMMPS does the overlap rejection itself. 0.9 sigma sits just outside the
+# 4-2 soft core's minimum at r = sigma, where the pair force is small and
+# attractive, so nothing is dropped inside anything else's core and blown up on
+# step 1. At phi = 0.1 rejection is rare and maxtry 200 is never hit.
+create_atoms    1 random ${nbeads} ${seed} box overlap 0.9 maxtry 200 units box
+
+# diameter THEN density: `set diameter` recomputes rmass from the radius, so the
+# order matters. m = (pi/6) = 0.5236, I = (2/5) m r^2 = 0.05236 -- the app's
+# values, and what its timestep is chosen against.
+set             group all diameter 1.0
+set             group all density  1.0
+# Random initial directors: the disordered orientational start the paper's
+# self-assembly begins from.
+set             group all dipole/random ${seed} 1.0
+
+# sigma eps k_tilt k_splay rc wc zeta c0   (c0 = 0 -> flat preferred)
+# Add a trailing 10th value in [0,1] for splay_symmetry if you built this
+# repo's patched pair style; the authors' original takes 8 and defaults it to 0.
+pair_style      mesomem ${rc}
+pair_coeff      * * 1.0 1.0 ${ktilt} ${ksplay} ${rc} ${wc} ${zeta} 0.0
+
+# Skin 0.6 (the app's RandomFill value): at cutoff rc+skin = 3.1 and number
+# density 0.191 that is ~12 half-list neighbours per bead in the initial gas,
+# rising to ~60 once beads pack into a lamella.
+neighbor        0.6 bin
+neigh_modify    every 1 delay 0 check yes
+
+# Implicit solvent. damp 1.0 is weaker friction than the probing scenarios use,
+# so beads diffuse far enough to find each other and assembly proceeds
+# watchably. `omega yes` thermostats the rotational degrees of freedom, which a
+# bead carrying a director needs -- and is the fix most likely to have no
+# Kokkos variant. See the checklist in README.md.
+fix             nve  all nve/sphere update dipole
+fix             bath all langevin ${temp} ${temp} 1.0 ${seed} omega yes
+
+# Uncomment for the MPI-only path: the gas is uniform but the lamellae are not,
+# so imbalance grows as it coarsens and static decomposition loses ranks to
+# empty cells.
+# fix           bal all balance 1000 1.05 shift xyz 10 1.05
+
+timestep        0.01
+
+# `-var timer_mode sync` fences before every section timer stamp, so the
+# Pair/Neigh/Comm breakdown of a Kokkos run is attributable. Without it, async
+# kernel launches let pair work be charged to a later section -- which is how a
+# GPU `Pair` time comes out above the hardware roofline. Default `normal` keeps
+# the honest end-to-end wall clock.
+variable        timer_mode index normal
+timer           ${timer_mode}
+
+# Start already warm rather than letting the bath heat from rest, so the timed
+# section below is measuring steady state and not a transient.
+velocity        all create ${temp} ${seed} loop geom mom yes rot yes dist gaussian
+
+thermo          100
+thermo_style    custom step temp pe etotal press spcpu cpuremain
+# Totals, not per-atom, so numbers are comparable across nbeads.
+thermo_modify   norm no format float %.10g
+
+# --- what the wire format needs (§5 of the plan) ----------------------------
+# id-ordered positions + directors is exactly the frame_state payload. Left off
+# by default: at 100k every 20 steps this writes ~7 MB/frame and will dominate
+# the timing. Turn it on only to capture a trajectory for the codec work.
+# dump          traj all custom 20 assembly_100k.lammpstrj id x y z mux muy muz
+# dump_modify   traj sort id
+
+# --- 1. warm-up: first neighbour build, first kernel launches ---------------
+run             200
+
+# --- 2. bulk throughput ----------------------------------------------------
+# Read `Loop time`, the Pair/Neigh/Comm percentage breakdown, and -- under
+# Kokkos -- whether a host/device sync line appears. Target for 60 fps at 20
+# steps/frame is 1200 steps/s.
+reset_timestep  0
+run             2000
+
+# --- 3. the demo's actual cadence ------------------------------------------
+# 100 chunks of 20 steps with the per-chunk setup skipped, which is what the app
+# does live (commit 2dae73c). Wall time / 100 is the per-frame sim budget and
+# must come in under 16.7 ms for 60 fps. This is the number that decides the
+# demo; the bulk figure above hides the per-chunk overhead.
+print           "=== frame cadence: 100 chunks x 20 steps, pre no ==="
+variable        f loop 100
+label           frames
+run             20 pre no post no
+next            f
+jump            SELF frames
+
+print           "=== done: N = ${nbeads}, L = ${L} ==="

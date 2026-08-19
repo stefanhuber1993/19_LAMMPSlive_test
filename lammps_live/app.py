@@ -24,15 +24,23 @@ from .input import (
 )
 from .ui import AtomTrails, Renderer, RollingHistory, Slider
 from .ui.camera import Camera3D, OrbitController
+from .ui.alert import Alert
+from .ui.remote_panel import RemotePanel
 
 STEPS_PER_FRAME_CAP = 200  # sanity cap if a system's timestep is set absurdly small
 
 
 class App:
     def __init__(self, input_mode, initial_system_key, fullscreen=False, debug=False,
-                 mode=None, preset=None):
+                 mode=None, preset=None, remote_address=None, remote_token="",
+                 ui_scale=None):
         self.input_mode = input_mode
         self.debug = debug
+        # `--remote HOST:PORT`: connect a remote playground straight to a server
+        # that is already running, instead of allocating one. The loopback path --
+        # no SSH, no Slurm, no connect panel.
+        self.remote_address = remote_address
+        self.remote_token = remote_token
         # Interaction mode ("game"/"sim") and named parameter preset, applied to
         # playgrounds. Both are None for legacy systems, which have neither.
         self.mode_override = mode
@@ -72,9 +80,15 @@ class App:
         pygame.display.init()
         pygame.font.init()
 
-        self.renderer = Renderer(config.WINDOW_SIZE, fullscreen=fullscreen)
+        # ui_scale=None lets the renderer pick from the screen (see ui/scale.py).
+        self.renderer = Renderer(config.WINDOW_SIZE, fullscreen=fullscreen,
+                                 ui_scale=ui_scale)
         self.clock = pygame.time.Clock()
 
+        # Opening the joystick is a run of blocking HID handshakes (one per
+        # force-feedback effect); building the first system is LAMMPS plus the
+        # shader compile. Put a frame up and pump the queue between them.
+        self._startup_frame("LAMMPS live", f"opening the {self.input_mode} input")
         self.source = self._make_source()
         # The simulation runs on a worker thread while the frame is drawn -- see
         # stepper.py for the rule that imposes and what it buys.
@@ -113,9 +127,57 @@ class App:
         # detection (see _poll_attach_button).
         self._attach_button_down = False
 
+        # The connect panel for a playground whose simulation runs elsewhere. It
+        # owns the SSH/Slurm session, so it is created once and lives as long as the
+        # app -- what changes is which system it is pointed at (see _build_system).
+        self.remote_panel = RemotePanel()
+        # The red card that says the simulation died and what was done about it.
+        self.alert = Alert()
+        # When the last automatic rebuild happened, so a parameter that destroys
+        # every fresh state cannot put the app in a reset loop (see _handle_faults).
+        self._last_auto_reset = 0.0
+
         self.system_key = None
         self.system = None
+        self._startup_frame("LAMMPS live", f"building {initial_system_key}")
         self._build_system(initial_system_key)
+        # Nothing before this point serviced the event queue, so anything in it
+        # now was aimed at a window that could not answer -- see
+        # _drain_startup_input.
+        self._drain_startup_input()
+
+    # ---- startup ------------------------------------------------------------
+
+    def _startup_frame(self, message, detail=None):
+        """Draw the splash and service the event queue, mid-startup.
+
+        Between the window appearing and the main loop's first
+        `pygame.event.get()` there is a second or two of blocking work -- the
+        joystick handshake, LAMMPS, the shaders -- and for all of it the window
+        is on screen with nobody reading its events. macOS calls that an
+        unresponsive app, and clicking a window in that state is how the press
+        and the release stop arriving as a pair. Pumping here keeps the app
+        answering; `_drain_startup_input` deals with whatever was aimed at it
+        meanwhile.
+        """
+        pygame.event.pump()
+        self.renderer.draw_splash(message, detail)
+
+    def _drain_startup_input(self):
+        """Throw away everything queued before the first real frame.
+
+        Those events describe a UI that did not exist when they happened: the
+        sliders had not been laid out (their rects are still the placeholder at
+        the origin until the first draw_panel), and no system was loaded, so
+        replaying a click into the main loop can only produce a drag nobody
+        started. Closing the window during startup still counts, though, so a
+        QUIT is put back.
+        """
+        pygame.event.pump()
+        quit_requested = bool(pygame.event.get(pygame.QUIT))
+        pygame.event.clear()
+        if quit_requested:
+            pygame.event.post(pygame.event.Event(pygame.QUIT))
 
     def _make_source(self):
         """Build the input source for the current mode and window geometry. Only
@@ -204,6 +266,31 @@ class App:
         self.system_key = key
         spec = self.system.spec
 
+        # A remote playground comes up disconnected, with the connect panel open --
+        # unless a session from earlier is still up, in which case it reconnects to
+        # the simulation the server has been holding (see RemotePanel.attach_system).
+        # Switching AWAY no longer gives the GPU back: going to another playground
+        # and returning is a normal thing to do mid-demo, and it should cost a
+        # socket rather than another queue wait. What ends the allocation is closing
+        # the window, Disconnect, or the server's own idle timeout.
+        from .remote.client import LinkClosed, RemoteSystem
+        if isinstance(self.system, RemoteSystem) and self.remote_address:
+            self.remote_panel.release()
+            host, port = self.remote_address
+            try:
+                self.system.connect(host, port, self.remote_token)
+                print(f"[lammps-live] connected to {host}:{port} -- "
+                      f"{self.system.status}")
+            except LinkClosed as exc:
+                # Not fatal: the scene comes up empty with the reason on the HUD,
+                # which is more use than a traceback over a server that has not
+                # been started yet.
+                print(f"[lammps-live] {exc}")
+        elif isinstance(self.system, RemoteSystem):
+            self.remote_panel.attach_system(self.system, key)
+        else:
+            self.remote_panel.detach_system()
+
         # Box<->screen mapping and (for 3D systems) the perspective camera. The
         # turntable is dropped first: a new system means a new scene, so it must
         # be framed from that scenario's own angle, not the last one's.
@@ -257,7 +344,18 @@ class App:
         """Restart a playback system from a fresh initial state (e.g. re-randomize
         the self-assembly box), keeping the current slider values, and clear the
         derived per-run state (plots, trails, energy baseline, step count). Leaves
-        the run paused so the fresh state is visible before Play is pressed."""
+        the run paused so the fresh state is visible before Play is pressed.
+
+        The wait is not optional. Reset arrives from the event handler, which runs
+        BETWEEN frames -- and between frames is exactly when a step is in flight
+        (see stepper.py: it is launched at the end of one frame and collected at
+        the start of the next). Rebuilding under it means tearing down a LAMMPS
+        instance the worker is inside; on the remote system, whose `reset` replaces
+        the analysis and clears the smoother, it means doing that to objects the
+        worker thread is using mid-frame, which is how Reset could leave the run
+        wedged. Every other rebuild path in this file already waits first.
+        """
+        self._sim_idle()
         self.system.reset()
         self.history.reset()
         self.atom_trails.reset()
@@ -265,6 +363,70 @@ class App:
         self.energy_baseline = None
         self.total_steps = 0
         self.sim_playing = False
+
+    # How long to wait before rebuilding automatically a second time. A value that
+    # destroys every fresh state (a temperature far above the melt, say) would
+    # otherwise blow up, rebuild, blow up again and leave the app flashing a card
+    # forever. One free recovery, then it stops and says so.
+    AUTO_RESET_COOLDOWN = 5.0
+
+    def _handle_faults(self):
+        """Show what killed the simulation, put it back on its feet, once.
+
+        The two failures look the same from here and are handled the same way: a
+        chunk that made LAMMPS raise (`step` latches it), and a rebuild that this
+        build would not accept (`reset` falls back and reports what it had to put
+        back). Both arrive as a `Fault`; both end with a running simulation and a
+        card on screen for three seconds.
+        """
+        fault = self.system.take_fault()
+        if fault is None:
+            return
+        now = perf_counter()
+        if fault.fatal:
+            # Nothing is running: only a rebuild brings it back.
+            if now - self._last_auto_reset > self.AUTO_RESET_COOLDOWN:
+                self._last_auto_reset = now
+                # Keep playing if it was playing. `_reset_simulation` pauses on
+                # purpose -- somebody pressed Reset and should see the fresh state
+                # before it moves -- but nobody pressed anything here, and a demo
+                # that silently stops until you find the Play button has still
+                # failed in front of an audience.
+                was_playing = self.sim_playing
+                self._reset_simulation()
+                self.sim_playing = was_playing
+                # A rebuild that had to fall back reports its own, better-informed
+                # fault -- it knows which parameter it put back.
+                fault = self.system.take_fault() or fault
+            else:
+                fault.summary += (" These settings destroy every fresh state -- "
+                                  "dial them back, then press R.")
+        # Whatever the rebuild settled on is now the truth; the sliders follow it
+        # rather than the other way round.
+        self._sync_sliders_to_system()
+        self.alert.show_fault(fault)
+
+    def _sync_sliders_to_system(self):
+        """Move the live-parameter sliders to the values the system actually holds.
+
+        The app pushes sliders into the system every frame, so this is the only way
+        a value the system chose for itself (a clamp, or a rebuild's fallback) can
+        survive more than one frame.
+        """
+        values = self.system.live_param_values()
+        for key, slider in zip(self.extra_slider_keys, self.extra_sliders):
+            if key in values:
+                slider.value = max(slider.vmin, min(slider.vmax, values[key]))
+
+    def _draw_overlays(self, renderer):
+        """Everything that goes over the sim view, in back-to-front order.
+
+        The alert is last so it is readable even while the connect panel's modal
+        wash is up -- a session that failed and a simulation that died are exactly
+        the pair of things that can happen at the same moment.
+        """
+        self.remote_panel.draw(renderer)
+        self.alert.draw(renderer)
 
     def _playback_action(self, name):
         """Apply a Play/Pause/Reset button (or its keyboard shortcut)."""
@@ -285,14 +447,54 @@ class App:
         finally:
             self._sim_idle()
             self.source.close()
+            # Before closing the system: this cancels the cluster job and closes the
+            # tunnel, and it is the whole reason the allocation is safe to start from
+            # a GUI. It is a no-op for a local playground.
+            self.remote_panel.release()
             self.system.close()
             pygame.quit()
 
+    def _sliders(self):
+        """Every slider that can be dragged, whatever system is loaded."""
+        return [self.temp_slider, self.damping_slider, *self.extra_sliders]
+
+    def _drop_lost_drags(self, event):
+        """End any drag the left button is demonstrably no longer holding.
+
+        Every drag here is opened by a MOUSEBUTTONDOWN and closed by the
+        matching MOUSEBUTTONUP, so a press whose release never arrives -- the
+        window not being frontmost when it happened, an event dropped while the
+        app was still starting up and not reading its queue -- leaves a widget
+        dragging for good. For the turntable that is not a cosmetic stuck
+        highlight: `_handle_orbit_mouse` eats MOUSEMOTION whenever it believes
+        it is orbiting, so one phantom camera drag silently swallows the motion
+        of every slider drag after it AND the release that should have ended
+        them -- the pointer stops working, permanently.
+
+        Two events prove no drag can still be open, and both carry the proof
+        themselves rather than asking SDL for global mouse state (which a
+        headless driver does not track): a motion with the left button up, and
+        a fresh left press, since one button cannot open a second drag.
+        """
+        released = ((event.type == pygame.MOUSEBUTTONDOWN and event.button == 1)
+                    or (event.type == pygame.MOUSEMOTION and not event.buttons[0]))
+        if not released:
+            return
+        self._orbit_dragging = False
+        for s in self._sliders():
+            s.dragging = False
+
     def _handle_events(self, dt):
         for event in pygame.event.get():
+            self._drop_lost_drags(event)
             if event.type == pygame.QUIT:
                 return False
-            elif event.type == pygame.KEYDOWN:
+            # The connect panel is modal while it is waiting for a login answer:
+            # that answer can be all digits, which are otherwise the playground
+            # shortcuts, so it takes the keystrokes before anything else sees them.
+            if self.remote_panel.handle_event(event):
+                continue
+            if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     # Escape leaves fullscreen (ours or a macOS-native space)
                     # first; only quits when already windowed.
@@ -310,6 +512,8 @@ class App:
                     self._reset_simulation()
                 elif event.key == pygame.K_c and self.orbit_cam is not None:
                     self.orbit_cam.toggle_auto()
+                elif event.key == pygame.K_n and self.remote_panel.active:
+                    self.remote_panel.toggle()
                 elif event.key == pygame.K_b:
                     self._toggle_puller_attached()
                 elif pygame.K_1 <= event.key <= pygame.K_9:
@@ -443,6 +647,10 @@ class App:
         t_frame_start = perf_counter()
         spec = self.system.spec
         ff_profile = spec.force_feedback
+        # Pick up whatever the remote session did since the last frame: a completed
+        # connection hands its link to the system here, and a link that died reopens
+        # the panel with the reason.
+        self.remote_panel.update()
 
         # ---- 1. collect the step launched at the end of the LAST frame -------
         # It has been running while this frame's predecessor was drawn, so this
@@ -450,6 +658,13 @@ class App:
         # have touched LAMMPS since it was launched -- see stepper.py.
         self.total_steps += self.stepper.wait()
         sim_seconds = self.stepper.wait_seconds
+
+        # ---- 1b. did the simulation die? -------------------------------------
+        # BEFORE the sliders are pushed, which is the whole reason it is here: a
+        # rebuild that had to put `zeta` back would be handed the value that killed
+        # it again, one line further down, by a slider still sitting where the user
+        # left it.
+        self._handle_faults()
 
         # ---- 2. push this frame's control inputs into the simulation ---------
         self.system.set_target_temp(self.temp_slider.value)
@@ -464,9 +679,8 @@ class App:
         # is orbiting the camera: in mouse mode the pointer position IS the
         # puller's deflection, so swinging the camera by hand would otherwise
         # fling the controlled particle across the box.
-        ui_capturing_mouse = (self.temp_slider.dragging or self.damping_slider.dragging
-                              or self._orbit_dragging
-                              or any(s.dragging for s in self.extra_sliders))
+        ui_capturing_mouse = (self._orbit_dragging
+                              or any(s.dragging for s in self._sliders()))
         # Device I/O is split into two debug fields, since on the joystick both are
         # blocking HID traffic that belongs in neither sim nor "other": "read" is
         # the stick poll here, "ff" is the force-feedback writes further down.
@@ -555,6 +769,10 @@ class App:
         # Playback systems (Play/Pause/Reset) step only while playing; every
         # interactive puller system always steps.
         should_step = self.sim_playing if spec.playback_controls else True
+        # Whether the run is going is pushed into the system, not just used here: a
+        # remote system has to tell its server, which would otherwise integrate into
+        # a socket nobody is reading. A local one does nothing with it.
+        self.system.set_playing(should_step)
         if should_step:
             self.stepper.start(self.system, self.steps_per_frame)
 
@@ -617,6 +835,12 @@ class App:
             debug_line=self._debug_line,
             playback_playing=(self.sim_playing if spec.playback_controls else None),
             puller_attached=self.system.puller_attached(),
+            # "the GPU is still yours, on that other playground" -- None unless a
+            # remote session is being held in the background.
+            remote_note=self.remote_panel.standby_note(),
+            # Drawn last, inside the renderer, so it lands on top of the 3D scene
+            # rather than under the composited frame.
+            overlay=self._draw_overlays,
         )
         if self.debug:
             render_seconds = perf_counter() - t_render_start
