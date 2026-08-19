@@ -313,6 +313,25 @@ def test_twisting_away_pushes_the_scene_away(sim_app):
     assert cam.dist > cam.dist0
 
 
+def test_shift_drag_pans_the_scene_and_the_camera_follows_the_target(sim_app):
+    """Panning moves what the turntable turns about, so an off-centre membrane can
+    be brought to the middle and then orbited."""
+    cam = sim_app.orbit_cam
+    before = cam.target.copy()
+    eye_before = cam.eye()
+    cam.pan(40, 0)
+    assert not (cam.target == before).all(), "the target moved across the view"
+    assert not (cam.eye() == eye_before).all(), "and the eye came with it"
+    # The scene follows the pointer: dragging right takes the camera the other way
+    # along its own horizontal axis.
+    import numpy as np
+    right = np.array([np.cos(cam.azimuth), np.sin(cam.azimuth), 0.0])
+    assert (cam.eye() - eye_before) @ right < 0
+    # A pan is a hand on the camera, like a drag: the automatic turn stops.
+    assert not cam.auto
+    cam.target = before
+
+
 def test_the_camera_stops_moving_once_a_slider_has_the_focus(sim_app):
     cam = sim_app.orbit_cam
     _flick(sim_app, 1)                       # -> Temperature

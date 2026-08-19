@@ -45,12 +45,14 @@ class Camera3D:
         self.right = _normalize(np.cross(self.forward, self.up_hint))
         self.true_up = np.cross(self.right, self.forward)
 
-    def move_to(self, eye):
-        """Put the camera somewhere else, still looking at the same target --
-        what the orbit controller calls every frame. The focal length is left
-        alone: an orbit dollies by moving the eye, and re-fitting the zoom as it
-        went would make the scene breathe as the camera swung."""
+    def move_to(self, eye, target=None):
+        """Put the camera somewhere else -- and, optionally, aim it somewhere else
+        too, which is what a pan does (see OrbitController.pan). The focal length
+        is left alone: an orbit dollies by moving the eye, and re-fitting the zoom
+        as it went would make the scene breathe as the camera swung."""
         self.eye = np.asarray(eye, dtype=float)
+        if target is not None:
+            self.target = np.asarray(target, dtype=float)
         self._rebuild_basis()
 
     def fit_to_points(self, pts, fill_w=0.92, fill_h=0.92):
@@ -203,6 +205,29 @@ class OrbitController:
         if rate == 0.0:
             return
         self.zoom(-rate * dt)
+
+    def pan(self, dx, dy):
+        """Shift-drag: slide the scene sideways instead of turning it.
+
+        Moves the TARGET across the view plane (the eye follows it, since `eye()`
+        is derived from the target), which is what makes this compose with the
+        orbit and the dolly rather than fighting them: after a pan the turntable
+        still turns about whatever you have brought to the middle. That is the
+        whole point -- one membrane in a 37-sigma cell of them is off-centre by
+        definition, and until now the only way to look at it was to zoom out.
+
+        Same "globe under your finger" convention as drag(): the scene follows the
+        pointer, so dragging right slides the scene right (the camera goes left).
+        """
+        s = self.spec
+        # World-space screen axes at the current angles: `right` is horizontal in
+        # the world's xy-plane (z is up), and screen-up is what is left after the
+        # view direction is taken out of world up.
+        right = np.array([np.cos(self.azimuth), np.sin(self.azimuth), 0.0])
+        forward = _normalize(self.target - self.eye())
+        up = np.cross(right, forward)
+        step = s.pan_sensitivity * self.dist
+        self.target = self.target + (up * dy - right * dx) * step
 
     def zoom(self, notches):
         """Wheel dolly. MULTIPLICATIVE, so one notch is the same PROPORTIONAL

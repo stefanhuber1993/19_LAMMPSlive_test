@@ -57,7 +57,8 @@ KEY_HINTS = (
     "Up/Down or wheel: temperature   F11/green button: fullscreen   Esc: exit fullscreen / quit"
 )
 # Appended for systems with a turntable camera (SystemSpec.camera_orbit).
-ORBIT_KEY_HINTS = "   drag: orbit camera   wheel: zoom   C: auto-orbit"
+ORBIT_KEY_HINTS = ("   drag: orbit camera   shift-drag: pan   wheel: zoom   "
+                   "C: auto-orbit")
 # Shown instead of nothing in --input joystick mode: the stick's own bindings,
 # which have no keyboard equivalent to read off the line above. The hat is the
 # only one that needs explaining -- it moves what the stick drives (the cyan

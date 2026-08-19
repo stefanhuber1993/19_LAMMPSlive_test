@@ -247,7 +247,7 @@ class App:
                 self.orbit_cam = OrbitController(cam["eye"], cam["target"],
                                                  spec.camera_orbit)
             if self.orbit_cam is not None:
-                self.camera3d.move_to(self.orbit_cam.eye())
+                self.camera3d.move_to(self.orbit_cam.eye(), self.orbit_cam.target)
         else:
             self.camera3d = None
             self.orbit_cam = None
@@ -774,7 +774,12 @@ class App:
         wandered left over the scene is still a slider drag, and grabbing the
         camera out from under it would be a surprise. The Play/Pause/Reset
         buttons are drawn INSIDE the sim view, so they are excluded too -- a
-        click on Play is a click on Play, not a camera grab."""
+        click on Play is a click on Play, not a camera grab.
+
+        Holding SHIFT pans instead of orbiting -- it slides the scene across the
+        view, so an off-centre membrane can be brought to the middle and then
+        orbited about. The modifier is read per motion event rather than latched at
+        the press, so shift can be taken and released mid-drag."""
         if self.orbit_cam is None:
             return False
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -786,7 +791,10 @@ class App:
                 self._orbit_dragging = False
                 return True
         elif event.type == pygame.MOUSEMOTION and self._orbit_dragging:
-            self.orbit_cam.drag(*event.rel)
+            if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                self.orbit_cam.pan(*event.rel)
+            else:
+                self.orbit_cam.drag(*event.rel)
             return True
         return False
 
@@ -795,7 +803,8 @@ class App:
         if self.orbit_cam is None or self.camera3d is None:
             return
         self.orbit_cam.update(dt)
-        self.camera3d.move_to(self.orbit_cam.eye())
+        # Both, because a pan moves what the camera LOOKS AT, not just where it is.
+        self.camera3d.move_to(self.orbit_cam.eye(), self.orbit_cam.target)
 
     def _tick(self, dt):
         t_frame_start = perf_counter()

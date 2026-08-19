@@ -259,3 +259,7 @@ class CameraOrbit:
     stick_speed: float = 2.0        # rad/s at the stop (~115 deg/s, a turn in 3 s)
     stick_zoom_slow_speed: float = 0.8   # wheel notches/s on the plateau
     stick_zoom_speed: float = 6.0        # wheel notches/s at full twist
+    # Shift-drag panning: world units moved per pixel, per unit of camera
+    # distance. Scaled by the distance so a pan covers the same fraction of the
+    # picture whether you are dollied in on one membrane or out at the whole cell.
+    pan_sensitivity: float = 0.0015
