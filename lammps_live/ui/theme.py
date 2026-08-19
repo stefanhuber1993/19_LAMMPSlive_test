@@ -16,6 +16,12 @@ SLIDER_TRACK = (70, 70, 80)
 SLIDER_HANDLE = (230, 230, 235)
 SLIDER_HANDLE_ACTIVE = (255, 210, 90)
 MELT_MARK_COLOR = (255, 110, 90)
+# What the joystick is currently driving (see control_focus.py): a bright cyan
+# frame around the sim viewport, or around the focused slider's row. Cyan because
+# nothing else in the panel is -- the point of the marker is that it is findable
+# from across a room, mid-demo, without reading anything.
+FOCUS_COLOR = (60, 230, 255)
+FOCUS_WIDTH = 3
 # Marker for a slider's recommended "optimum" value (the paper's sweet spot),
 # drawn as a distinct tick + "opt" label so it reads differently from the red
 # melt marker on the temperature slider.

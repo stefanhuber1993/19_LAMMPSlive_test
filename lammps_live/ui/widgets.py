@@ -6,8 +6,8 @@ import pygame
 from .scale import UI
 from .theme import (
     BUTTON_ACTIVE_BG, BUTTON_ACTIVE_TEXT, BUTTON_BG, BUTTON_BORDER, BUTTON_TEXT,
-    MELT_MARK_COLOR, OPTIMUM_MARK_COLOR, SLIDER_HANDLE, SLIDER_HANDLE_ACTIVE,
-    SLIDER_TRACK, TEXT_COLOR,
+    FOCUS_COLOR, FOCUS_WIDTH, MELT_MARK_COLOR, OPTIMUM_MARK_COLOR, SLIDER_HANDLE,
+    SLIDER_HANDLE_ACTIVE, SLIDER_TRACK, TEXT_COLOR,
 )
 
 
@@ -105,7 +105,22 @@ class Slider:
     def _mark_x(self, value):
         return self.rect.x + (value - self.vmin) / (self.vmax - self.vmin) * self.rect.width
 
-    def draw(self, screen, font, mark_value=None, mark_label=None):
+    def focus_rect(self):
+        """The whole row this slider occupies -- label above, track, and the tick
+        captions below -- as one rectangle, for the joystick-focus frame. Derived
+        from the track rect rather than stored, since draw_panel re-lays the track
+        out every frame and the frame has to follow it."""
+        return pygame.Rect(self.rect.x - UI(6), self.rect.y - UI(22),
+                           self.rect.width + UI(12), UI(42))
+
+    def draw(self, screen, font, mark_value=None, mark_label=None, focused=False):
+        # `focused` = the joystick is driving THIS slider (see control_focus.py).
+        # Framed in the same cyan as the viewport frame, and the handle takes the
+        # colour too: at a glance across a room the frame says which row, the
+        # handle says where in it the value sits.
+        if focused:
+            pygame.draw.rect(screen, FOCUS_COLOR, self.focus_rect(),
+                             width=UI.w(FOCUS_WIDTH), border_radius=UI(6))
         pygame.draw.line(screen, SLIDER_TRACK, (self.rect.x, self.rect.centery),
                           (self.rect.right, self.rect.centery), UI.w(4))
         # Recommended-value ("optimum") marker: a distinct-colored tick with an
@@ -124,7 +139,12 @@ class Slider:
                 lbl = font.render(mark_label, True, MELT_MARK_COLOR)
                 screen.blit(lbl, (mx - lbl.get_width() / 2, self.rect.bottom + UI(4)))
         hx, hy = self._handle_pos()
-        color = SLIDER_HANDLE_ACTIVE if self.dragging else SLIDER_HANDLE
+        if self.dragging:
+            color = SLIDER_HANDLE_ACTIVE
+        elif focused:
+            color = FOCUS_COLOR
+        else:
+            color = SLIDER_HANDLE
         pygame.draw.circle(screen, color, (int(hx), int(hy)), UI(8))
         text = font.render(f"{self.label}: {self.fmt.format(self.value)}{self.unit}", True, TEXT_COLOR)
         screen.blit(text, (self.rect.x, self.rect.y - UI(18)))

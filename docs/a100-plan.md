@@ -36,7 +36,12 @@ original reasoning, which held up:
   `frame_state` arrays.
 - Control channel back: the sliders already produce plain LAMMPS command *strings*
   (`ForceField.live_commands`, `set_target_temp`) -- send the text.
-- Sim mode only. Do not attempt the joystick/haptic loop over the network.
+- Sim mode only. Do not attempt the joystick/haptic *loop* over the network.
+  The stick still drives the remote demo -- camera, Play/Pause/Reset, every
+  slider (see the joystick section of the README) -- because none of that is a
+  haptic loop: it is local UI on one side and the same command strings on the
+  other. What stays local is force feedback, which needs the contact force back
+  within a frame.
 
 ## 3. The Python analysis is the real wall
 

@@ -13,6 +13,8 @@ as spikes standing up out of the sheet.
 """
 import numpy as np
 
+from ..control_focus import band_rate
+
 
 def _normalize(v):
     n = np.linalg.norm(v)
@@ -158,6 +160,49 @@ class OrbitController:
         limit = np.radians(self.spec.elev_limit_deg)
         self.azimuth -= dx * s
         self.elev = float(np.clip(self.elev + dy * s, -limit, limit))
+
+    def _stick_rate(self, x, slow, fast):
+        """One stick axis -> a rate, through the shared deadzone / slow plateau /
+        smooth ramp response (control_focus.band_rate). The camera and the sliders
+        deliberately use the same curve, in their own units."""
+        s = self.spec
+        return band_rate(x, s.stick_deadzone, s.stick_slow_end, slow, fast)
+
+    def steer(self, x, y, dt):
+        """Fly the camera from a held stick, in deflections (-1..1) per axis.
+
+        Same three numbers the drag and the auto-orbit write, so this composes
+        with both -- and, like a drag, taking the stick stops the automatic turn
+        (a camera that is both flown and turning is unusable, and C hands it
+        back). The convention is the PILOT's, not the drag's "globe under your
+        finger": push right and you travel right around the box, push forward and
+        you climb over the top of it. That is the mapping a stick in the hand
+        reads as movement, and it is why this is not just drag() with the pixels
+        swapped for a rate.
+        """
+        s = self.spec
+        rate_x = self._stick_rate(x, s.stick_slow_speed, s.stick_speed)
+        rate_y = self._stick_rate(y, s.stick_slow_speed, s.stick_speed)
+        if rate_x == 0.0 and rate_y == 0.0:
+            return
+        self.auto = False
+        limit = np.radians(s.elev_limit_deg)
+        self.azimuth += rate_x * dt
+        self.elev = float(np.clip(self.elev + rate_y * dt, -limit, limit))
+
+    def steer_zoom(self, twist, dt):
+        """Dolly from a held twist axis, in wheel notches per second, through the
+        same banded response as the other two axes.
+
+        NEGATED against `zoom`'s notches: twisting the grip away from you has to
+        push the scene away. The other sign was tried first and reads as inverted
+        -- the hand expects the twist to move the SCENE, not to reel the camera in.
+        """
+        s = self.spec
+        rate = self._stick_rate(twist, s.stick_zoom_slow_speed, s.stick_zoom_speed)
+        if rate == 0.0:
+            return
+        self.zoom(-rate * dt)
 
     def zoom(self, notches):
         """Wheel dolly. MULTIPLICATIVE, so one notch is the same PROPORTIONAL

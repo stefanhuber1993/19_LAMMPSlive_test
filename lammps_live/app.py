@@ -1,8 +1,14 @@
 """Main control loop: owns the active system, the input source, the
 renderer, and the force-feedback shaping that connects them. Switching
-systems at runtime (number keys / Tab) tears down the old LAMMPS instance
-and rebuilds the UI state (renderer scale, sliders, history, smoothers) for
-the new one, in place.
+systems at runtime (number keys / Tab / joystick buttons 3-4) tears down the old
+LAMMPS instance and rebuilds the UI state (renderer scale, sliders, history,
+smoothers) for the new one, in place.
+
+The joystick reaches all of that without the keyboard or the pointer: one focus
+at a time -- the viewport or one slider -- moved with the hat switch, which is
+what decides whether the stick is flying the camera, holding a bead, or setting a
+value. See control_focus.py for the model, and _route_stick / _poll_device_buttons
+below for the mapping.
 """
 import math
 import os
@@ -12,6 +18,7 @@ from time import perf_counter
 import pygame
 
 from . import config, units
+from .control_focus import Choice, ControlFocus
 from .forcefeedback import (
     ExponentialSmoother2D, shape_damper_coefficient, shape_interaction_force,
     shape_stiffness, shape_velocity_damping,
@@ -123,9 +130,29 @@ class App:
         # system, kept across window resizes -- see _setup_viewport.
         self.orbit_cam = None
         self._orbit_dragging = False
-        # Previous frame's state of the joystick's grab/release button, for edge
-        # detection (see _poll_attach_button).
-        self._attach_button_down = False
+        # What the joystick is currently driving -- the viewport (camera / puller)
+        # or one slider -- rebuilt per system in _build_system. See
+        # control_focus.py; the hat switch is what moves it.
+        self.focus = ControlFocus()
+        # The bead colouring, as a focus stop: the same state the mouse toggle
+        # flips (renderer.bead_color_energy), reachable from the hat cycle. Its
+        # options are pictures rather than points on a scale, so it steps once per
+        # push instead of walking -- see control_focus.Choice.
+        self.color_choice = Choice(
+            "bead colour", ("director", "energy"),
+            on_change=lambda i: setattr(self.renderer, "bead_color_energy", bool(i)))
+        # Whether the puller was released BY moving the focus off the viewport, so
+        # coming back re-grabs it -- and a bead the user let go of with the trigger
+        # is left alone (see _cycle_focus).
+        self._focus_released_puller = False
+        # What the stick drove on the last frame -- "puller", "camera" or "slider"
+        # (see _route_stick). The force-feedback shaping reads it: only a stick that
+        # is actually holding a bead gets the contact force rendered onto it.
+        self._stick_target = "puller"
+        # Previous frame's joystick buttons and hat direction, for edge detection
+        # (see _poll_device_buttons).
+        self._prev_buttons = frozenset()
+        self._prev_hat = (0, 0)
 
         # The connect panel for a playground whose simulation runs elsewhere. It
         # owns the SSH/Slurm session, so it is created once and lives as long as the
@@ -312,6 +339,22 @@ class App:
         self.extra_sliders = [Slider.from_spec((0, 0, 100, 4), ss)
                               for ss in spec.extra_sliders]
         self.extra_slider_keys = [ss.key for ss in spec.extra_sliders]
+
+        # What the joystick can drive here, and where its cycle starts: the
+        # viewport, then every EVERYDAY slider in panel order, then the bead
+        # colouring. The advanced group is deliberately left out -- see
+        # control_focus.py. On the MesoMem playgrounds this is viewport,
+        # Temperature, k_tilt, k_splay, zeta, bead colour. The colouring is only a
+        # stop on the scenes that have one (the 2D crystals colour by species,
+        # which is not a choice), and it follows whatever the toggle is set to
+        # rather than resetting it -- the colouring is the viewer's preference, not
+        # the playground's.
+        choices = ()
+        if spec.render_3d:
+            self.color_choice.index = int(self.renderer.bead_color_energy)
+            choices = (self.color_choice,)
+        self.focus.set_stops([s for s in self._sliders() if not s.advanced], choices)
+        self._focus_released_puller = False
 
         if self.history is None:
             self.history = RollingHistory(config.HISTORY_WINDOW_SECONDS, ["temp", "press", "ke", "pe", "etotal"])
@@ -547,7 +590,10 @@ class App:
                         self._playback_action(name)
                         continue
                     if self.renderer.bead_color_hit(event.pos):
-                        self.renderer.bead_color_energy = not self.renderer.bead_color_energy
+                        # Through the Choice, so clicking and pushing the stick are
+                        # two ways of moving one state -- otherwise the next stick
+                        # push would step from whatever the click left behind.
+                        self.color_choice.step(1)
                         continue
                 # A click on the "Advanced" header flips the group open/closed.
                 # When collapsing, cancel any in-progress drag on a now-hidden
@@ -574,6 +620,11 @@ class App:
                         continue
                     s.handle_event(event)
 
+        # The joystick's buttons and hat are polled here, with the keyboard
+        # shortcuts they mirror, rather than in _tick: switching playground
+        # rebuilds the system, and _tick reads the spec it is drawing at the top
+        # of the frame.
+        self._poll_device_buttons()
         self._sync_orbit_camera(dt)
         keys = pygame.key.get_pressed()
         temp_range = self.temp_slider.vmax - self.temp_slider.vmin
@@ -594,16 +645,119 @@ class App:
         self.ff_smoother.reset()
         self.interaction_smoother.reset()
 
-    def _poll_attach_button(self):
-        """Edge-detect the joystick's grab/release button. Held is not pressed:
-        without this the puller would flip state every frame the trigger is
-        down."""
-        buttons = self.source.poll_buttons()
-        pressed = config.JOYSTICK_ATTACH_BUTTON in buttons
-        fired = pressed and not self._attach_button_down
-        self._attach_button_down = pressed
-        if fired:
+    def _cycle_focus(self, step):
+        """Move the joystick's focus one place along [viewport, *sliders].
+
+        Leaving the viewport RELEASES the puller, and coming back re-grabs it.
+        That is not a convenience: the stick cannot hold a bead against a membrane
+        and set a number at the same time, and a bead left attached while the
+        stick drives a slider would be dragged across the box by every value
+        change. It is exactly the state the trigger toggles, so what the hand
+        feels when the focus leaves the scene is what it feels when the bead is
+        let go -- the force feedback goes limp because the released puller reports
+        no interaction force at all (see modes.py).
+
+        Only a puller THIS released is re-grabbed, so a bead the user let go of
+        with the trigger stays let go.
+        """
+        was_viewport = self.focus.on_viewport
+        self.focus.cycle(step)
+        if self.focus.on_viewport == was_viewport:
+            return
+        if not self.focus.on_viewport:
+            if self.system.puller_attached():
+                self._toggle_puller_attached()
+                self._focus_released_puller = True
+        elif self._focus_released_puller:
             self._toggle_puller_attached()
+            self._focus_released_puller = False
+
+    def _poll_device_buttons(self):
+        """Edge-detect the joystick's buttons and hat, and act on them.
+
+        Held is not pressed: without the edge detection the trigger would flip
+        play/pause every frame it is down, and one flick of the hat would sweep
+        the whole focus cycle.
+
+        Every action here has a keyboard twin (Space, R, B, Tab, the number keys),
+        which is what keeps the two input modes honest -- the joystick reaches the
+        same set of things, and this method is where the mapping is written down:
+
+            hat left / right   move the focus back / forward (see _cycle_focus)
+            1 (trigger)        Play/Pause where there is no puller, else grab it
+            2                  Reset the run to a fresh state
+            3 / 4              previous / next playground
+
+        Nothing fires while the remote connect panel is up: it is modal and
+        waiting for a login code, and a stray button that switched playground
+        mid-login would cancel the allocation it is in the middle of asking for.
+        The device state is still recorded, so a button held through the panel
+        does not fire the moment the panel closes.
+        """
+        buttons = self.source.poll_buttons()
+        hat = self.source.poll_hat()
+        fired = buttons - self._prev_buttons
+        hat_moved = hat != self._prev_hat
+        self._prev_buttons = buttons
+        self._prev_hat = hat
+        if self.remote_panel.visible:
+            return
+
+        if hat_moved and hat[0]:
+            self._cycle_focus(hat[0])          # dx: -1 = left = back, +1 = forward
+        if self.system.spec.playback_controls:
+            # A playback playground has no puller, so the trigger is the run
+            # switch -- the one thing the scene does.
+            if config.JOYSTICK_PLAY_PAUSE_BUTTON in fired:
+                self.sim_playing = not self.sim_playing
+            if config.JOYSTICK_RESET_BUTTON in fired:
+                self._reset_simulation()
+        elif config.JOYSTICK_ATTACH_BUTTON in fired:
+            self._toggle_puller_attached()
+        # Last, and it returns: switching playground rebuilds the system out from
+        # under everything above (and under the caller's `spec`).
+        if config.JOYSTICK_PREV_PLAYGROUND_BUTTON in fired:
+            self._cycle_system(-1)
+        elif config.JOYSTICK_NEXT_PLAYGROUND_BUTTON in fired:
+            self._cycle_system(1)
+
+    def _route_stick(self, jx, jy, yaw, dt):
+        """Send this frame's stick deflection where the focus points it, and hand
+        back what is left for the puller.
+
+        There are three things the stick can drive and the focus picks exactly
+        one, so the other two must read a real zero rather than last frame's
+        value:
+
+          * a focused slider -- left/right walks its value, with the deadzone and
+            the two speed bands from control_focus.py;
+          * the turntable camera, on a playground with nothing to pull: the stick
+            flies around the box and the twist axis dollies in and out;
+          * the puller, which is what a game-mode playground has always done with
+            the stick, unchanged.
+
+        Joystick only. The mouse's "deflection" is a pointer position and the
+        keyboard's is WASD; neither has a hat to move the focus with, and the
+        camera stays theirs to drag.
+        """
+        if self.input_mode != "joystick":
+            self._stick_target = "puller"
+            return jx, jy, yaw
+        if not self.focus.on_viewport:
+            self._stick_target = "slider"
+            self.focus.drive(jx, dt)
+            return 0.0, 0.0, 0.0
+        # A turntable on a playback playground: nothing to pull, so the scene is
+        # what the stick moves. A game-mode playground that also has a turntable
+        # keeps the puller on the stick and leaves the camera to the mouse -- the
+        # bead is the point there, and it is the only control with force feedback.
+        if self.orbit_cam is not None and self.system.spec.playback_controls:
+            self._stick_target = "camera"
+            self.orbit_cam.steer(jx, jy, dt)
+            self.orbit_cam.steer_zoom(yaw, dt)
+            return 0.0, 0.0, 0.0
+        self._stick_target = "puller"
+        return jx, jy, yaw
 
     # ---- turntable camera ---------------------------------------------------
 
@@ -693,8 +847,10 @@ class App:
         else:
             jx, jy = self.source.poll()
             yaw = self.source.poll_yaw()
-        self._poll_attach_button()
         read_seconds += perf_counter() - t_in
+        # Whatever holds the joystick's focus takes the stick first; jx/jy/yaw
+        # come back zeroed if the camera or a slider took it.
+        jx, jy, yaw = self._route_stick(jx, jy, yaw, dt)
         # A released puller is driven by nothing, so the input force IS zero --
         # here, not just inside the mode. Everything downstream reads this: the
         # green input arrow, the header readout, and the joystick's cancellation
@@ -793,10 +949,25 @@ class App:
         )
         stiffness = shape_stiffness(smooth_ifx, smooth_ify, ff_profile, SPRING_STIFFNESS_MAX)
         t_in = perf_counter()
-        self.source.send_force(smooth_fx, smooth_fy, stiffness)
-        self.source.set_damper_coefficient(
-            shape_damper_coefficient(smooth_ifx, smooth_ify, ff_profile, DAMPER_COEFFICIENT_MAX)
-        )
+        if self._stick_target == "puller":
+            self.source.send_force(smooth_fx, smooth_fy, stiffness)
+            self.source.set_damper_coefficient(
+                shape_damper_coefficient(smooth_ifx, smooth_ify, ff_profile,
+                                         DAMPER_COEFFICIENT_MAX)
+            )
+        else:
+            # Flying the camera or setting a value: a strong, plain centring spring
+            # instead of a contact force. Both of those are RATE controls read off
+            # the stick's own position, so the deadzone only means "stop" if the
+            # stick returns to true centre by itself -- and there is nothing being
+            # held, so there is no interaction force to render anyway. The
+            # smoothers are dropped rather than left to decay the last frames of
+            # contact onto a hand that is no longer holding anything.
+            self.source.send_force(0.0, 0.0, SPRING_STIFFNESS_MAX)
+            self.source.set_damper_coefficient(
+                config.JOYSTICK_CENTERING_DAMPER_FRACTION * DAMPER_COEFFICIENT_MAX)
+            self.ff_smoother.reset()
+            self.interaction_smoother.reset()
         ff_seconds += perf_counter() - t_in
 
         if self.energy_baseline is None:
@@ -835,6 +1006,9 @@ class App:
             debug_line=self._debug_line,
             playback_playing=(self.sim_playing if spec.playback_controls else None),
             puller_attached=self.system.puller_attached(),
+            # The cyan frame and the panel's "joystick drives:" line. None on the
+            # mouse and keyboard, which have no focus to show.
+            control_focus=self.focus if self.input_mode == "joystick" else None,
             # "the GPU is still yours, on that other playground" -- None unless a
             # remote session is being held in the background.
             remote_note=self.remote_panel.standby_note(),

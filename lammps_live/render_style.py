@@ -245,3 +245,17 @@ class CameraOrbit:
     # Stop short of straight overhead: the view basis is built with a cross
     # product against world up, which collapses when you look exactly along it.
     elev_limit_deg: float = 84.0
+    # Joystick flying (the viewport-focus stick, see control_focus.py). Rates,
+    # not offsets: the camera keeps moving for as long as the stick is held. The
+    # response is the same shape as a slider's -- deadzone, a wide slow plateau,
+    # then a smooth ramp to full speed over the last of the travel (see
+    # control_focus.band_rate) -- so one hand learns one behaviour and the same
+    # push means "creep" whether it is aimed at the camera or at k_tilt. The slow
+    # plateau is what a demo actually spends its time in: a nudge that eases the
+    # view round a few degrees to show the other side of a membrane.
+    stick_deadzone: float = 0.20
+    stick_slow_end: float = 0.75
+    stick_slow_speed: float = 0.25  # rad/s on the plateau (~14 deg/s)
+    stick_speed: float = 2.0        # rad/s at the stop (~115 deg/s, a turn in 3 s)
+    stick_zoom_slow_speed: float = 0.8   # wheel notches/s on the plateau
+    stick_zoom_speed: float = 6.0        # wheel notches/s at full twist

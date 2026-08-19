@@ -15,10 +15,18 @@ class InputSource:
 
     def poll_buttons(self):
         """Return the set of device buttons currently held, as ints. Used for
-        edge-triggered actions (grab / release the puller). Default: none -- a
-        device with no buttons simply never fires them, and the keyboard binding
-        for the same action still works."""
+        edge-triggered actions (grab / release the puller, Play/Pause, Reset,
+        switching playground). Default: none -- a device with no buttons simply
+        never fires them, and the keyboard binding for the same action still
+        works."""
         return frozenset()
+
+    def poll_hat(self):
+        """Return the 8-direction hat switch as (dx, dy), each in {-1, 0, 1},
+        (0, 0) when centred; dy = +1 is forward, away from the hand. Used
+        edge-triggered, to walk the control focus along its cycle (see
+        control_focus.py). Default: no hat, so it never moves."""
+        return (0, 0)
 
     def send_force(self, fx, fy, stiffness=None):
         """Feed back a force (sim units) the device should resist with, and

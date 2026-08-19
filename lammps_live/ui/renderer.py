@@ -22,6 +22,7 @@ from .theme import (
     BOX_EDGE_FADE_DEPTH, BOX_EDGE_SUBDIVISIONS,
     BOX_OUTLINE, CRYSTAL_COLOR,
     CRYSTAL_RADIUS, DIM_TEXT_COLOR, DIRECTOR_ARROW_COLOR, EDGE_VIGNETTE_STRENGTH,
+    FOCUS_COLOR, FOCUS_WIDTH,
     HAZE_COLOR, HAZE_STRENGTH, HBOND_COLOR, HBOND_DASH,
     HBOND_WIDTH, HEADER_TEXT_COLOR, HUD_BG, HUD_TEXT_COLOR, INPUT_VEC_COLOR,
     ION_LABEL_COLOR, MELT_MARK_COLOR, MEMBRANE_BEAD_COLOR, NET_COLOR,
@@ -57,6 +58,15 @@ KEY_HINTS = (
 )
 # Appended for systems with a turntable camera (SystemSpec.camera_orbit).
 ORBIT_KEY_HINTS = "   drag: orbit camera   wheel: zoom   C: auto-orbit"
+# Shown instead of nothing in --input joystick mode: the stick's own bindings,
+# which have no keyboard equivalent to read off the line above. The hat is the
+# only one that needs explaining -- it moves what the stick drives (the cyan
+# frame), and everything else follows from that.
+JOYSTICK_HINTS = (
+    "hat L/R: pick control (cyan frame)   stick: drive it (a colour steps per "
+    "push)   twist: zoom   "
+    "1: play/pause or grab   2: reset   3/4: playground"
+)
 
 
 def _wrap_items(items, font, width, separator="  "):
@@ -1846,6 +1856,16 @@ class Renderer:
         self._draw_hud(hud_lines)
         self._draw_debug_line(debug_line)
 
+    def draw_focus_frame(self):
+        """The bright cyan rectangle that says the joystick is flying the camera
+        rather than setting a value (see control_focus.py). Inset by its own width
+        so the whole line is inside the viewport at every UI scale, and never over
+        the panel."""
+        pad = UI.w(FOCUS_WIDTH)
+        rect = pygame.Rect(pad // 2, pad // 2,
+                           self.sim_width - pad, self.window_size[1] - pad)
+        pygame.draw.rect(self.screen, FOCUS_COLOR, rect, width=pad)
+
     def draw_playback_controls(self, playing):
         """Play / Pause / Reset buttons centered along the bottom of the sim view
         (playback systems only). The button matching the current run state is
@@ -1872,10 +1892,14 @@ class Renderer:
                 return btn.name
         return None
 
-    def _draw_bead_color_toggle(self, x, y, w, spec):
+    def _draw_bead_color_toggle(self, x, y, w, spec, focused=False):
         """The bead-colouring toggle plus a line saying what the colours mean.
         Returns the y to carry on from. Only for the 3D bead scenes -- the 2D
-        crystals colour by species, which is not a choice."""
+        crystals colour by species, which is not a choice.
+
+        `focused` frames it in the joystick's cyan, the same marker the sliders and
+        the viewport get, so "what is the stick driving" is one thing to look for
+        wherever the answer happens to live."""
         self._bead_color_visible = False
         if not spec.render_3d:
             return y
@@ -1884,6 +1908,10 @@ class Renderer:
         self.bead_color_button.rect = pygame.Rect(x, y, UI(210), UI(26))
         self.bead_color_button.label = ("bead colour: ENERGY" if energy
                                         else "bead colour: DIRECTOR")
+        if focused:
+            pygame.draw.rect(self.screen, FOCUS_COLOR,
+                             self.bead_color_button.rect.inflate(UI(8), UI(8)),
+                             width=UI.w(FOCUS_WIDTH), border_radius=UI(8))
         self.bead_color_button.draw(self.screen, self.font, active=energy)
         # What the colours mean, on its own line under the button: a colour scale
         # nobody can read is decoration.
@@ -1904,7 +1932,8 @@ class Renderer:
         return self._bead_color_visible and self.bead_color_button.hit(pos)
 
     def draw_panel(self, systems, current_key, sliders, thermo_now, puller_energy,
-                    history, rdf, spec, puller_speed_m_s=None, remote_note=None):
+                    history, rdf, spec, puller_speed_m_s=None, control_focus=None,
+                    remote_note=None):
         pygame.draw.rect(self.screen, PANEL_BG, self.panel_rect)
         pygame.draw.line(self.screen, PANEL_DIVIDER, (self.panel_rect.x, 0),
                           (self.panel_rect.x, self.window_size[1]), UI.w(1))
@@ -1937,7 +1966,8 @@ class Renderer:
 
         # The turntable keys are only listed for the systems that have one --
         # a hint for a key that does nothing is worse than no hint.
-        hints = KEY_HINTS + (ORBIT_KEY_HINTS if spec.camera_orbit else "")
+        hints = (KEY_HINTS + (ORBIT_KEY_HINTS if spec.camera_orbit else "")
+                 + ("   " + JOYSTICK_HINTS if control_focus is not None else ""))
         # Wrapped rather than one line: the hints are wider than the panel, so a
         # single surface loses its tail (the temperature and fullscreen keys) off
         # the right edge -- at every UI scale, since both grow together.
@@ -1956,7 +1986,20 @@ class Renderer:
                 y += UI(15)
             y += UI(3)
 
-        y = self._draw_bead_color_toggle(x, y, w, spec)
+        # In joystick mode, say in words what the cyan frame is around -- the
+        # frame is what you find across a room, this is what you read up close.
+        if control_focus is not None:
+            focus_surf = self.small_font.render(
+                f"joystick drives: {control_focus.label}", True, FOCUS_COLOR)
+            self.screen.blit(focus_surf, (x, y))
+            y += UI(17)
+
+        # The bead colouring is the only Choice in the cycle today, so "a choice
+        # holds the focus" and "the colouring holds the focus" are the same
+        # question. A second one would want the stop itself passed down here.
+        y = self._draw_bead_color_toggle(
+            x, y, w, spec,
+            focused=(control_focus is not None and control_focus.choice is not None))
 
         pygame.draw.line(self.screen, PANEL_DIVIDER, (x, y), (x + w, y), UI.w(1))
         y += UI(12)
@@ -1965,16 +2008,18 @@ class Renderer:
         # sliders[0], never advanced) carries the melt marker and is drawn first.
         # The rest split into "basic" (drawn in order right after temperature) and
         # "advanced" (hidden behind a collapsible toggle -- see self.show_advanced).
+        focused = control_focus.slider if control_focus is not None else None
         temp_slider = sliders[0]
         temp_slider.rect = pygame.Rect(x, y, w, UI(4))
-        temp_slider.draw(self.screen, self.font, mark_value=spec.melt_temp, mark_label="melt")
+        temp_slider.draw(self.screen, self.font, mark_value=spec.melt_temp,
+                          mark_label="melt", focused=temp_slider is focused)
         y += UI(46)
 
         basic = [s for s in sliders[1:] if not s.advanced]
         advanced = [s for s in sliders[1:] if s.advanced]
         for extra in basic:
             extra.rect = pygame.Rect(x, y, w, UI(4))
-            extra.draw(self.screen, self.font)
+            extra.draw(self.screen, self.font, focused=extra is focused)
             y += UI(34)
 
         if advanced:
@@ -2130,7 +2175,7 @@ class Renderer:
               atom_trails=None, species=None, bond_pairs=None, hbond_pairs=None,
               hud_lines=None, scene_3d=None, total_steps=0, steps_per_frame=1,
               debug_line=None, playback_playing=None, puller_attached=True,
-              overlay=None, remote_note=None):
+              overlay=None, control_focus=None, remote_note=None):
         # In GL mode the default framebuffer is cleared to BG first; the 3D scene
         # (if any) is drawn straight into its sim viewport, and every 2D surface
         # is composited over it at the end. In CPU mode self.screen IS the display
@@ -2164,7 +2209,13 @@ class Renderer:
                            puller_attached=puller_attached)
         self.draw_panel(systems, current_key, sliders, thermo_now, puller_energy,
                          history, rdf, spec, puller_speed_m_s,
-                         remote_note=remote_note)
+                         control_focus=control_focus, remote_note=remote_note)
+        # The scene is what the stick is driving: frame it. Drawn over the sim
+        # view (and so over the 3D scene, which in GL mode is already in the
+        # framebuffer) rather than around it, because the viewport runs to the
+        # window edge on three sides and an outside frame would have nowhere to go.
+        if control_focus is not None and control_focus.on_viewport:
+            self.draw_focus_frame()
         # Play / Pause / Reset controls for playback systems, over the sim view.
         self._playback_visible = False
         if spec.playback_controls and playback_playing is not None:

@@ -48,3 +48,20 @@ OVERLAP_SIM_AND_RENDER = True
 # Joystick button that grabs / releases the puller, the same action as the B key.
 # 1 is the trigger on the Sidewinder FF2.
 JOYSTICK_ATTACH_BUTTON = 1
+# The trigger's other job: on a playback playground (Play/Pause/Reset, i.e. sim
+# mode) there is no puller to grab, so the same button is the run switch. One
+# button, one meaning per playground -- "the main thing this scene does".
+JOYSTICK_PLAY_PAUSE_BUTTON = 1
+# Reset the run to a fresh state, the same action as the R key.
+JOYSTICK_RESET_BUTTON = 2
+# Switch playground, the same action as Tab (forward) and the number keys.
+JOYSTICK_PREV_PLAYGROUND_BUTTON = 3
+JOYSTICK_NEXT_PLAYGROUND_BUTTON = 4
+# What the stick feels while it is NOT holding a bead -- flying the camera or
+# setting a slider (see app._route_stick). The spring goes to full stiffness and
+# true centre, because both of those controls are rate controls read off the
+# stick's own position: "let go" has to mean exactly zero, and the hand should not
+# have to find the middle itself. This is the damper that goes with it, as a
+# fraction of the device maximum -- enough that the return to centre lands rather
+# than rings, without making the stick feel like it is in treacle.
+JOYSTICK_CENTERING_DAMPER_FRACTION = 0.35

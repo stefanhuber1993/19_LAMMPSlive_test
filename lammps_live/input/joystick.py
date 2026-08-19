@@ -103,6 +103,7 @@ class JoystickInput(InputSource):
         self._last_xy = (0.0, 0.0)
         self._last_yaw = 0.0
         self._last_buttons = frozenset()
+        self._last_hat = (0, 0)
         self._twist_center = None  # captured from the first reading (see _process_twist)
         # Last force-feedback conditions actually written to the device, so a
         # redundant re-write is skipped. Each set_condition is a blocking HID
@@ -163,10 +164,14 @@ class JoystickInput(InputSource):
         xy = (state.x, -state.y)             # device convention -> sim (+y up)
         yaw = self._process_twist(state.twist)
         buttons = frozenset(int(b) for b in state.pressed)
+        # The hat arrives already decoded to (dx, dy) with dy = +1 forward (the
+        # driver's own convention, which is pygame's); no remapping to do.
+        hat = tuple(int(v) for v in state.hat)
         with self._lock:
             self._last_xy = xy
             self._last_yaw = yaw
             self._last_buttons = buttons
+            self._last_hat = hat
 
     def _io_loop(self):
         """Daemon loop: sample the stick, then flush the latest requested force-
@@ -215,6 +220,14 @@ class JoystickInput(InputSource):
             self._read_once(timeout_ms=0)
         with self._lock:
             return self._last_buttons
+
+    def poll_hat(self):
+        # Held state, like poll_buttons: the caller edge-detects. Reads the last
+        # reported direction, which stays correct until the hat is moved again.
+        if self._worker is None:
+            self._read_once(timeout_ms=0)
+        with self._lock:
+            return self._last_hat
 
     def calibrate(self, n=200):
         """Print live decoded stick state -- a sanity check that the device is
