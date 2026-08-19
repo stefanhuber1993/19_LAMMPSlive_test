@@ -1,5 +1,11 @@
 """Temporal smoothing of the DRAWN particle state. Visuals only.
 
+Two channels, filtered over the same window: where each particle is (and which way
+its director points), and the per-bead ENERGY the colouring paints. The second is
+not an afterthought -- a bead's energy is a sum over neighbours that are themselves
+rattling, so it swings frame to frame even harder than the positions do, and
+smoothing only the coordinates trades a wiggle for a twinkle.
+
 WHAT IT IS FOR: at any temperature the bath keeps every bead rattling, and on a
 900-6000 bead scene that thermal jitter is most of what the eye sees -- the whole
 screen wiggles while the thing actually worth watching (patches nucleating,
@@ -54,6 +60,12 @@ class TrajectorySmoother:
     def __init__(self):
         self._pos = None
         self._dirs = None
+        # Per-particle SCALAR channels filtered alongside the coordinates, by name
+        # (see smooth_scalar). The energy colouring is the one that matters: it is
+        # drawn from the same thermal rattle the positions are, so smoothing where
+        # each bead IS while leaving how bright it is at full frame rate trades a
+        # wiggle for a twinkle.
+        self._scalars = {}
 
     def reset(self):
         """Forget the history. Next frame reseeds from the live coordinates, so
@@ -61,6 +73,41 @@ class TrajectorySmoother:
         from a stale ghost."""
         self._pos = None
         self._dirs = None
+        self._scalars = {}
+
+    @staticmethod
+    def _alpha(tau, dt):
+        """The per-frame weight of an exponential average with time constant `tau`
+        over a frame that advanced `dt` of simulated time. Shared, so a scalar
+        channel is filtered over exactly the same window as the coordinates."""
+        return min(1.0, max(1e-6, 1.0 - float(np.exp(-dt / tau))))
+
+    def smooth_scalar(self, name, values, tau, dt):
+        """Low-pass a per-particle scalar over the same window as the positions.
+
+        For the bead energies, which are a per-pair sum over neighbours that are
+        themselves rattling: the number swings frame to frame far more than the
+        configuration it is measuring, so an energy-coloured scene sparkles even
+        once the beads have been held still. Filtering it with the same tau puts
+        the colour on the same footing as the picture it is painting.
+
+        Straight exponential -- a scalar has no periodic image to fold and no
+        direction to renormalize. `values` is returned unchanged (and the channel
+        reseeded) when smoothing is off, the length changes, or the frame is not
+        finite, matching `apply`.
+        """
+        if values is None:
+            return None
+        values = np.asarray(values, dtype=float)
+        if tau <= 0.0 or dt <= 0.0 or not len(values) or not np.isfinite(values).all():
+            self._scalars.pop(name, None)
+            return values
+        previous = self._scalars.get(name)
+        if previous is None or len(previous) != len(values):
+            self._scalars[name] = values.copy()
+            return values
+        previous += self._alpha(tau, dt) * (values - previous)
+        return previous.copy()
 
     @property
     def active(self):
@@ -96,8 +143,7 @@ class TrajectorySmoother:
             self._dirs = None if dirs is None else dirs.copy()
             return state
 
-        alpha = 1.0 - float(np.exp(-dt / tau))
-        alpha = min(1.0, max(1e-6, alpha))
+        alpha = self._alpha(tau, dt)
         box = state.box
         delta = pos - self._pos
         if box is not None:

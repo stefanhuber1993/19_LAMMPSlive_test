@@ -155,6 +155,11 @@ class PlaygroundSystem(MDSystem3D):
         self._smoother = TrajectorySmoother()
         self._render_cache = None
         self._render_frame = -1
+        # Same once-per-frame caching for the smoothed bead energies (see
+        # _smooth_energies), kept separate because the colouring is read only while
+        # it is switched on.
+        self._energy_cache = None
+        self._energy_render_frame = -1
         self._last_step_dt = 0.0
         self.analysis_seconds = 0.0
         # Latched message once the simulation has been driven unstable, else None,
@@ -312,6 +317,8 @@ class PlaygroundSystem(MDSystem3D):
         self._smoother.reset()
         self._render_cache = None
         self._render_frame = -1
+        self._energy_cache = None
+        self._energy_render_frame = -1
         self._sim_time = 0.0
         # Populate the panels for the paused first frame (sim mode shows its fresh
         # state before Play is pressed, and would otherwise show empty bars).
@@ -807,7 +814,31 @@ class PlaygroundSystem(MDSystem3D):
         order = self._order()
         pe = np.array(self.lmp.numpy.extract_compute("pe_atom", 1, 1)[:self.natoms],
                       dtype=float)[order]
-        return 2.0 * pe if self.force_field.energy_terms_labels else pe
+        energies = 2.0 * pe if self.force_field.energy_terms_labels else pe
+        return self._smooth_energies(energies)
+
+    def _smooth_energies(self, energies):
+        """Put the colouring through the same low-pass as the drawn positions.
+
+        It is a DRAWN quantity, so it belongs on the drawn side of the line this
+        class draws everywhere else (see _render_state): the energy panels, the
+        observables and everything that measures keep reading the raw per-atom
+        compute. Without it, turning the smoothing up holds the beads still and
+        leaves them twinkling -- each one's energy is a sum over neighbours that are
+        still rattling, so the colour swings frame to frame far more than the
+        configuration it is painting.
+
+        Filtered once per frame however many readouts ask for it, like
+        _render_state, so the filter advances with the simulation rather than with
+        the number of callers.
+        """
+        if self._smoothing_tau <= 0.0:
+            return energies
+        if self._energy_render_frame != self._frame:
+            self._energy_cache = self._smoother.smooth_scalar(
+                "bead_energy", energies, self._smoothing_tau, self._last_step_dt)
+            self._energy_render_frame = self._frame
+        return self._energy_cache
 
     # ---- 3D rendering data --------------------------------------------------
 
