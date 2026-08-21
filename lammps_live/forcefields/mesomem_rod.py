@@ -337,6 +337,17 @@ class MesoMemRod(MesoMem):
         # Spaced well inside a radius of each other, so the silhouette is smooth
         # rather than beaded: the impostors are opaque spheres and overlapping
         # them IS the capsule.
+        #
+        # The creases where consecutive spheres meet are real, and once the body
+        # wears a flat material (RenderStyle.body_material) rather than a stripe
+        # running the length of it, they are visible: the renderer's
+        # depth-gradient outline finds every one. Packing them tighter is NOT the
+        # fix -- it makes the ribs finer and denser rather than shallower, because
+        # what the outline measures is the crease's ANGLE and halving the spacing
+        # only halves that. The fix is at the other end, in the shader: a body's
+        # pixels carry a marker that raises the outline's threshold past a crease
+        # while leaving the silhouette (a far larger gradient) outlined. So this
+        # stays at the spacing the silhouette wants.
         n_seg = max(2, int(np.ceil(2.0 * L / r_rod)) + 1)
         s = np.linspace(-0.5 * L, 0.5 * L, n_seg)
         rods = np.flatnonzero(is_rod)

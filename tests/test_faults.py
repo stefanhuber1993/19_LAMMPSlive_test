@@ -154,3 +154,159 @@ def test_a_rebuild_falls_back_off_a_value_lammps_refuses():
         assert system.take_fault() is None
     finally:
         system.close()
+
+
+# ---- a rebuild must not move the controlled particle ------------------------
+
+def test_a_rebuild_does_not_carry_the_old_atom_ordering_into_the_new_one():
+    """Reset with a live bead used to blow the simulation up on the first frame.
+
+    The mechanism, because it is not obvious from either end: the id-order
+    permutation (`_order`) is cached per FRAME, and a rebuild does not advance the
+    frame counter -- so after Reset the cache still described the LAMMPS instance
+    that had just been closed. `controlled_local` then named a different particle,
+    `GameMode.on_built` read ITS coordinate as the control plane, and the first
+    `constrain()` teleported the real controlled bead most of a sigma onto that
+    plane -- on top of a neighbour, which is a blow-up. Measured before the fix:
+    the 7-bead patch went from T = 0.001 to T = 2.8 in two frames.
+
+    So this pins the invariant that closes it: after a rebuild, the controlled
+    particle is where the fresh build put it, the plane it is held in is ITS OWN
+    coordinate, and holding it there moves nothing.
+    """
+    pytest.importorskip("lammps")
+    import numpy as np
+
+    from lammps_live.playground import registry
+
+    system = registry.build("mesomem_patch")
+    try:
+        # Steps first: LAMMPS reorders its local arrays as it runs, so the stale
+        # permutation has to actually differ from the fresh one for this to bite.
+        for _ in range(20):
+            system.step(10)
+        system.reset()
+
+        ic = system.controlled_local()
+        assert ic is not None
+        ids = system.lmp.numpy.extract_atom("id")[:system.natoms]
+        assert int(ids[ic]) == system.controlled_id, (
+            "controlled_local named some other particle -- the stale permutation")
+
+        mode = system.mode
+        x = np.array(system.lmp.numpy.extract_atom("x"))
+        assert mode._pin_value == pytest.approx(float(x[ic][mode.pin_axis])), (
+            "the control plane is not the controlled particle's own coordinate")
+
+        # ...and holding it on that plane is therefore a no-op, not a teleport.
+        before = np.array(x[ic][:3])
+        mode.constrain()
+        after = np.array(system.lmp.numpy.extract_atom("x")[ic][:3])
+        assert float(np.linalg.norm(after - before)) < 1e-6
+
+        # End to end: the fresh state stays cold instead of exploding.
+        for _ in range(30):
+            system.step(10)
+        assert system.unstable is None
+        assert system.take_fault() is None
+        temp = system.get_thermo_state()[0]
+        assert temp < 0.1, f"the rebuilt patch ran away to T = {temp}"
+    finally:
+        system.close()
+
+
+def test_the_first_build_settles_before_it_picks_the_control_plane():
+    """The same bug without any Reset at all, on a scenario LAMMPS fills itself.
+
+    There, `_pick_controlled` has to read the positions back out of LAMMPS to
+    choose a particle -- which builds an id-order permutation BEFORE the settle
+    runs. The settle then reorders, and the permutation is stale by the time
+    `GameMode.on_built` uses it to ask where its particle is. Same wrong-particle
+    coordinate, same teleport, on the very first frame of the playground.
+    """
+    pytest.importorskip("lammps")
+    import numpy as np
+
+    from lammps_live.playground import Playground, random_fill
+    from lammps_live.playground.system import PlaygroundSystem
+
+    playground = Playground(
+        name="filled box", force_field="mesomem",
+        # Dense enough that LAMMPS really does rebin during the build's own
+        # settle: a permutation that never changes would not test anything.
+        scenario=random_fill(n=200, box=9.0), mode="game", seed=7,
+    )
+    system = PlaygroundSystem(playground, mode_name="game", analysis=False)
+    try:
+        ic = system.controlled_local()
+        ids = system.lmp.numpy.extract_atom("id")[:system.natoms]
+        assert int(ids[ic]) == system.controlled_id
+        mode = system.mode
+        x = np.array(system.lmp.numpy.extract_atom("x"))
+        assert mode._pin_value == pytest.approx(float(x[ic][mode.pin_axis]))
+    finally:
+        system.close()
+
+
+def test_a_rebuild_of_a_lammps_filled_box_picks_its_bead_from_the_new_atoms():
+    """The third reader, and the earliest: `_pick_controlled` itself.
+
+    On a scenario LAMMPS fills, choosing the controlled particle means reading the
+    positions back -- through the same id-order permutation. On a REBUILD that
+    happens before anything else has had a chance to drop the dead instance's
+    permutation, and gathering through it either names the wrong particle for the
+    whole session or, when the two builds differ in size, indexes off the end.
+    """
+    pytest.importorskip("lammps")
+    import numpy as np
+
+    from lammps_live.playground import Playground, random_fill
+    from lammps_live.playground.system import PlaygroundSystem
+
+    playground = Playground(
+        name="filled box", force_field="mesomem",
+        scenario=random_fill(n=200, box=9.0), mode="game", seed=3,
+    )
+    system = PlaygroundSystem(playground, mode_name="game", analysis=False)
+    try:
+        for _ in range(15):
+            system.step(10)
+        system.reset()                      # must NOT raise, and must not misname
+        ic = system.controlled_local()
+        ids = system.lmp.numpy.extract_atom("id")[:system.natoms]
+        assert int(ids[ic]) == system.controlled_id
+        # The choice is "nearest the box centre", so it has to actually be that --
+        # gathered through a stale permutation it would be some other particle.
+        x = np.array(system.lmp.numpy.extract_atom("x")[:system.natoms])
+        by_id = x[np.argsort(ids, kind="stable")]
+        centre = np.asarray(system.box.center)
+        want = int(np.argmin(np.linalg.norm(by_id[:, :2] - centre[:2], axis=1)))
+        assert system.controlled_id == want + 1
+    finally:
+        system.close()
+
+
+def test_a_released_bead_is_the_case_that_broke():
+    """Same rebuild, with the bead let go of first -- how the bug was reported.
+
+    Worth its own test because `attached` survives a rebuild (a bead you let go of
+    stays let go), so the released path reaches `constrain()` down a different
+    branch: no leash, and nothing else holding the particle to stop a bad plane
+    value from being the only thing that moves it.
+    """
+    pytest.importorskip("lammps")
+    from lammps_live.playground import registry
+
+    system = registry.build("mesomem_patch")
+    try:
+        system.toggle_puller_attached()
+        assert not system.puller_attached()
+        for _ in range(20):
+            system.step(10)
+        system.reset()
+        for _ in range(30):
+            system.step(10)
+        assert system.unstable is None
+        assert system.get_thermo_state()[0] < 0.1
+    finally:
+        system.close()

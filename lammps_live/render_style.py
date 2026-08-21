@@ -65,6 +65,19 @@ class RenderStyle:
     # The control "net": the plane the joystick slides the active bead along.
     net_color: tuple = (120, 150, 210)
     net_alpha: int = 100
+    # WHEN TO RING THE CONTROLLED BEAD. The ring answers "which of these is the one
+    # I am driving?", which is a real question in a membrane and no question at all
+    # in a scene that holds one bead -- there it is a cyan circle drawn around the
+    # only thing on screen, competing with the director spike and the arrows for the
+    # eye. Three settings:
+    #
+    #   "always"    (the default) ringed whether it is being steered or not, dim
+    #               once released -- see renderer._puller_ring_color.
+    #   "released"  ringed ONLY while nobody is holding it. The ring then means one
+    #               thing instead of two: not "this is the one", which is obvious,
+    #               but "you have let go of it", which is not.
+    #   "never"     never ringed.
+    puller_ring: str = "always"
     # The two unbacked text lines drawn over the scene itself (the header and its
     # legend). Everything else in the sim view carries its own backdrop, so only
     # these have to follow the background.
@@ -257,6 +270,47 @@ class RenderStyle:
     # section of the slab and that is what both asked for.
     section_axis: tuple = (0.0, 1.0, 0.0)
     section_min: float = None
+
+    # --- the material a BODY is drawn in --------------------------------------
+    # A particle drawn as a body (see MDSystem3D.get_glyph_spheres -- the rod) is
+    # not a membrane bead, and the bead colourings are all wrong for it:
+    #
+    #   THE DIRECTOR BANDING is a statement about a bead's orientational degree of
+    #     freedom. The rod has an axis, but no yellow hydrophobic equator and no
+    #     blue poles -- painting it in the membrane's own colours says it is made
+    #     of the same stuff as the thing it is invaginating into.
+    #   THE ENERGY RAMP is worse, and it is a scale problem rather than a taste
+    #     one. The ramp spans a bead's `energy_range` (single-digit eps); the rod
+    #     is one particle in contact with a hundred beads at once, so its own
+    #     potential runs to several hundred. It is pinned at the bright end of the
+    #     ramp in every configuration, which is not a reading of anything -- and it
+    #     drags the eye to the one object in the frame whose colour means nothing.
+    #   THE CLUSTER COLOURING gives it whichever aggregate colour its owner drew.
+    #
+    # So a body gets a MATERIAL of its own instead, outside the colourings
+    # entirely: `"bacterium"` is a mottled, procedurally textured surface (see the
+    # `bacterium` branch of gl3d's geometry shader) in the two colours below. It
+    # reads as a living thing with a wall rather than a giant bead, which is what
+    # the rod is a picture of, and it stays the same object whichever colouring
+    # the viewer has the beads in. "" leaves bodies painted like their owner.
+    #
+    # Only the GL renderer has this; the CPU fallback bakes one banded sprite per
+    # radius and cannot vary a per-bead albedo at all -- the same reason it draws
+    # no energy ramp and no per-bead tints.
+    body_material: str = ""
+    # The two ends of the mottling, DISPLAY-SPACE bytes like the rest of the
+    # palette. A pale warm cell wall against an olive-brown shadow: enough
+    # separation that the texture reads at a distance, not so much that the rod
+    # looks like camouflage. Kept off `on_light()`: a bacterium is an object with
+    # its own colour, not part of the scene's ground, and it has to stay the same
+    # thing on either background.
+    body_color_light: tuple = (214, 208, 168)
+    body_color_dark: tuple = (108, 116, 72)
+    # Mottle size, in units of the bead radius: the wavelength of the coarsest
+    # octave of the noise. About two bead diameters, so a 1.5-sigma rod carries a
+    # handful of patches along its body rather than one gradient or a fine speckle
+    # that aliases the moment the camera pulls back.
+    body_mottle_r: float = 4.0
 
     # --- antialiasing ---------------------------------------------------------
     # FXAA over the finished image. Every silhouette here is a hard `discard`

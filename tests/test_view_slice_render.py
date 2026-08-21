@@ -119,9 +119,14 @@ def test_the_app_drives_the_slice_from_the_lever(monkeypatch):
             0.5 * app.view_slice.thickness_fraction * span, rel=1e-3)
         assert plane.mask(app.system.get_positions_3d()[1]) is not None
 
-        # Left alone, it opens back up.
-        for _ in range(int(60 * (app.view_slice.hold_seconds
-                                 + app.view_slice.transition_seconds)) + 8):
+        # Left alone it stays cut -- there is no idle timeout.
+        for _ in range(180):
+            app._tick(1.0 / 60)
+        assert seen["slice"] is not None
+
+        # Shoved to a stop, it opens back up.
+        lever["value"] = 1.0
+        for _ in range(int(60 * app.view_slice.transition_seconds) + 8):
             app._tick(1.0 / 60)
         assert seen["slice"] is None
     finally:
@@ -141,7 +146,7 @@ def test_switching_playground_forgets_the_lever(monkeypatch):
                             lambda self: lever["value"], raising=False)
         for _ in range(4):
             app._tick(1.0 / 60)
-        lever["value"] = 0.9
+        lever["value"] = 0.7
         for _ in range(40):
             app._tick(1.0 / 60)
         assert app.view_slice.engaged

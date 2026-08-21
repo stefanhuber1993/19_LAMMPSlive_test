@@ -728,6 +728,17 @@ What each level checks:
   runs no analysis. Worth reporting, since a cluster python with numpy and no scipy
   is common and would otherwise look like a risk.
 
+**"scipy is not needed" is a constraint on this codebase, not just an observation
+about the probe.** Everything the server touches -- a scenario's `build`, the force
+field's deck, the per-frame read-out -- has to run on numpy alone; scipy belongs to
+the client, where the analysis is. It is an easy invariant to break silently,
+because locally scipy is always there: `mesomem_polymer` broke it with one
+`cKDTree` inside `icosphere_spacing`, and the bill came due as a
+`ModuleNotFoundError` *after* Slurm had allocated an A100 -- a server that says
+LISTENING, dies on the first build, and takes the allocation down with it. The
+guard is `test_the_build_runs_with_no_scipy_installed`, which builds the scenario
+with the import blocked.
+
 **Every LAMMPS question is asked in a subprocess.** A LAMMPS error normally raises a
 Python exception -- but a build without exceptions enabled calls `MPI_Abort`, which
 takes the whole process with it, and a probe that can kill the thing it is probing
@@ -777,18 +788,70 @@ Details that took a moment's thought:
   distinction it keeps is the one that matters: a SILENT server is broken and should
   be given up on quickly, a server that has said it is working should not.
 - **Switching playground and back resumes the session rather than replacing it**
-  (`_resume`). Three states, three answers: streaming -> reconnect over the tunnel
-  and carry on; still connecting -> leave it working and hand the link over when it
-  lands (a queue wait that is nearly done must not be cancelled by a keystroke);
-  anything else -> there is nothing to come back to, so a new session and the card.
-  A link that arrived *while the playground was off screen* is adopted rather than
-  reconnected: the server serves one client at a time, so a second socket would sit
-  in the backlog behind the one we already hold.
+  (`RemotePanel.attach_system`). Streaming -> reconnect over the tunnel and carry
+  on; still connecting -> leave it working and hand the link over when it lands (a
+  queue wait that is nearly done must not be cancelled by a keystroke); the job
+  gone -> a new session and the card. A link that arrived *while the playground was
+  off screen* is adopted rather than reconnected: the server serves one client at a
+  time, so a second socket would sit in the backlog behind the one we already hold.
+- **One allocation serves both remote playgrounds.** See 7.1.
 - It is drawn *inside* `renderer.draw()`, because in GL mode every 2D surface has
   to be on `self.screen` before it is composited -- and because `draw()` is what
   flips the display.
 - **C copies the whole report**, in every state, to the clipboard *and* to a file
   in the temp directory. See below.
+
+### 7.1 One GPU, several demos
+
+There are two remote playgrounds now -- `mesomem_remote` and `mesomem_polymer` --
+and asking for a GPU twice in one talk is asking for the queue twice. So there is
+one session for the whole app, not one per playground, and the split it rests on is:
+
+| | |
+|---|---|
+| expensive, done once | the login and its one-time code, the deployed package, the probe, the **allocation**, the server process, the tunnel |
+| cheap, done per demo | closing one `PlaygroundSystem` on the far side and building another |
+
+Which gives three behaviours, and the third is the only one that costs anything:
+
+- **`Tab` to the other remote playground.** Nothing happens on the cluster. The run
+  you left is still integrating (or rather still held -- `serve_forever` stops
+  integrating the moment nobody is connected), the job is still yours, and the card
+  comes up saying so: *GPU held: job 4242 on gcn12, running mesomem_remote*.
+- **`Tab` back.** One socket through the tunnel that never closed, and you are
+  looking at the same box you left. This is `reopen_link`, and it predates the rest.
+- **Connect on the other one.** The button says *Move GPU here*, because that is
+  what it does. The client's `hello` now carries a `playground` field; a server
+  holding a different one closes it -- freeing the LAMMPS instance and the GPU memory
+  with it -- and builds the named one in its place
+  (`FrameServer.switch_playground`). Same node, same port, same job id, no queue, no
+  second code. What is **not** preserved is the state of the run being left, which is
+  the honest price and the reason this is a button press rather than something `Tab`
+  does behind your back.
+
+Three details worth knowing:
+
+- **The switch runs on the session's worker thread** (`RemoteSession._run_switch`),
+  because the far side's rebuild is LAMMPS' own setup on 50,000 beads. The state is
+  `SWITCH` while it goes, the progress bar sits at 6/7 -- everything but the last
+  step really is still done -- and the app keeps drawing.
+- **A failed switch does not give the GPU back.** This is the one place that departs
+  from the rest of `session.py`, where every failed step tears down. The distinction
+  is whether a process of *ours* has exited: if `_check_still_alive` raises, the
+  server is gone and its own `scancel` has already ended the allocation, so there is
+  nothing to hold and the session tears down as usual. If both ends are alive and
+  the socket merely did not work out, the allocation is still good and the useful
+  thing to offer is another go -- so the state goes to `DOWN`, `holds_allocation`
+  stays true, and the card keeps both *Move GPU here* and *Disconnect*. "Give the
+  GPU back" has to be one click from every state that is holding one.
+- **A link landing for the other playground is not handed over.** Switch to B, then
+  `Tab` back to A before it lands, and B's link would otherwise be attached to A's
+  system -- one simulation's beads drawn into another's scene. `RemotePanel.update`
+  checks `session.serves(playground_key)` first.
+
+A client that names **no** playground (the `--remote HOST:PORT` CLI path) leaves the
+server on whatever its own `--playground` said. That keeps "connect to what is
+running" and "put this on the GPU" as two different things.
 
 ### Reading a failure: the report
 

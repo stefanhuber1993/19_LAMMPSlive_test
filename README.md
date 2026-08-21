@@ -38,7 +38,9 @@ model whose parameters otherwise stay pretty abstract.
 
 | | |
 |---|---|
+| `mesomem_bead` | one bead, filling a quarter of the frame. No physics -- just the controls, for the start of a talk |
 | `mesomem_patch` | seven beads. Pull the middle one out and feel tilt and splay resist |
+| `mesomem_patch_torque` | the same seven, twisted instead of pulled: the stick turns the middle bead's director and the ring splays after it |
 | `mesomem_sheet` | ~900 beads, periodic, so a piece of an endless membrane. Watch a deformation spread |
 | `mesomem_assembly` | 1500 beads from a random start, assembling. Play / Pause / Reset |
 | `mesomem_rod` | 3600 beads at constant tension, seen in section. Steer a rod-shaped "bacterium" in and watch the membrane invaginate it |
@@ -62,6 +64,14 @@ included, because what goes over the wire is the same LAMMPS commands the local
 app runs on itself. And the GPU stays yours while you wander off to show
 another scene.
 
+**One GPU, both of them.** The two remote scenes share the allocation: you ask
+for a GPU once, at the start, and after that `Tab` between them costs nothing --
+the run you leave keeps running, and going back to it is one socket. Pressing
+Connect on the other one *moves* the GPU: the far side drops the simulation it
+was holding and builds the other one on the same node, through the same tunnel,
+with no queue and no second one-time code. So an hour's allocation is an hour of
+switching between demos, not one demo.
+
 How it works: [docs/remote-gpu.md](docs/remote-gpu.md).
 How to run it: [docs/snellius/README.md](docs/snellius/README.md).
 
@@ -73,27 +83,47 @@ whole demo from it, which is the point. Once you're standing in front of people
 with a stick in your hand you don't want to go hunting for the keyboard.
 
 The stick has two axes and there's more than two things worth steering, so only
-one control is live at a time and the hat switch walks between them: the camera,
-then each slider, then the bead colouring. A cyan frame shows which one you're
-on. Then you just push the stick to drive it. Most of the travel is a slow band
-for placing a value carefully, and it accelerates near the end when you want to
-cross the whole range. Trigger is play/pause (or grab the bead), and 2, 3 and 4
-are reset and scene back/forward.
+one control is live at a time and the hat switch moves between them, laid out
+like the screen: left and right cross between the scene and the control panel,
+up and down walk the panel's rows (the bead colouring, then each slider). A cyan
+frame shows which one you're on. Then you just push the stick to drive it. Most
+of the travel is a slow band for placing a value carefully, and it accelerates
+near the end when you want to cross the whole range.
 
-The thrust lever cuts the scene open. Nudge it and the view narrows to a slab a
-few per cent of the box thick, square-on to whichever direction you're looking
-from, and sliding the lever sweeps that slab through the box. Let go for three
-seconds and it opens back up. It works on any of the 3D scenes; on
-`mesomem_polymer` it's the only way to see anything at all, since a closed
-membrane is opaque and the whole point of that one is what's inside it. A lever
-you haven't touched since you started the app never cuts anything, wherever it
-happens to be sitting.
+Once the panel has the focus the stick's own up/down axis walks the rows too, so
+the hand never has to leave the stick: push forward or back to pick the control,
+left or right to move its value. A flick is exactly one row, and holding it walks
+about two rows a second -- slow enough to let go on the one you wanted.
+
+The trigger starts and stops the simulation, on every scene, and 2 resets it to a
+fresh state; 3 and 4 are scene back and forward. Every scene shows Play, Pause
+and Reset buttons for the same three actions, and Space, R and Tab are the
+keyboard twins.
+
+The thrust lever cuts the scene open, and it's a position, not a button: shove it
+to either stop and there's no cut at all, and anywhere in between the view
+narrows to a slab 15% of the box thick, square-on to whichever direction you're
+looking from, with the lever's position sweeping that slab through the box.
+Nothing times out -- cut in, let go, and it stays cut. It works on any of the 3D
+scenes; on `mesomem_polymer` it's the only way to see anything at all, since a
+closed membrane is opaque and the whole point of that one is what's inside it. A
+lever you haven't touched since you started the app never cuts anything, wherever
+it happens to be sitting.
 
 The force feedback runs on the device itself instead of being streamed frame by
 frame: a spring whose centre and stiffness follow the contact force, a damper
 that stiffens when you're in contact, and a vibration standing in for thermal
 jitter. None of it is required, `--input mouse` and `--input keyboard` work
 fine.
+
+**Push or twist.** A scene says which of the two the stick's axes are for.
+Normally they push the bead around, inside the drawn net, and the twist axis
+turns its director as a second control. `mesomem_patch_torque` swaps that round:
+the two axes *turn* the director instead, about two axes, and nothing pushes the
+bead at all -- where it goes is the membrane's answer. Everything downstream
+follows into the rotational domain, force feedback included, so what you feel is
+the tilt term twisting back. Green and red mean the same as always: what you're
+doing, and what the membrane is doing about it.
 
 ## Run it
 

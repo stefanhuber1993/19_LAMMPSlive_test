@@ -36,7 +36,9 @@ from .theme import (
     REACTION_VEC_COLOR, SLIDER_HANDLE_ACTIVE, SPHERE_AMBIENT,
     SPHERE_LIGHT_DIR, TEXT_COLOR, TORQUE_ARC_APPLIED_RADIUS,
     TORQUE_ARC_HEAD_LEN, TORQUE_ARC_REACTION_RADIUS, TORQUE_ARC_WIDTH,
-    VECTOR_MAX_PX,
+    TORQUE_RING_APPLIED_RADIUS, TORQUE_RING_DEPTH_FADE, TORQUE_RING_DEPTH_TAPER,
+    TORQUE_RING_HEAD_LEN, TORQUE_RING_MIN, TORQUE_RING_REACTION_RADIUS,
+    TORQUE_RING_WIDTH, VECTOR_MAX_PX,
 )
 
 
@@ -45,6 +47,14 @@ from .theme import (
 # it is part of. See theme.py for the first two's colours and CLUSTER_COLORS for
 # the third's, and playground/clustering.py for what "part of" means.
 BEAD_COLOR_MODES = ("director", "energy", "cluster")
+
+# The shader's `in_material` value for each RenderStyle.body_material name -- what
+# a particle drawn as a BODY is painted as, instead of any of the colourings above
+# (see RenderStyle.body_material for why the rod cannot wear one of them, and the
+# geometry shader in gl3d.py for what each branch draws). 0 is "no material of its
+# own": the body is painted like the particle it belongs to, which is what every
+# scene without a declared material gets.
+BODY_MATERIALS = {"bacterium": 1.0}
 
 
 # Banded-bead sprites are shaded per-pixel in numpy on a cache miss, and in a
@@ -64,6 +74,7 @@ def _lerp_color(a, b, t):
 
 KEY_HINTS = (
     "1-9: system   Tab/shift-Tab: next, previous   WASD/mouse: move   Q/E or L/R click: rotate   "
+    "Space: play/pause   R: reset   B: grab bead   "
     "Up/Down or wheel: temperature   F11/green button: fullscreen   Esc: exit fullscreen / quit"
 )
 # Appended for systems with a turntable camera (SystemSpec.camera_orbit).
@@ -72,11 +83,15 @@ ORBIT_KEY_HINTS = ("   drag: orbit camera   shift-drag: pan   wheel: zoom   "
 # Shown instead of nothing in --input joystick mode: the stick's own bindings,
 # which have no keyboard equivalent to read off the line above. The hat is the
 # only one that needs explaining -- it moves what the stick drives (the cyan
-# frame), and everything else follows from that.
+# frame), and everything else follows from that. Note that inside the panel the
+# stick's two axes do different jobs -- up/down picks the row, left/right moves
+# its value -- which is worth spelling out because it is the one place where the
+# same stick means two things at once.
 JOYSTICK_HINTS = (
-    "hat L/R: pick control (cyan frame)   stick: drive it (a colour steps per "
-    "push)   twist: zoom   "
-    "1: play/pause or grab   2: reset   3/4: playground"
+    "hat L/R: scene <-> panel (cyan frame)   in the panel: stick or hat up/down "
+    "picks a control, stick L/R drives it (a colour steps per push)   "
+    "twist: zoom   1: play/pause   2: reset   3/4: playground   "
+    "lever: slice (ends = off)"
 )
 
 
@@ -126,10 +141,11 @@ class Renderer:
         self.show_advanced = False
         self.advanced_toggle_rect = None
 
-        # Play / Pause / Reset buttons for playback systems (self-assembly). Their
+        # Play / Pause / Reset buttons, on every playground. Their
         # rects are (re)positioned every frame in draw_playback_controls; the app
         # reads them back via playback_hit to route clicks. Empty-rect until first
-        # drawn, so a stray click can't hit a button for a non-playback system.
+        # drawn, and hit-testing is gated on `_playback_visible`, so a click
+        # cannot land on a stale rect before the first frame or behind a modal.
         self.playback_buttons = [Button("play", "Play"),
                                  Button("pause", "Pause"),
                                  Button("reset", "Reset")]
@@ -773,10 +789,19 @@ class Renderer:
         self._banded_cache[key] = surf
         return surf
 
-    def _puller_ring_color(self, attached):
-        """Colour of the ring marking the controlled particle. Dim once released
-        (B / joystick trigger): still marked, because it is still the particle
-        the ring will grab again, but plainly not being steered."""
+    def _puller_ring_color(self, attached, style=None):
+        """Colour of the ring marking the controlled particle, or None to draw no
+        ring at all.
+
+        Dim once released (B, or the focus leaving the viewport): still marked,
+        because it is still the particle the ring will grab again, but plainly not
+        being steered. Whether it is drawn at all is the scene's own choice --
+        see RenderStyle.puller_ring, and the one-bead playground, where a ring
+        around the only object in shot marks nothing.
+        """
+        when = getattr(style, "puller_ring", "always")
+        if when == "never" or (when == "released" and attached):
+            return None
         return PULLER_RING_COLOR if attached else PULLER_RING_FREE_COLOR
 
     def _fog(self, depth, near, far):
@@ -1138,6 +1163,149 @@ class Renderer:
             hy = end[1] + UI(ARROWHEAD_LEN) * math.sin(ha)
             pygame.draw.line(self.screen, color, end, (hx, hy), UI.w(3))
 
+    @staticmethod
+    def _torque_ring_points(camera, center_world, vec_world, radius_world,
+                            samples_per_rad=11.0):
+        """The world-space circle a torque draws, or None if it is too small to be
+        worth drawing.
+
+        `vec_world` is the torque as the axial vector it is: the direction is the
+        axis the rotation is about (right-hand rule), the length is the fraction of
+        that torque's display maximum. What comes back is (points (N, 3), sweep) --
+        an arc of the circle of `radius_world` about that axis, through
+        `center_world`, swept by the right-hand rule and reaching a semicircle at
+        full scale.
+
+        PHI = 0 IS THE POINT OF THE CIRCLE NEAREST THE CAMERA, and the sweep runs
+        half either side of it. That is what keeps the arc the part of the ring
+        facing the viewer, whichever way the axis happens to point -- so the
+        arrowhead at its leading end is on the near side and reads, instead of
+        being the piece that disappears behind the bead. The alternative (a fixed
+        start, like the flat arc's "top of the ring") has no meaning once the ring
+        is a real object in the scene: there is no top.
+        """
+        mag = float(np.linalg.norm(vec_world))
+        if mag < TORQUE_RING_MIN:
+            return None
+        axis = np.asarray(vec_world, dtype=float) / mag
+        c = np.asarray(center_world, dtype=float)
+        # In-plane basis. e1 points at the camera as far as the plane allows; when
+        # the axis IS the view direction the ring is face-on and every choice of e1
+        # gives the same picture, so any perpendicular will do.
+        toward = np.asarray(camera.eye, dtype=float) - c
+        e1 = toward - axis * float(toward @ axis)
+        if float(np.linalg.norm(e1)) < 1e-9:
+            e1 = np.cross(axis, (0.0, 0.0, 1.0))
+            if float(np.linalg.norm(e1)) < 1e-9:
+                e1 = np.cross(axis, (0.0, 1.0, 0.0))
+        e1 = e1 / np.linalg.norm(e1)
+        e2 = np.cross(axis, e1)          # +phi turns e1 toward e2: right-handed
+        sweep = min(mag, 1.0) * math.pi
+        n = max(8, int(sweep * samples_per_rad))
+        phi = np.linspace(-0.5 * sweep, 0.5 * sweep, n + 1)
+        pts = (c[None, :] + radius_world
+               * (np.cos(phi)[:, None] * e1[None, :]
+                  + np.sin(phi)[:, None] * e2[None, :]))
+        return pts, sweep
+
+    def _ring_occluders(self, pts, depth, center_world, reach, shown):
+        """Indices of the beads a ring of `reach` about `center_world` can pass
+        behind. A 3D distance cut first, so that a 50k scene costs one pass over an
+        array and not a per-sample test against fifty thousand spheres -- only the
+        handful of beads the ring physically reaches can hide any of it."""
+        if not len(pts):
+            return np.zeros(0, dtype=int)
+        near = np.linalg.norm(pts - np.asarray(center_world, dtype=float)[None, :],
+                              axis=1) <= reach
+        near &= np.isfinite(depth)
+        if shown is not None:
+            near &= shown            # a bead cut away by the slice hides nothing
+        return np.flatnonzero(near)
+
+    def _draw_torque_ring(self, camera, center_world, vec_world, radius_world,
+                          color, pts, screen, depth, radii, phys_r, occ):
+        """A torque drawn as what it is in the scene: a circular arrow lying in the
+        plane the rotation happens in, put through the same camera as everything
+        else.
+
+        WHY NOT A CIRCLE ON THE SCREEN, which is what this used to be. A rotation
+        about an axis pointing at the camera is seen as a circle; the SAME rotation
+        about an axis lying across the screen is seen edge-on, as a straight line;
+        anything between is an ellipse. A screen-space circle throws all of that
+        away -- it says "something is turning" and nothing about what it is turning
+        around, which on a drive whose whole point is that the director can be
+        turned about two independent axes is precisely the part worth seeing. Here
+        the axis is IN the picture: the ring tips as the director tips, and going
+        edge-on is not a degenerate case to avoid but the correct reading that the
+        rotation is happening in the plane of the screen.
+
+        Three cues carry the depth, because the projected ellipse alone is
+        ambiguous -- an axis tipped toward the camera and one tipped away give the
+        same outline, and they are opposite rotations:
+
+          IT GOES BEHIND THINGS. Clipped against the front surface of every bead it
+            reaches, the same sphere test the net and the box are clipped by, so
+            the far half passes behind its own bead and the near half in front.
+          THE FAR HALF IS THINNER, tapering with depth measured in units of the
+            ring's own radius -- so a face-on ring, whose near and far are the same
+            distance away, is drawn evenly and does not pretend otherwise.
+          THE FAR HALF IS FADED toward the background, on the same measure.
+        """
+        made = self._torque_ring_points(camera, center_world, vec_world,
+                                        radius_world)
+        if made is None:
+            return
+        ring, _ = made
+        scr, dep, _ = camera.project(ring)
+        vis = np.isfinite(dep) & np.isfinite(scr[:, 0]) & np.isfinite(scr[:, 1])
+        if not np.any(vis):
+            return
+        eps = 0.02          # reach exactly to a silhouette, not a pixel short
+        for i in occ:
+            r_px = max(float(radii[i]), 1e-6)
+            rho2 = (((scr[:, 0] - screen[i][0]) ** 2
+                     + (scr[:, 1] - screen[i][1]) ** 2) / (r_px * r_px))
+            front = depth[i] - phys_r * np.sqrt(np.clip(1.0 - rho2, 0.0, 1.0))
+            vis &= ~((rho2 <= 1.0) & (dep > front + eps))
+        # Depth in units of the ring's own radius, about the bead's own depth: 0 at
+        # the near edge of the circle, 1 at the far one, 0.5 everywhere on a ring
+        # seen face on.
+        _, d_center, _ = camera.project_point(center_world)
+        t = np.clip(0.5 + (dep - d_center) / (2.0 * radius_world), 0.0, 1.0)
+        bg = self._scene_style.background
+        last = -1
+        for k in range(len(ring) - 1):
+            if not (vis[k] and vis[k + 1]):
+                continue
+            tm = 0.5 * (t[k] + t[k + 1])
+            w = max(1, int(round(UI.f(TORQUE_RING_WIDTH)
+                                 * (1.0 - TORQUE_RING_DEPTH_TAPER * tm))))
+            pygame.draw.line(self.screen,
+                             _lerp_color(color, bg, TORQUE_RING_DEPTH_FADE * tm),
+                             (scr[k, 0], scr[k, 1]), (scr[k + 1, 0], scr[k + 1, 1]),
+                             w)
+            last = k + 1
+        # The head goes on the last piece that survived the clip, pointing the way
+        # the arc was travelling there. If the leading end is behind a bead the head
+        # follows it in rather than being drawn floating at the silhouette.
+        if last < 1:
+            return
+        ex, ey = float(scr[last, 0]), float(scr[last, 1])
+        dx, dy = ex - float(scr[last - 1, 0]), ey - float(scr[last - 1, 1])
+        dl = math.hypot(dx, dy)
+        if dl < 1e-6:
+            return
+        tm = float(t[last])
+        head = UI(TORQUE_RING_HEAD_LEN) * (1.0 - TORQUE_RING_DEPTH_TAPER * tm)
+        w = max(1, int(round(UI.f(TORQUE_RING_WIDTH)
+                             * (1.0 - TORQUE_RING_DEPTH_TAPER * tm))))
+        col = _lerp_color(color, bg, TORQUE_RING_DEPTH_FADE * tm)
+        angle = math.atan2(dy, dx)
+        for sign in (-1, 1):
+            ha = angle + math.pi - sign * ARROWHEAD_ANGLE
+            pygame.draw.line(self.screen, col, (ex, ey),
+                             (ex + head * math.cos(ha), ey + head * math.sin(ha)), w)
+
     def _draw_torque_arc(self, center, radius, frac, color):
         """A circular arrow around `center` depicting a torque about the control-
         plane normal. The arc starts at the top of the ring and sweeps to the
@@ -1182,6 +1350,7 @@ class Renderer:
                     input_force, reaction_force, control_grid, fps,
                     sim_time_ps=0.0, puller_energy=None, hud_lines=None,
                     potential_terms=None, torque_signals=None,
+                    torque_vectors=None,
                     total_steps=0, steps_per_frame=1, debug_line=None,
                     brightness=None, total_potential_terms=None, box_bounds=None,
                     puller_attached=True, bead_energies=None,
@@ -1261,15 +1430,16 @@ class Renderer:
             # walking `order` to test every bead cost one numpy call per bead,
             # which is 26 ms a frame at 50k -- most of the remote playground's
             # frame, spent deciding not to draw a circle.
-            visible = (np.isfinite(depth) if shown is None
-                       else np.isfinite(depth) & shown)
-            pulled = np.flatnonzero(np.asarray(is_puller, dtype=bool) & visible)
-            for i in pulled[np.argsort(-depth[pulled])]:
-                cx, cy = int(screen[i][0]), int(screen[i][1])
-                pygame.draw.circle(self.screen,
-                                   self._puller_ring_color(puller_attached),
-                                   (cx, cy), int(radii[i]) + UI(2),
-                                   UI.w(PULLER_RING_WIDTH))
+            ring = self._puller_ring_color(puller_attached, spec.render_style)
+            if ring is not None:
+                visible = (np.isfinite(depth) if shown is None
+                           else np.isfinite(depth) & shown)
+                pulled = np.flatnonzero(np.asarray(is_puller, dtype=bool) & visible)
+                for i in pulled[np.argsort(-depth[pulled])]:
+                    cx, cy = int(screen[i][0]), int(screen[i][1])
+                    pygame.draw.circle(self.screen, ring, (cx, cy),
+                                       int(radii[i]) + UI(2),
+                                       UI.w(PULLER_RING_WIDTH))
         else:
             radii = np.clip(phys_r * scale, 3, 90)   # capped: matches CPU sprites
             self._draw_sim_3d_cpu(pts, dipoles3d, is_puller, spec, camera, bonds,
@@ -1278,11 +1448,13 @@ class Renderer:
                                   puller_attached, glyph_spheres, view_slice,
                                   shown)
 
-        self._draw_3d_overlays(camera, pts, screen, depth, radii, is_puller, spec,
+        self._draw_3d_overlays(camera, pts, screen, depth, radii, phys_r,
+                               is_puller, spec,
                                input_force, reaction_force, fps, sim_time_ps,
                                total_steps, steps_per_frame, potential_terms,
-                               torque_signals, hud_lines, debug_line,
-                               total_potential_terms, shown=shown)
+                               torque_signals, torque_vectors, hud_lines,
+                               debug_line, total_potential_terms,
+                               shown=shown)
 
     # ---- GPU scene: hand the beads + occluded lines to the GL pipeline ------
 
@@ -1442,13 +1614,19 @@ class Renderer:
             benergy, btint = benergy[keep], btint[keep]
             bfade = None if bfade is None else bfade[keep]
         radii = np.full(len(bpts), phys_r, dtype=np.float32)
+        # Beads carry no material of their own -- they ARE the colourings. Only a
+        # body can (see RenderStyle.body_material), and _append_bodies is what
+        # marks the instances that do.
+        bmaterial = np.zeros(len(bpts), dtype=np.float32)
         # Then the bodies, and the particles they belong to, BEFORE the frustum is
         # measured: they are impostors of their own (larger) radius and have to be
         # inside the depth span and the clip planes.
         if glyph_spheres is not None:
-            bpts, bdips, bbright, benergy, btint, bfade, radii = self._append_bodies(
+            (bpts, bdips, bbright, benergy, btint, bfade, radii,
+             bmaterial) = self._append_bodies(
                 glyph_spheres, np.flatnonzero(bodied), real, phys_r,
-                bpts, bdips, bbright, benergy, btint, bfade, radii)
+                bpts, bdips, bbright, benergy, btint, bfade, radii, bmaterial,
+                BODY_MATERIALS.get(style.body_material, 0.0))
 
         # The frustum and the depth span are measured over what is ACTUALLY
         # drawn, not over the real cell alone. With periodic images that is the
@@ -1487,16 +1665,22 @@ class Renderer:
                              edge_fade=edge_fade, style=style,
                              bead_radius=phys_r, focal_px=camera.focal,
                              energies=benergy if energies is not None else None,
-                             tints=btint if tints is not None else None,
+                             # The tint channel goes up whenever anything reads
+                             # it, and a body material reads it as its noise
+                             # anchor even in a colouring that has no tints of its
+                             # own (see _append_bodies).
+                             tints=(btint if tints is not None
+                                    or bmaterial.any() else None),
                              color_mode=color_mode,
-                             fades=bfade, overlay_verts=ov_verts,
-                             overlay_cols=ov_cols)
+                             fades=bfade, materials=bmaterial,
+                             overlay_verts=ov_verts, overlay_cols=ov_cols)
         # Sim viewport is the left sim_width columns, full height (GL origin is
         # bottom-left, so its y origin is 0).
         self.gl_scene.blit_to_viewport(0, 0, W, H)
 
     def _append_bodies(self, glyphs, owner_rows, real, phys_r,
-                       bpts, bdips, bbright, benergy, btint, bfade, radii):
+                       bpts, bdips, bbright, benergy, btint, bfade, radii,
+                       bmaterial, material=0.0):
         """Append the bodied particles and the spheres that make up their bodies.
 
         Both go on unfaded and uncopied -- they are the real cell's, drawn once
@@ -1507,6 +1691,15 @@ class Renderer:
         bead inside a grey body. A sphere's DIRECTOR is its own, so the shading
         bands run along the body's axis rather than the owner's, and its
         brightness is neutral.
+
+        `material` (non-zero when the style declares one -- see
+        RenderStyle.body_material) puts the whole object, owner particle included,
+        outside the bead colourings altogether: the shader paints it its own
+        material instead. It then reads the TINT CHANNEL AS A POSITION rather than
+        a colour -- the anchor its procedural texture is sampled about -- so every
+        sphere of one body is handed its OWNER's position, which is what keeps the
+        texture on the body as it is steered rather than the body sliding through
+        a fixed field of it.
         """
         centers, grad, gdirs, owners = glyphs
         centers = np.asarray(centers, dtype=float)
@@ -1520,7 +1713,13 @@ class Renderer:
                                      np.ones(len(centers))])
         add_energy = np.concatenate([real["energy"][owner_rows],
                                      real["energy"][owners]])
-        add_tint = np.concatenate([real["tint"][owner_rows], real["tint"][owners]])
+        if material:
+            add_tint = np.zeros((len(add_pts), 4))
+            add_tint[:, :3] = np.concatenate([real["pts"][owner_rows],
+                                              real["pts"][owners]])
+        else:
+            add_tint = np.concatenate([real["tint"][owner_rows],
+                                       real["tint"][owners]])
         add_radii = np.concatenate([np.full(len(owner_rows), phys_r),
                                     np.asarray(grad, dtype=float)])
         return (
@@ -1531,6 +1730,8 @@ class Renderer:
             np.concatenate([btint, add_tint]),
             None if bfade is None else np.concatenate([bfade, np.ones(len(add_pts))]),
             np.concatenate([radii, add_radii.astype(np.float32)]),
+            np.concatenate([bmaterial,
+                            np.full(len(add_pts), material, dtype=np.float32)]),
         )
 
     def _periodic_image_instances(self, pts, dips, bright, energy, tint, style,
@@ -1763,6 +1964,8 @@ class Renderer:
         self.screen (the display surface in fallback mode)."""
         style = spec.render_style
         self.screen.fill(style.background)
+        # None when this scene rings no puller (see _puller_ring_color).
+        ring = self._puller_ring_color(puller_attached, style)
         net_segs = self._net_world_segments(control_grid) if control_grid is not None else None
 
         # Connectivity lines, behind the beads: alpha peaks at d_opt and falls off
@@ -1851,9 +2054,9 @@ class Renderer:
             cx, cy = int(bscreen[i][0]), int(bscreen[i][1])
             sprite = self._banded_sphere_sprite(r, dv[i], total_fade, float(bbright[i]))
             self.screen.blit(sprite, (cx - r, cy - r))
-            if aug_pull[i]:
-                pygame.draw.circle(self.screen, self._puller_ring_color(puller_attached),
-                                   (cx, cy), r + UI(2), UI.w(PULLER_RING_WIDTH))
+            if aug_pull[i] and ring is not None:
+                pygame.draw.circle(self.screen, ring, (cx, cy), r + UI(2),
+                                   UI.w(PULLER_RING_WIDTH))
 
         # Director spikes on top (batch-projected -- see the GL path), so the
         # 900-bead sheet's arrows don't cost thousands of per-bead projections.
@@ -1888,11 +2091,13 @@ class Renderer:
 
     # ---- shared 2D overlays over the 3D scene (both GL and CPU paths) --------
 
-    def _draw_3d_overlays(self, camera, pts, screen, depth, radii, is_puller, spec,
+    def _draw_3d_overlays(self, camera, pts, screen, depth, radii, phys_r,
+                          is_puller, spec,
                           input_force, reaction_force, fps, sim_time_ps,
                           total_steps, steps_per_frame, potential_terms,
-                          torque_signals, hud_lines, debug_line,
-                          total_potential_terms=None, shown=None):
+                          torque_signals, torque_vectors, hud_lines,
+                          debug_line, total_potential_terms=None,
+                          shown=None):
         # Force arrows at the puller (map control-plane (x,z) -> world x,z).
         # Everything anchored ON a particle is skipped for a scene that has none --
         # which is a real state, not a degenerate one: a remote playground holds an
@@ -1906,18 +2111,56 @@ class Renderer:
         # the header line below, which is not cut by anything.
         puller_idx = int(np.argmax(is_puller)) if np.any(is_puller) else 0
         anchored = bool(len(pts)) and (shown is None or bool(shown[puller_idx]))
-        if anchored:
+        # What is drawn at the puller, in whichever domain drives it. Same colours
+        # and same anchor either way -- green is what you are doing to it, red is
+        # what the force field is doing back -- but they are different KINDS of
+        # quantity and are drawn as different things:
+        #
+        #   FORCE DRIVE   two straight arrows: the in-plane force vectors, mapped
+        #     from the control plane's (u, v) into world (x, z). A force is a push
+        #     along a line and a straight arrow is a picture of it.
+        #   TORQUE DRIVE   two rings, and NO straight arrows. A torque is not a
+        #     push in any direction, and drawing its axial vector as an arrow says
+        #     it is: the arrow points along an axis nothing moves along, and next
+        #     to the force playground's arrows -- same colours, same anchor -- it
+        #     reads as the pull that this drive specifically does not apply. The
+        #     ring is the rotation itself, in the plane it happens in, and the
+        #     camera turns it into the ellipse that plane is seen as (see
+        #     _draw_torque_ring).
+        torque_drive = spec.control_drive == "torque"
+        if anchored and torque_drive:
+            if torque_vectors is not None:
+                anchor = pts[puller_idx]
+                applied3, reaction3 = torque_vectors
+                r_out = phys_r * TORQUE_RING_REACTION_RADIUS
+                occ = self._ring_occluders(pts, depth, anchor, r_out + phys_r,
+                                           shown)
+                self._draw_torque_ring(camera, anchor, reaction3, r_out,
+                                       REACTION_VEC_COLOR, pts, screen, depth,
+                                       radii, phys_r, occ)
+                self._draw_torque_ring(camera, anchor, applied3,
+                                       phys_r * TORQUE_RING_APPLIED_RADIUS,
+                                       INPUT_VEC_COLOR, pts, screen, depth,
+                                       radii, phys_r, occ)
+        elif anchored:
             anchor = pts[puller_idx]
             knee = spec.force_feedback.ff_knee
             ivec = np.array([input_force[0], 0.0, input_force[1]])
             rvec = np.array([reaction_force[0], 0.0, reaction_force[1]])
             self._draw_arrow_3d(camera, anchor, rvec, REACTION_VEC_COLOR, knee)
             self._draw_arrow_3d(camera, anchor, ivec, INPUT_VEC_COLOR, knee)
-        # Circular torque arrows around the puller, both about the control-plane
-        # normal (in-plane director rotation): green = the user's steering torque,
-        # red = the membrane's restoring torque. Both signals are the component
-        # already projected onto the net's plane (see get_torque_signals).
-        if torque_signals is not None and anchored:
+        # Flat circular torque arrows around the puller, both about the control-
+        # plane normal (in-plane director rotation): green = the user's steering
+        # torque, red = the membrane's restoring torque. Both signals are the
+        # component already projected onto the net's plane (see get_torque_signals).
+        #
+        # A FORCE DRIVE ONLY. These are secondary there -- the twist is a secondary
+        # control, on one axis, about the normal of the plane the scene is looked
+        # down, which is the one axis a flat circle is honest about. A torque drive
+        # has the rings above, which say the same thing about both of its axes and
+        # say it in the scene; drawing these as well would be the same torque
+        # twice, once truthfully and once flattened.
+        if torque_signals is not None and anchored and not torque_drive:
             pcx, pcy = int(screen[puller_idx][0]), int(screen[puller_idx][1])
             r_px = float(radii[puller_idx])
             applied, reaction = torque_signals
@@ -1933,23 +2176,39 @@ class Renderer:
         ix, iy = input_force
         rx, ry = reaction_force
         sim_time_str = units.format_sim_time(sim_time_ps, spec.reduced_units)
-        # Input/reaction torque (director twist about the control-plane normal),
-        # shown alongside the forces. torque_signals are the fractions [-1, 1] the
-        # torque arcs use (green = your twist, red = membrane restoring twist).
-        torque_str = ""
-        if torque_signals is not None:
-            applied, reaction = torque_signals
-            torque_str = (f"input torque: {applied:+.2f}   "
-                          f"membrane torque: {reaction:+.2f}   ")
+        if torque_drive:
+            # The same two numbers, in the other domain: the stick's two axes ARE
+            # the torque here, about the two axes named in Control.torque_axes, and
+            # the reaction is the membrane's restoring torque about the same pair.
+            # No separate scalar readout -- the arcs' own axis is the first of these
+            # two, so repeating it would be the same number written twice.
+            drive_str = (f"input torque: ({ix:4.1f}, {iy:4.1f})   "
+                         f"membrane torque: ({rx:5.1f}, {ry:5.1f})   ")
+        else:
+            # Input/reaction torque (director twist about the control-plane normal),
+            # shown alongside the forces. torque_signals are the fractions [-1, 1]
+            # the torque arcs use (green = your twist, red = membrane restoring
+            # twist).
+            torque_str = ""
+            if torque_signals is not None:
+                applied, reaction = torque_signals
+                torque_str = (f"input torque: {applied:+.2f}   "
+                              f"membrane torque: {reaction:+.2f}   ")
+            drive_str = (
+                f"input force: ({ix:4.1f}, {iy:4.1f})"
+                f"{units.force_unit(spec.reduced_units)}   "
+                f"membrane force: ({rx:5.1f}, {ry:5.1f})   {torque_str}")
         label = self.font.render(
             f"{spec.name}  |  sim time: {sim_time_str}   steps: {total_steps:,} ({steps_per_frame}/frame)   "
-            f"input force: ({ix:4.1f}, {iy:4.1f}){units.force_unit(spec.reduced_units)}   "
-            f"membrane force: ({rx:5.1f}, {ry:5.1f})   "
-            f"{torque_str}fps: {fps:4.0f}",
+            f"{drive_str}fps: {fps:4.0f}",
             True, spec.render_style.text_color,
         )
         self.screen.blit(label, (UI(10), UI(10)))
         legend = self.font.render(
+            "green = your twist, red = membrane reaction   |   the stick tips the "
+            "center bead's director (WASD/mouse); arrows are the torque AXES "
+            "(right-hand rule), arcs the rotation you see"
+            if torque_drive else
             "green = your pull/twist, red = membrane reaction   |   drag the center bead (WASD/mouse); twist / Q-E / L-R click rotates its director",
             True, spec.render_style.dim_text_color,
         )
@@ -2134,10 +2393,10 @@ class Renderer:
         pygame.draw.rect(self.screen, FOCUS_COLOR, rect, width=pad)
 
     def draw_playback_controls(self, playing):
-        """Play / Pause / Reset buttons centered along the bottom of the sim view
-        (playback systems only). The button matching the current run state is
-        highlighted: Play while running, Pause while stopped. Reset never latches.
-        Positions the button rects so the app can hit-test clicks (playback_hit)."""
+        """Play / Pause / Reset buttons centered along the bottom of the sim view.
+        The button matching the current run state is highlighted: Play while
+        running, Pause while stopped. Reset never latches. Positions the button
+        rects so the app can hit-test clicks (playback_hit)."""
         bw, bh, gap = UI(96), UI(34), UI(12)
         total = 3 * bw + 2 * gap
         x0 = (self.sim_width - total) // 2
@@ -2545,6 +2804,7 @@ class Renderer:
                 puller_energy=puller_energy, hud_lines=hud_lines,
                 potential_terms=scene_3d.get("potential_terms"),
                 torque_signals=scene_3d.get("torque_signals"),
+                torque_vectors=scene_3d.get("torque_vectors"),
                 total_steps=total_steps, steps_per_frame=steps_per_frame,
                 debug_line=debug_line, brightness=scene_3d.get("brightness"),
                 total_potential_terms=scene_3d.get("total_potential_terms"),
@@ -2573,9 +2833,12 @@ class Renderer:
         # window edge on three sides and an outside frame would have nowhere to go.
         if control_focus is not None and control_focus.on_viewport:
             self.draw_focus_frame()
-        # Play / Pause / Reset controls for playback systems, over the sim view.
+        # Play / Pause / Reset controls, over the sim view. On EVERY playground:
+        # stopping a scene to look at it, and putting it back to a fresh state,
+        # are things any of them can do, and a demo where the buttons appear on
+        # some scenes and not others reads as the buttons being broken.
         self._playback_visible = False
-        if spec.playback_controls and playback_playing is not None:
+        if playback_playing is not None:
             self.draw_playback_controls(playback_playing)
         # A modal card over the sim view (the remote connect panel). Drawn here
         # rather than by the caller after draw() returns, because in GL mode every

@@ -5,10 +5,12 @@ LAMMPS instance and rebuilds the UI state (renderer scale, sliders, history,
 smoothers) for the new one, in place.
 
 The joystick reaches all of that without the keyboard or the pointer: one focus
-at a time -- the viewport or one slider -- moved with the hat switch, which is
-what decides whether the stick is flying the camera, holding a bead, or setting a
-value. See control_focus.py for the model, and _route_stick / _poll_device_buttons
-below for the mapping.
+at a time -- the viewport or one slider -- moved with the hat switch (left/right
+between the scene and the panel, up/down between the panel's rows), which is what
+decides whether the stick is flying the camera, holding a bead, or setting a
+value. The trigger starts and stops the simulation and button 2 resets it, on
+every playground alike. See control_focus.py for the focus model, and
+_route_stick / _poll_device_buttons below for the mapping.
 """
 import atexit
 import math
@@ -136,10 +138,14 @@ class App:
         self.sim_wall_time = 0.0
         self.steps_per_frame = 1
         self.total_steps = 0
-        # Playback state for systems driven by Play/Pause/Reset buttons (the
-        # self-assembly system): only stepped while playing. Ignored by the
-        # interactive puller systems, which always step. Set per-system in
-        # _build_system (playback systems start paused on their fresh state).
+        # Whether the simulation is running. EVERY playground has this, and every
+        # playground shows the Play/Pause/Reset buttons for it -- being able to
+        # stop a scene and look at it is not a property of one kind of scene. What
+        # differs is only where it STARTS: a playback playground comes up paused on
+        # its fresh state (that first configuration is the thing to look at before
+        # it moves), an interactive one comes up running (there is a bead to push,
+        # and pushing it against a frozen box is nothing). Set per system in
+        # _build_system.
         self.sim_playing = False
 
         # Turntable camera for the 3D systems that ask for one (spec.camera_orbit),
@@ -394,8 +400,8 @@ class App:
         self.sim_wall_time = 0.0
         self.total_steps = 0
         # Playback systems start paused, showing their fresh initial state until
-        # the user presses Play; puller systems ignore this flag and always step.
-        self.sim_playing = False
+        # Play is pressed; interactive ones start running -- see `sim_playing`.
+        self.sim_playing = not spec.playback_controls
 
         self.ff_smoother.reset()
         self.interaction_smoother.reset()
@@ -409,10 +415,14 @@ class App:
         self._build_system(keys[(idx + step) % len(keys)])
 
     def _reset_simulation(self):
-        """Restart a playback system from a fresh initial state (e.g. re-randomize
-        the self-assembly box), keeping the current slider values, and clear the
-        derived per-run state (plots, trails, energy baseline, step count). Leaves
-        the run paused so the fresh state is visible before Play is pressed.
+        """Restart the system from a fresh initial state (e.g. re-randomize the
+        self-assembly box), keeping the current slider values, and clear the
+        derived per-run state (plots, trails, energy baseline, step count).
+
+        It leaves the run in whatever state that playground STARTS in -- paused for
+        a playback scene, so the fresh configuration is visible before it moves;
+        running for an interactive one, because a reset in the middle of a demo is
+        "put it back how it was", and having to find Play afterwards is not that.
 
         The wait is not optional. Reset arrives from the event handler, which runs
         BETWEEN frames -- and between frames is exactly when a step is in flight
@@ -430,7 +440,7 @@ class App:
         self._trail_frame_counter = 0
         self.energy_baseline = None
         self.total_steps = 0
-        self.sim_playing = False
+        self.sim_playing = not self.system.spec.playback_controls
 
     # How long to wait before rebuilding automatically a second time. A value that
     # destroys every fresh state (a temperature far above the melt, say) would
@@ -641,9 +651,9 @@ class App:
                     # Shift-Tab walks the picker backwards, Tab forwards.
                     back = event.mod & pygame.KMOD_SHIFT
                     self._cycle_system(-1 if back else 1)
-                elif event.key == pygame.K_SPACE and self.system.spec.playback_controls:
+                elif event.key == pygame.K_SPACE:
                     self.sim_playing = not self.sim_playing
-                elif event.key == pygame.K_r and self.system.spec.playback_controls:
+                elif event.key == pygame.K_r:
                     self._reset_simulation()
                 elif event.key == pygame.K_c and self.orbit_cam is not None:
                     self.orbit_cam.toggle_auto()
@@ -728,7 +738,8 @@ class App:
         return True
 
     def _toggle_puller_attached(self):
-        """Grab / release the puller (B, or the joystick trigger). Released, the
+        """Grab / release the puller (B, or moving the focus off the viewport --
+        the joystick trigger is the run switch, on every playground). Released, the
         stick stops driving it and stops feeling it -- so the smoothers, which are
         still carrying the last frames of contact force, are reset rather than
         left to decay a force onto a hand that is no longer holding anything."""
@@ -737,23 +748,24 @@ class App:
         self.ff_smoother.reset()
         self.interaction_smoother.reset()
 
-    def _cycle_focus(self, step):
-        """Move the joystick's focus one place along [viewport, *sliders].
+    def _move_focus(self, move):
+        """Run one focus move (`move` is a ControlFocus method) and settle the
+        puller around it.
 
         Leaving the viewport RELEASES the puller, and coming back re-grabs it.
         That is not a convenience: the stick cannot hold a bead against a membrane
         and set a number at the same time, and a bead left attached while the
         stick drives a slider would be dragged across the box by every value
-        change. It is exactly the state the trigger toggles, so what the hand
-        feels when the focus leaves the scene is what it feels when the bead is
-        let go -- the force feedback goes limp because the released puller reports
-        no interaction force at all (see modes.py).
+        change. It is exactly the state B toggles, so what the hand feels when the
+        focus leaves the scene is what it feels when the bead is let go -- the
+        force feedback goes limp because the released puller reports no
+        interaction force at all (see modes.py).
 
         Only a puller THIS released is re-grabbed, so a bead the user let go of
-        with the trigger stays let go.
+        deliberately stays let go.
         """
         was_viewport = self.focus.on_viewport
-        self.focus.cycle(step)
+        move()
         if self.focus.on_viewport == was_viewport:
             return
         if not self.focus.on_viewport:
@@ -764,6 +776,31 @@ class App:
             self._toggle_puller_attached()
             self._focus_released_puller = False
 
+    def _move_focus_hat(self, hat):
+        """One flick of the hat -> one focus move, laid out like the screen.
+
+        Left / right cross between the two AREAS (the scene, the control panel);
+        up / down walk the panel's rows once it holds the focus. See
+        control_focus.py for why it is not one flat left/right cycle.
+
+        Diagonals are read on the horizontal axis alone: the hat is an eight-way
+        switch and a firm push at a corner is a push at the pane you were reaching
+        for, not an instruction to do both.
+        """
+        # The stick's own up/down axis walks these same rows, and at this instant
+        # it may be held right over -- on the viewport that axis was flying the
+        # camera. Suspend it, or entering the panel with the stick forward would
+        # step a row immediately (see RowStepper.reset).
+        self.focus.row_stepper.reset()
+        dx, dy = hat
+        if dx:
+            self._move_focus(self.focus.enter_stops if dx > 0
+                             else self.focus.to_viewport)
+        elif dy and not self.focus.on_viewport:
+            # dy = +1 is forward, away from the hand, and the stops are drawn top
+            # to bottom -- so forward is the row ABOVE, one place back in the list.
+            self._move_focus(lambda: self.focus.step_stop(-dy))
+
     def _poll_device_buttons(self):
         """Edge-detect the joystick's buttons and hat, and act on them.
 
@@ -771,19 +808,27 @@ class App:
         play/pause every frame it is down, and one flick of the hat would sweep
         the whole focus cycle.
 
-        Every action here has a keyboard twin (Space, R, B, Tab, the number keys),
+        Every action here has a keyboard twin (Space, R, Tab, the number keys),
         which is what keeps the two input modes honest -- the joystick reaches the
         same set of things, and this method is where the mapping is written down:
 
-            hat left / right   move the focus back / forward (see _cycle_focus)
-            1 (trigger)        Play/Pause where there is no puller, else grab it
-            2                  Reset the run to a fresh state
-            3 / 4              previous / next playground
+            hat               move the focus (see _move_focus_hat)
+            1 (trigger)       start / stop the simulation
+            2                 reset the run to a fresh state
+            3 / 4             previous / next playground
+
+        THE TRIGGER IS THE RUN SWITCH ON EVERY PLAYGROUND, and 2 resets every
+        playground. It used to depend on which kind of scene was loaded -- the run
+        switch on a playback one, grab-the-bead on an interactive one -- which made
+        the most prominent control on the device the one you could not predict.
+        Running and not running is the thing every scene has in common, so that is
+        what the trigger means everywhere; the puller is grabbed and released with
+        B, and by moving the focus off the viewport.
 
         The remote connect panel is modal, so while it is up the only buttons that
         still fire are 3/4: switching away is how you leave the card, and it costs
         the session nothing (the job, the tunnel and the server survive, see
-        RemotePanel.detach_system). Everything else -- the focus cycle, the trigger,
+        RemotePanel.detach_system). Everything else -- the focus, the trigger,
         reset -- belongs to a scene that is not running yet. The device state is
         still recorded, so a button held through the panel does not fire the moment
         the panel closes.
@@ -798,17 +843,12 @@ class App:
             self._cycle_system_buttons(fired)
             return
 
-        if hat_moved and hat[0]:
-            self._cycle_focus(hat[0])          # dx: -1 = left = back, +1 = forward
-        if self.system.spec.playback_controls:
-            # A playback playground has no puller, so the trigger is the run
-            # switch -- the one thing the scene does.
-            if config.JOYSTICK_PLAY_PAUSE_BUTTON in fired:
-                self.sim_playing = not self.sim_playing
-            if config.JOYSTICK_RESET_BUTTON in fired:
-                self._reset_simulation()
-        elif config.JOYSTICK_ATTACH_BUTTON in fired:
-            self._toggle_puller_attached()
+        if hat_moved and hat != (0, 0):
+            self._move_focus_hat(hat)
+        if config.JOYSTICK_PLAY_PAUSE_BUTTON in fired:
+            self.sim_playing = not self.sim_playing
+        if config.JOYSTICK_RESET_BUTTON in fired:
+            self._reset_simulation()
         # Last, and it returns: switching playground rebuilds the system out from
         # under everything above (and under the caller's `spec`).
         self._cycle_system_buttons(fired)
@@ -830,7 +870,11 @@ class App:
         value:
 
           * a focused slider -- left/right walks its value, with the deadzone and
-            the two speed bands from control_focus.py;
+            the two speed bands from control_focus.py, while up/down walks the
+            focus from row to row (the hat's up/down by another route -- see
+            ControlFocus.row_step). Both axes are the panel's while it holds the
+            focus, which is what lets a whole demo be driven without the hand
+            leaving the stick: pick the row, set the value, pick the next;
           * the turntable camera, on a playground with nothing to pull: the stick
             flies around the box and the twist axis dollies in and out;
           * the puller, which is what a game-mode playground has always done with
@@ -845,6 +889,11 @@ class App:
             return jx, jy, yaw
         if not self.focus.on_viewport:
             self._stick_target = "slider"
+            # Which row first, then its value: a frame that does both would move
+            # the value of a row the focus is already leaving.
+            step = self.focus.row_step(jy, dt, cross=jx)
+            if step:
+                self._move_focus(lambda: self.focus.step_stop(step))
             self.focus.drive(jx, dt)
             return 0.0, 0.0, 0.0
         # A turntable on a playback playground: nothing to pull, so the scene is
@@ -942,8 +991,17 @@ class App:
         # is orbiting the camera: in mouse mode the pointer position IS the
         # puller's deflection, so swinging the camera by hand would otherwise
         # fling the controlled particle across the box.
+        #
+        # And the same for the pointer merely RESTING on Play/Pause/Reset, which
+        # are drawn inside the sim view: since those buttons went onto the
+        # interactive playgrounds too, reaching for Play in mouse mode would
+        # otherwise drag the bead to the bottom of the frame on the way. Hovering
+        # is enough here, not just a press -- a position control is read every
+        # frame, so it is the travel that does the damage, not the click.
         ui_capturing_mouse = (self._orbit_dragging
-                              or any(s.dragging for s in self._sliders()))
+                              or any(s.dragging for s in self._sliders())
+                              or self.renderer.playback_hit(
+                                  pygame.mouse.get_pos()) is not None)
         # Device I/O is split into two debug fields, since on the joystick both are
         # blocking HID traffic that belongs in neither sim nor "other": "read" is
         # the stick poll here, "ff" is the force-feedback writes further down.
@@ -980,7 +1038,16 @@ class App:
         # coupling (fully cancelling it felt too detached). Spread across the
         # puller's atoms via puller_bead_count, since set_input_force applies its
         # force to each. Mouse mode keeps the full direct force-on-atom feel.
-        if self.input_mode == "joystick":
+        #
+        # NOT on a torque drive, where the two axes turn the puller's director
+        # instead of pushing it (spec.control_drive; see playground/spec.py). There
+        # the argument does not carry over: the user's command is an
+        # angular-momentum kick and the force field's restoring torque is integrated
+        # by LAMMPS, so the two are never summed and there is no double count to
+        # take out. Subtracting one from the other would simply cancel the physics
+        # the twist exists to feel -- and, since a restoring torque here can be
+        # several times a full-deflection command, invert it.
+        if self.input_mode == "joystick" and spec.control_drive != "torque":
             n_beads = max(1, self.system.puller_bead_count())
             md_fx, md_fy = self.system.get_interaction_force()
             cancel = (1.0 - config.JOYSTICK_MD_FORCE_FELT_FRACTION) / n_beads
@@ -1035,6 +1102,12 @@ class App:
                 "potential_terms": self.system.get_potential_terms(),
                 "total_potential_terms": self.system.get_total_potential_terms(),
                 "torque_signals": self.system.get_torque_signals(),
+                # The two torques as world vectors, for the two RINGS at the puller
+                # (a torque is a rotation in a plane, and that is what gets drawn --
+                # see Renderer._draw_torque_ring). None on every playground whose
+                # input is a force, which has real force vectors to draw there
+                # instead.
+                "torque_vectors": self.system.get_torque_vectors(),
                 "brightness": self.system.get_bead_brightness(),
                 # Only gathered when the colouring is on: it is a whole-system
                 # readout, and paying for it to be thrown away every frame is
@@ -1058,9 +1131,9 @@ class App:
 
         # ---- 4. hand the next step to the worker -----------------------------
         # From here to the next frame's wait(), the simulation is off limits.
-        # Playback systems (Play/Pause/Reset) step only while playing; every
-        # interactive puller system always steps.
-        should_step = self.sim_playing if spec.playback_controls else True
+        # Every playground steps only while playing -- see `sim_playing` for what
+        # differs between them, which is only where the flag starts.
+        should_step = self.sim_playing
         # Whether the run is going is pushed into the system, not just used here: a
         # remote system has to tell its server, which would otherwise integrate into
         # a socket nobody is reading. A local one does nothing with it.
@@ -1140,7 +1213,7 @@ class App:
             hbond_pairs=hbond_pairs, hud_lines=hud_lines, scene_3d=scene_3d,
             total_steps=self.total_steps, steps_per_frame=self.steps_per_frame,
             debug_line=self._debug_line,
-            playback_playing=(self.sim_playing if spec.playback_controls else None),
+            playback_playing=self.sim_playing,
             puller_attached=self.system.puller_attached(),
             # The cyan frame and the panel's "joystick drives:" line. None on the
             # mouse and keyboard, which have no focus to show.

@@ -103,6 +103,11 @@ TUNNEL = "tunnel"
 READY = "ready"
 FAILED = "failed"
 CLOSING = "closing"
+# Moving an allocation we already hold onto a different playground: not one of the
+# six numbered steps, because it skips every one of them -- the login, the queue,
+# the launch and the tunnel are all still standing, and only the far side's
+# simulation is rebuilt. See `switch_playground`.
+SWITCH = "switch"
 
 _STEP_ORDER = (LOGIN, DEPLOY, PROBE, ALLOCATE, LAUNCH, TUNNEL, READY)
 
@@ -270,6 +275,12 @@ class RemoteSession:
         # Which playground the server is told to build. Both ends must name the
         # same one or they would disagree about how many beads there are.
         self.playground_ref = playground_ref
+        # And what was ASKED for, before `_deploy_playground_file` rewrote a local
+        # path to where it landed on the cluster. Kept because it is the name the
+        # caller knows a playground by -- the app hands back a bundled key or the
+        # path the user typed, never the far side's copy -- and `serves` has to
+        # answer "is that the one you are running?" in the caller's terms.
+        self.playground_asked = playground_ref
         self.state = DOWN
         self.reached = DOWN                 # the furthest step this session got to
         self.detail = "not connected"
@@ -336,10 +347,35 @@ class RemoteSession:
     def connected(self):
         return self.state == READY and self.link is not None
 
+    @property
+    def holds_allocation(self):
+        """Is there a Slurm job of ours still out there?
+
+        The question the connect panel asks before deciding whether Connect means
+        "get a GPU" or "move the one we have" -- and the reason it is a job id and
+        not the state is that a link can die, or a switch can fail, with the
+        allocation perfectly intact behind it. Cleared by `_teardown`, which is the
+        one place the job is given back.
+        """
+        return self.job_id is not None and self.state not in (FAILED, CLOSING)
+
+    def serves(self, playground_ref):
+        """Whether this session's server is (or is being) built for that playground.
+
+        Compared against `playground_asked`, not `playground_ref`: the latter has
+        been rewritten to the far side's copy for a path, and the caller only ever
+        knows the name it gave.
+        """
+        return str(self.playground_asked) == str(playground_ref)
+
     def progress(self):
         """(step index, total) for a progress readout."""
         if self.state in _STEP_ORDER:
             return _STEP_ORDER.index(self.state) + 1, len(_STEP_ORDER)
+        if self.state == SWITCH:
+            # Everything but the last step is already done and staying done, so the
+            # bar sits where it genuinely is rather than resetting to empty.
+            return len(_STEP_ORDER) - 1, len(_STEP_ORDER)
         return (len(_STEP_ORDER), len(_STEP_ORDER)) if self.state == READY else (0, len(_STEP_ORDER))
 
     def diagnostics(self):
@@ -370,7 +406,9 @@ class RemoteSession:
             f"/{len(_STEP_ORDER)})",
             "error       " + _indented(self.error or "-", 12),
             "",
-            f"playground  {self.playground_ref}",
+            "playground  " + (
+                str(self.playground_asked) if self.playground_ref == self.playground_asked
+                else f"{self.playground_asked} (shipped to {self.playground_ref})"),
             f"login       {target.destination}",
             f"allocation  {target.partition}, {target.gpus} gpu, "
             f"{target.cpus_per_task} cores, {target.time}"
@@ -508,16 +546,146 @@ class RemoteSession:
         if self.state != READY or self.local_port is None:
             return None
         try:
+            # This one is not a connection failure but a bereavement: a process of
+            # ours has exited, and the server's own `scancel` means the allocation
+            # went with it. Handled separately below, because the difference decides
+            # whether `holds_allocation` may still be believed.
             self._check_still_alive()
             self.link = FrameLink.connect("127.0.0.1", self.local_port,
                                           self._token, timeout=15.0,
-                                          on_notice=self._say)
-        except (SessionError, LinkClosed, OSError) as exc:
+                                          on_notice=self._say,
+                                          playground=self.playground_ref)
+        except SessionError as exc:
+            self.link = None
+            self.error = str(exc)
+            self._say(f"FAILED: {exc}", FAILED)
+            self._teardown()
+            return None
+        except (LinkClosed, OSError) as exc:
+            # Both ends still look alive and the socket did not work out: the GPU is
+            # very probably still ours, so it is NOT given back on the strength of
+            # one refused connection. The panel offers another go, and Disconnect.
             self.link = None
             self.note_link_lost(str(exc))
             return None
         self._say(f"reconnected to {self.node} (job {self.job_id})", READY)
         return self.link
+
+    def switch_playground(self, ref):
+        """Put a DIFFERENT playground on the GPU this session already holds.
+
+        The whole point of the exercise, and the thing that makes two remote demos
+        practical to stand in front of: getting the allocation is the part that
+        queues, prompts for a one-time code and takes minutes, and it is not
+        repeated. The login, the deployed package, the job, the server process and
+        the tunnel all stay exactly as they are; the far side closes the simulation
+        it was holding and builds this one instead, on the same node (see
+        server.FrameServer.switch_playground). What that costs is the state of the
+        run being left behind, and nothing else.
+
+        Returns True if a switch was started. It runs on a worker thread, because
+        the far side's rebuild is LAMMPS' own setup on tens of thousands of beads --
+        tens of seconds during which this end must keep drawing at 60 fps, and
+        during which `state` is SWITCH and the panel says so.
+
+        A FAILED SWITCH DOES NOT GIVE THE GPU BACK. That is the one place this
+        departs from every other step in this file, and deliberately: the allocation
+        is still ours and still good, so the useful thing to offer is another go at
+        the switch, not another hour in the queue. The state goes to DOWN with the
+        reason, `holds_allocation` stays true, and the panel's Connect comes back
+        here rather than to `start` (see connect_playground).
+        """
+        if self.serves(ref):
+            return False                # already the one loaded; resume instead
+        return self._start_relink(ref)
+
+    def _start_relink(self, ref):
+        """Run `_run_switch` on a worker. Also the reconnect path: with `ref` the
+        playground already loaded it asks the server for nothing and just opens a
+        fresh socket, which is what a link that died on its own needs."""
+        if self.busy or not ref or self.local_port is None:
+            return False
+        if not self.holds_allocation:
+            return False
+        self._cancel.clear()
+        self.error = None
+        self.prompt = None
+        self.state = SWITCH
+        self.detail = (f"reconnecting to {ref}" if self.serves(ref)
+                       else f"switching the GPU to {ref}")
+        self._thread = threading.Thread(target=self._run_switch, args=(ref,),
+                                        name="remote-switch", daemon=True)
+        self._thread.start()
+        return True
+
+    def _run_switch(self, ref):
+        previous, previous_asked = self.playground_ref, self.playground_asked
+        try:
+            # Our own socket first: the server serves one client at a time, so it
+            # has to see this one close before it will accept the hello that asks
+            # for the new playground.
+            if self.link is not None:
+                self.link.close()
+                self.link = None
+            self.playground_ref = self.playground_asked = ref
+            self._say(f"asking {self.node} for {ref} on job {self.job_id}", SWITCH)
+            # A playground given as a path has to be re-shipped: `_deploy` only ran
+            # for the one this session started with. A bundled name came over with
+            # the package and this returns at once.
+            self._deploy_playground_file()
+            self._check_still_alive()
+            self.link = FrameLink.connect("127.0.0.1", self.local_port,
+                                          self._token, timeout=15.0,
+                                          on_notice=self._say,
+                                          playground=self.playground_ref)
+            self._say(f"streaming {ref} from {self.node} (job {self.job_id})",
+                      READY)
+        except SessionError as exc:
+            # A process of ours has exited (see _check_still_alive), which for the
+            # server means its own `scancel` has already ended the allocation. There
+            # is nothing left to switch onto, so give the rest back and let the panel
+            # start a fresh session -- the same thing every other step does when it
+            # fails, and for the same reason.
+            self.playground_ref, self.playground_asked = previous, previous_asked
+            self.error = str(exc)
+            self._say(f"FAILED: could not switch to {ref}: {exc}", FAILED)
+            self._teardown()
+        except (LinkClosed, OSError) as exc:
+            self.playground_ref, self.playground_asked = previous, previous_asked
+            self.link = None
+            self.error = str(exc)
+            self.state = DOWN
+            self._say(f"could not switch to {ref}: {exc} -- the allocation "
+                      f"(job {self.job_id}) is still held")
+        except Exception as exc:                      # noqa: BLE001 -- reported
+            self.playground_ref, self.playground_asked = previous, previous_asked
+            self.link = None
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.state = DOWN
+            self._say(f"could not switch to {ref}: {self.error}")
+        finally:
+            self.prompt = None
+
+    def connect_playground(self, ref):
+        """What the panel's Connect button means, whichever situation it is in:
+        get a GPU and put `ref` on it, or move the GPU we already hold to `ref`.
+
+        One method rather than two buttons, because from where the user stands they
+        are one action -- "run this one" -- and which of the two it takes is a fact
+        about the session, not a decision they should have to make.
+        """
+        # A held allocation covers three cases and one answer: streaming another
+        # playground, holding a link to this one that has died, or sitting there
+        # after a switch that failed. All three are "open a socket, naming what we
+        # want", which is what `_start_relink` does -- on a worker, because the far
+        # side may have to build.
+        if self.holds_allocation and self._start_relink(ref):
+            return True
+        if self.busy:
+            return False
+        self.playground_ref = self.playground_asked = ref
+        self.start()
+        return True
 
     def note_link_lost(self, reason):
         """Record that the link died on its own -- the job hit its time limit, the
@@ -690,6 +858,14 @@ class RemoteSession:
         """
         ref = self.playground_ref
         if not (os.sep in ref or ref.endswith(".py")):
+            return
+        if ref.startswith(self.target.deploy_dir.rstrip("/") + "/"):
+            # ALREADY SHIPPED: this is where a previous call put it, so `ref` is a
+            # path on the FAR side. Re-sending it would look for it under that path
+            # on this machine -- which on a real cluster does not exist, and on the
+            # single-machine tests is the deployed copy itself, which `cat >` would
+            # truncate before reading. Reachable because `switch_playground` can be
+            # asked for a ref that has been through here before.
             return
         local = os.path.abspath(os.path.expanduser(ref))
         if not os.path.isfile(local):

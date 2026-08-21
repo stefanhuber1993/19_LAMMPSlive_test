@@ -11,6 +11,7 @@ The second half builds a small one in LAMMPS, because the deck has a shape nothi
 else in this codebase has: bonded particles arriving through a molecule template,
 after the atoms the runtime placed itself.
 """
+import builtins
 import math
 
 import numpy as np
@@ -19,7 +20,8 @@ import pytest
 from lammps_live.playground import registry
 from lammps_live.playground.scenario import VesiclePolymer
 from lammps_live.playground.state import (icosphere_faces, icosphere_spacing,
-                                          lattice_ring)
+                                          lattice_ring,
+                                          nearest_neighbour_distances)
 
 # Small enough to build in a second, and shaped like the real one: an icosphere
 # with several rings inside it.
@@ -49,6 +51,31 @@ def test_icosphere_spacing_is_the_real_nearest_neighbour_distance():
         d, _ = cKDTree(centres).query(centres, k=2)
         measured = float(d[:, 1].mean())
         assert icosphere_spacing(nu) == pytest.approx(measured, rel=0.02)
+
+
+def test_nearest_neighbour_distances_are_exact():
+    """The pure-numpy sweep that replaced the KD-tree, against brute force. Small
+    enough clouds that the O(N^2) oracle is the cheap way round."""
+    rng = np.random.default_rng(3)
+    clouds = [
+        rng.normal(size=(2, 3)),
+        rng.normal(size=(400, 3)),
+        icosphere_faces(6)[0],
+        # Coincident points, and a cloud flat in z -- both make the sweep's band
+        # degenerate, and both must still come out exact.
+        np.zeros((16, 3)),
+        np.column_stack([rng.normal(size=(60, 2)), np.zeros(60)]),
+        # Two clumps far apart on z: the first band is far wider than the spacing
+        # inside a clump, which is the other side of the adaptive band.
+        np.vstack([rng.normal(size=(80, 3)), rng.normal(size=(80, 3)) + (0, 0, 400)]),
+    ]
+    for pts in clouds:
+        d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+        np.fill_diagonal(d, np.inf)
+        assert np.allclose(nearest_neighbour_distances(pts), d.min(axis=1)), (
+            f"{pts.shape} cloud")
+    # One point has no neighbour to be near.
+    assert nearest_neighbour_distances(np.zeros((1, 3))).tolist() == [0.0]
 
 
 def test_icosphere_spacing_is_bounded():
@@ -175,6 +202,24 @@ def test_render_tints_leave_the_membrane_banded_and_paint_the_polymer():
     assert np.allclose(first[0], tints[n_mem + per_ring - 1: n_mem + per_ring, :3],
                        atol=30)
     assert np.ptp(first[:, 0]) > 100
+
+
+def test_the_build_runs_with_no_scipy_installed(monkeypatch):
+    """The remote server is given numpy and nothing else -- scipy is the client's,
+    because the analysis is what needs it. A scipy import anywhere under `build`
+    is a ModuleNotFoundError that only shows up once the cluster has allocated a
+    node, which is how the last one was found, so pin it here instead."""
+    real_import = builtins.__import__
+
+    def no_scipy(name, *args, **kwargs):
+        if name == "scipy" or name.startswith("scipy."):
+            raise ModuleNotFoundError("No module named 'scipy'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_scipy)
+    icosphere_spacing.cache_clear()   # or a warm cache hides the import
+    scenario, params, build = _built()
+    assert len(build.positions) == scenario.particle_count(params)
 
 
 # --- the deck -----------------------------------------------------------------

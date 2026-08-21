@@ -14,7 +14,8 @@ import pytest
 from lammps_live.playground import registry
 from lammps_live.playground.verify import verify_system
 
-PLAYGROUNDS = ["mesomem_patch", "mesomem_sheet", "mesomem_assembly", "mesomem_rod",
+PLAYGROUNDS = ["mesomem_bead", "mesomem_patch", "mesomem_patch_torque",
+               "mesomem_sheet", "mesomem_assembly", "mesomem_rod",
                "lj_argon", "cu_deposition", "nacl"]
 
 
@@ -127,6 +128,145 @@ def test_pinned_axis_stays_pinned(patch):
     pos3 = patch.controlled_position()
     assert pos3[patch.mode.pin_axis] == pytest.approx(0.0, abs=1e-12)
     patch.set_input_force(0.0, 0.0)
+
+
+# --- the torque drive ---------------------------------------------------------
+# The other thing the stick can be: two axes that turn the puller's director
+# instead of pushing it (Control.drive = "torque"). What matters is that the
+# mapping is the one the playground declared -- get an axis or a sign wrong and the
+# demo is merely confusing rather than broken -- and that nothing pushes the bead.
+
+@pytest.fixture(scope="module")
+def twist():
+    system = registry.build("mesomem_patch_torque")
+    yield system
+    system.close()
+
+
+def _director(system, i=0):
+    return np.array(system.get_dipoles_3d()[i], dtype=float)
+
+
+def test_each_input_axis_turns_the_director_the_declared_way(twist):
+    """The trackball mapping: stick right tips the director toward +x, stick
+    forward tips it away into the screen (+y). See Control.torque_axes."""
+    for axis, (fx, fy), expect in ((0, (1.0, 0.0), 0), (1, (0.0, 1.0), 1)):
+        twist.reset()
+        twist.set_input_force(*(v * twist.spec.max_input_force for v in (fx, fy)))
+        for _ in range(30):
+            twist.step(10)
+        n = _director(twist)
+        assert n[expect] > 0.3, f"axis {axis} did not tip the director: {n}"
+        assert n[2] < 0.95, "and it came off +z"
+    twist.set_input_force(0.0, 0.0)
+
+
+def test_nothing_pushes_the_bead(twist):
+    """A torque drive applies no force at all: where the bead goes is the
+    membrane's answer. Its own neighbours hold it, so it stays put."""
+    twist.reset()
+    start = twist.controlled_position().copy()
+    twist.set_input_force(twist.spec.max_input_force, 0.0)
+    for _ in range(30):
+        twist.step(10)
+    moved = np.linalg.norm(twist.controlled_position() - start)
+    assert moved < 0.5, f"the bead travelled {moved:.2f} sigma with no force on it"
+    twist.set_input_force(0.0, 0.0)
+
+
+def test_the_reaction_is_the_torque_and_it_opposes_the_command(twist):
+    """What reaches the hand is the pair style's own restoring torque about the two
+    driven axes -- read, not reconstructed -- and it pushes back."""
+    twist.reset()
+    twist.set_input_force(twist.spec.max_input_force, 0.0)
+    for _ in range(20):
+        twist.step(10)
+    reaction = twist.get_interaction_force()
+    assert reaction[0] < -0.5, f"the membrane is not resisting: {reaction}"
+    applied, arc = twist.get_torque_signals()
+    assert applied == pytest.approx(1.0)
+    assert -1.0 <= arc < 0.0, "the arc reads the same axis, with the same sign"
+    twist.set_input_force(0.0, 0.0)
+
+
+def test_the_torque_vectors_are_axial_and_normalized(twist):
+    """What the two 3D arrows are drawn from. A torque is an axial vector, so these
+    point along the axes the rotations are about -- and each is scaled to its own
+    display maximum, or the input would be a stub beside the reaction."""
+    control = twist.playground.effective_control()
+    twist.reset()
+    twist.set_input_force(control.max_input_torque, 0.0)
+    for _ in range(20):
+        twist.step(10)
+
+    applied, reaction = twist.get_torque_vectors()
+    assert applied.shape == (3,) and reaction.shape == (3,)
+    # Input axis 1 is +y (Control.torque_axes[0]), at full deflection -> exactly 1.
+    assert applied[1] == pytest.approx(1.0)
+    assert applied[0] == pytest.approx(0.0) and applied[2] == pytest.approx(0.0)
+    # The reaction opposes it about that axis, and carries the raw ratio to the
+    # display ceiling -- which it is allowed to exceed.
+    assert reaction[1] < 0.0
+    raw = twist.get_interaction_force()[0]
+    assert reaction[1] == pytest.approx(raw / control.reaction_torque_max, rel=1e-6)
+    twist.set_input_force(0.0, 0.0)
+
+
+def test_a_released_puller_draws_no_torque_arrows(twist):
+    """Nothing is holding it, so there is no hand and no reaction to draw -- the
+    same rule the arcs and the force arrows follow."""
+    twist.reset()
+    twist.set_input_force(twist.spec.max_input_force, 0.0)
+    twist.step(10)
+    assert twist.get_torque_vectors() is not None
+    twist.toggle_puller_attached()
+    try:
+        twist.step(10)
+        assert twist.get_torque_vectors() is None
+        assert twist.get_torque_signals() is None
+    finally:
+        twist.toggle_puller_attached()
+        twist.set_input_force(0.0, 0.0)
+
+
+def test_a_force_drive_has_no_torque_vectors(patch):
+    """It has real force vectors to draw at the puller instead."""
+    assert patch.get_torque_vectors() is None
+
+
+def test_a_torque_drive_is_unconfined_and_draws_no_net(twist):
+    """No plane, no leash, so no net -- the scene draws one only where there is a
+    boundary to mark."""
+    assert twist.get_control_grid() is None
+    assert twist.spec.control_drive == "torque"
+    assert twist.spec.max_input_force == pytest.approx(
+        twist.playground.effective_control().max_input_torque)
+
+
+def test_the_twist_axis_is_unused_on_a_torque_drive(twist):
+    """Two axes already cover both of a director's degrees of freedom, and a third
+    rotation -- about the director itself -- is the identity. A twist that also
+    steered would fight the axis it shared."""
+    twist.reset()
+    twist.set_input_force(0.0, 0.0)
+    twist.steer_orientation(1.0, 0.016)
+    before = _director(twist)
+    for _ in range(20):
+        twist.step(10)
+    assert np.linalg.norm(_director(twist) - before) < 0.2
+
+
+def test_the_force_drive_still_steers_in_plane_only(patch):
+    """The regression guard for the constrain() split: on a force drive the twist
+    axis still turns the director, and still only within the control plane."""
+    patch.set_input_force(0.0, 0.0)
+    patch.steer_orientation(1.0, 0.016)
+    for _ in range(20):
+        patch.step(10)
+    n = _director(patch)
+    assert abs(n[patch.mode.pin_axis]) < 1e-9, "the director left the control plane"
+    assert abs(n[0]) > 0.05, "the twist axis did not turn it"
+    patch.steer_orientation(0.0, 0.016)
 
 
 # --- every playground builds, steps and reports -------------------------------

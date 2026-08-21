@@ -71,7 +71,10 @@ def make_spec(playground, mode_name=None, preset=None):
             fmt="{:.2f}", advanced=True),
         melt_temp=playground.melt_temp,
         force_feedback=playground.force_feedback,
-        max_input_force=control.max_input_force if mode_name == "game" else 0.0,
+        # One ceiling for a unit of input deflection, in whichever domain this
+        # control drives -- a force, or a torque (see Control.input_scale).
+        max_input_force=control.input_scale if mode_name == "game" else 0.0,
+        control_drive=control.drive if mode_name == "game" else "force",
         puller_speed_cap=(playground.puller_speed_cap
                           or 0.06 * playground.lattice_spacing / scenario.timestep),
         crystal_color=playground.crystal_color,
@@ -104,6 +107,32 @@ SMOOTHING_KEY = "view_smoothing"
 # third of a second at 60 Hz -- enough to flatten the rattle completely while a
 # real rearrangement still reads as prompt.
 SMOOTHING_MAX_FRAMES = 20
+# Where the slider STARTS, in the scenario's own time units (tau on every
+# playground that offers it -- they are all the reduced-unit MesoMem ones).
+#
+# Not zero, which is where it used to start. Every one of these scenes is watched
+# for a slow collective change -- a membrane healing, a rod being engulfed, a box
+# assembling -- and at the default near-frozen temperature the per-bead rattle on
+# top of that is still the fastest thing on screen, so an unsmoothed picture reads
+# as noisier than the physics actually is. 0.2 tau is a few frames' worth on every
+# scenario here: it takes the shimmer off without any visible lag on a real
+# rearrangement, which is what the slider's top end (a third of a second) starts to
+# have. Turn it to zero to see every bead's own motion, which is still the right
+# thing when a single bead IS the subject.
+SMOOTHING_DEFAULT_TAU = 0.2
+
+
+def smoothing_default(scenario):
+    """The starting smoothing span for a scenario, in its own time units.
+
+    Clamped into the slider's range: the span is expressed in simulated time and
+    the range is `SMOOTHING_MAX_FRAMES` of the scenario's own per-frame slice, so
+    a scenario advancing very little per frame could have a top end below the
+    default. Every bundled playground's top end is comfortably above it (the
+    tightest, the rod's, is 0.6 tau), but a new one need not be.
+    """
+    return min(SMOOTHING_DEFAULT_TAU,
+               SMOOTHING_MAX_FRAMES * scenario.sim_time_per_frame)
 
 
 # The other view-only key, and the opposite effect: the synthetic thermal rattle
@@ -131,7 +160,8 @@ def smoothing_slider_specs(playground, scenario):
     if playground.trajectory_smoothing:
         per_frame = scenario.sim_time_per_frame
         specs.append(SliderSpec("Smoothing", 0.0,
-                                SMOOTHING_MAX_FRAMES * per_frame, 0.0,
+                                SMOOTHING_MAX_FRAMES * per_frame,
+                                smoothing_default(scenario),
                                 fmt="{:.2f}", unit=" tau", key=SMOOTHING_KEY,
                                 advanced=True))
     if playground.remote is not None:
@@ -181,25 +211,21 @@ class PlaygroundSystem(MDSystem3D):
                                  **self._analysis_kwargs)
         # Frame-state cache: several readouts want the same id-ordered gather over
         # every particle, and rebuilding it per readout is what made the old code
-        # walk the whole system several times a frame.
+        # walk the whole system several times a frame. All of it is declared by
+        # `_invalidate_frame_caches`, which is also what a rebuild calls -- see
+        # there for why that matters more than it looks.
         self._frame = 0
-        self._state = None
-        self._state_frame = -1
-        self._order_cache = None
-        self._order_frame = -1
+        self._invalidate_frame_caches()
         # Visual-only trajectory smoothing (see smoothing.py). Its own frame cache,
         # deliberately separate from the analysis one: the filtered coordinates must
         # reach the renderer and NOTHING else, so the two states cannot share a
         # slot that an observable might pick up by accident.
-        self._smoothing_tau = 0.0
+        # Started at the slider's own default rather than at zero, so a system
+        # driven without the app (a test, the remote server) smooths the same way
+        # the app's first frame will ask it to.
+        self._smoothing_tau = (smoothing_default(self.scenario)
+                               if playground.trajectory_smoothing else 0.0)
         self._smoother = TrajectorySmoother()
-        self._render_cache = None
-        self._render_frame = -1
-        # Same once-per-frame caching for the smoothed bead energies (see
-        # _smooth_energies), kept separate because the colouring is read only while
-        # it is switched on.
-        self._energy_cache = None
-        self._energy_render_frame = -1
         # The cluster colouring's labelling (see clustering.py). Paced by frame
         # count rather than cached per frame -- unlike the energies, recomputing
         # it every frame would be both expensive and pointless, since it is a
@@ -295,6 +321,10 @@ class PlaygroundSystem(MDSystem3D):
         if self.host_profile is not None:
             cmdargs += list(self.host_profile.lammps_args)
         self.lmp = lammps(cmdargs=cmdargs)
+        # A new instance: nothing cached about the old one's local arrays may be
+        # read against it (`_pick_controlled` is the first thing that would, on a
+        # scenario whose atoms LAMMPS places itself). See _invalidate_frame_caches.
+        self._invalidate_frame_caches()
         try:
             self._issue_setup(seed, rng, build, params, sparams)
         except BaseException:
@@ -424,6 +454,15 @@ class PlaygroundSystem(MDSystem3D):
         # The cell may have been rescaled by a barostat during settling, so read
         # it back rather than trusting the requested geometry.
         self._refresh_box_from_lammps()
+        # AGAIN, and this one is not redundant even though the instance was fresh
+        # a moment ago: the deck above has RUN (the settle, and `run 0` at the
+        # least), and a run is free to reorder the local arrays -- while
+        # `_pick_controlled` may already have built a permutation from before it,
+        # on a scenario whose atoms LAMMPS places itself. `on_built` is the first
+        # reader, and what it reads is the controlled particle's own coordinate, so
+        # the permutation it uses has to be this instance's, taken after
+        # everything that could have reordered it.
+        self._invalidate_frame_caches()
         if hasattr(self.mode, "on_built"):
             self.mode.on_built()
         self._rdf = self._make_rdf()
@@ -431,10 +470,6 @@ class PlaygroundSystem(MDSystem3D):
         # A rebuild is a new set of particles; a filter still holding the old ones
         # would drag the first frames of the new scene toward the previous one.
         self._smoother.reset()
-        self._render_cache = None
-        self._render_frame = -1
-        self._energy_cache = None
-        self._energy_render_frame = -1
         self._clusters.reset()
         self._sim_time = 0.0
         # Populate the panels for the paused first frame (sim mode shows its fresh
@@ -582,6 +617,39 @@ class PlaygroundSystem(MDSystem3D):
         self.lmp.command(cmd)
 
     # ---- id <-> local-index bookkeeping -------------------------------------
+
+    def _invalidate_frame_caches(self):
+        """Drop everything cached "for this frame". Called on every build.
+
+        THE FRAME COUNTER IS NOT ENOUGH OF A KEY, and that is the whole reason
+        this is a method rather than five assignments at the top of `_setup`.
+        Each of these caches is keyed on `self._frame`, which is right for the
+        steady state -- one gather per frame, however many readouts ask -- but
+        `_frame` is a clock, not an identity: it does not move when the LAMMPS
+        instance underneath it is replaced, nor when a settle inside a build
+        reorders the local arrays. Either of those makes a cache that is still
+        "for this frame" describe particles that no longer exist.
+        `_order_cache` is the one that bites, because it is a permutation of LOCAL
+        INDICES: served stale, `controlled_local` names some other particle
+        entirely, `GameMode.on_built` reads ITS coordinate as the control plane,
+        and the next `constrain()` teleports the real controlled bead most of a
+        sigma onto that plane -- on top of a neighbour, which is a blow-up on the
+        first frame after Reset. That was a real bug, and it is what
+        tests/test_faults.py's rebuild test now pins.
+        """
+        self._state = None
+        self._state_frame = -1
+        self._order_cache = None
+        self._order_frame = -1
+        # Visual-only trajectory smoothing's own frame cache, deliberately
+        # separate from the analysis one: the filtered coordinates must reach the
+        # renderer and NOTHING else, so the two states cannot share a slot that an
+        # observable might pick up by accident. Same again for the smoothed bead
+        # energies, which are read only while that colouring is switched on.
+        self._render_cache = None
+        self._render_frame = -1
+        self._energy_cache = None
+        self._energy_render_frame = -1
 
     def _order(self):
         """Local indices in stable atom-id order.
@@ -842,6 +910,9 @@ class PlaygroundSystem(MDSystem3D):
 
     def get_torque_signals(self):
         return self.mode.torque_signals()
+
+    def get_torque_vectors(self):
+        return self.mode.torque_vectors()
 
     def get_thermo_state(self):
         # Hold the last finite reading once unstable, so the plots and the

@@ -160,6 +160,17 @@ class SystemSpec:
     # start/stop the automatic orbit), for a scene with nothing to steer. None ->
     # the fixed camera the scenario chose. A render_style.CameraOrbit.
     camera_orbit: object = None
+    # WHAT THE INPUT DEVICE'S TWO AXES DRIVE: "force" (they push the puller) or
+    # "torque" (they turn its director, and nothing pushes it). See
+    # playground/spec.py's Control.drive, which is where a playground says so.
+    #
+    # It reaches the SystemSpec because two things above the system have to know,
+    # and neither can ask the mode: the renderer draws the reaction as two straight
+    # arrows (force) or as two rings in the plane each rotation happens in (torque)
+    # accordingly and labels the header line to match, and the app's joystick loop
+    # cancels part of the measured reaction from what it applies -- which is a
+    # force-domain correction with no counterpart here (see App._tick).
+    control_drive: str = "force"
 
 
 class MDSystem(ABC):
@@ -339,6 +350,15 @@ class MDSystem(ABC):
         is the force field's restoring torque on the puller. Both are the
         component projected onto the 2D plane the scene depicts. None (default)
         -> no torque arrows (systems whose puller has no meaningful orientation)."""
+        return None
+
+    def get_torque_vectors(self):
+        """Optional: (applied, reaction) torques as world 3-vectors -- the axes the
+        two rotations are about, by the right-hand rule -- each normalized so 1.0 is
+        its own display maximum. Drawn as the two arrows at the puller on a system
+        whose input is a TORQUE rather than a force (spec.control_drive); a force
+        drive has real force vectors to draw there instead and returns None, which
+        is also the default."""
         return None
 
     def get_box_periodic(self):

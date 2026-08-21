@@ -49,9 +49,65 @@ class Control:
     inside the force field's interaction range: a particle dragged past the cutoff
     detaches and floats free instead of being pulled back, and the snap-back on
     release is the whole point.
+
+    `drive` is WHAT the two input axes are: a force that moves the particle, or a
+    torque that turns its director. See the field below -- the two are alternatives
+    on the same stick, not a mode switch on top of one another.
     """
     atom: str = "nearest_center"
     plane: str = "xz"
+    # WHAT THE STICK'S TWO AXES DO.
+    #
+    #   "force"   they push the particle, in the control plane. The particle is
+    #             normally held on that plane inside the leash (see `confine`),
+    #             its director is steered separately by the twist axis, and the
+    #             thing rendered back to the hand is the force field's reaction
+    #             FORCE. This is the shipped default and what every playground
+    #             that predates the choice does.
+    #   "torque"  they turn the particle's director, about the two axes named in
+    #             `torque_axes`, and no force is applied to it at all. The
+    #             particle then moves only under the force field -- it is an
+    #             ordinary particle of the simulation that you happen to be able
+    #             to twist -- and what is rendered back to the hand is the
+    #             reaction TORQUE. The twist axis is unused, because two axes
+    #             already cover both of a director's degrees of freedom and a
+    #             director has no third (spinning it about itself is the identity).
+    #
+    # Everything downstream is the same pipeline in the other domain: the input
+    # ceiling (`max_input_torque`), the reaction signal, the force-feedback
+    # shaping, the joystick's partial cancellation of the measured reaction. The
+    # only thing that changes shape is the drawing, which swaps the two straight
+    # arrows for the two circular arcs it already had (see the renderer).
+    drive: str = "force"
+    # Which world axes the two input axes torque about, when `drive` is "torque".
+    # Signed axis names: "y" and "-x" mean +y and -x.
+    #
+    # THE DEFAULT IS THE TRACKBALL MAPPING for the scenes here -- an xz control
+    # plane, a camera on -y, +z up on screen -- and it is worth writing out, since
+    # the intuition and the arithmetic disagree about the sign. Think of the bead
+    # as a ball under your palm and the director as a pin standing out of it:
+    #
+    #   stick right  the top of the ball goes right, so the pin tips toward +x.
+    #                d(n)/dt = w x n, and (+y) x (+z) = +x, so w is +y.
+    #   stick fwd    the top goes away from you, toward +y (into the screen), so
+    #                the pin tips that way. (-x) x (+z) = +y, so w is -x.
+    #
+    # A scenario framed from a different angle sets its own pair. The rule for
+    # picking one: name the two axes PERPENDICULAR to where the directors start,
+    # never the one they lie along -- a torque about the director itself does
+    # nothing, so that pair would leave one input axis dead at rest.
+    torque_axes: tuple = ("y", "-x")
+    # The peak torque at full deflection of any input device, for `drive` of
+    # "torque" -- the rotational counterpart of `max_input_force`, and the one
+    # honest "how hard can I twist" number. Both are here rather than one shared
+    # field because they are in different units and a playground that switched
+    # between them would silently reuse the wrong magnitude.
+    #
+    # It shares `yaw_torque`'s default because it is the same kind of number: the
+    # angular-momentum kick a full deflection is worth, per frame. A twist that
+    # flips a director over the tilt term's barrier at 1.0 on the twist axis flips
+    # it at 1.0 here too.
+    max_input_torque: float = 1.0
     leash: tuple = (3.0, 3.0)
     # How much of each leash half-extent the REPORTED force fades out over as the
     # particle approaches that boundary, as a fraction. The leash is the app's
@@ -92,6 +148,17 @@ class Control:
     # fills the arc.
     reaction_torque_max: float = 6.0
     grid_step: float = 0.5
+
+    @property
+    def drives_torque(self):
+        return self.drive == "torque"
+
+    @property
+    def input_scale(self):
+        """The ceiling a unit of input deflection is multiplied by, whichever
+        domain this control drives in. One number, so the app, the HUD and the
+        arrows all read the same one and nothing has to ask which drive it is."""
+        return self.max_input_torque if self.drives_torque else self.max_input_force
 
     @property
     def u_range(self):

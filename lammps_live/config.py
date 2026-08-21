@@ -45,14 +45,16 @@ FF_SMOOTHING_TAU = 0.1   # seconds
 # force and seeing its effect. See stepper.py. False = take turns.
 OVERLAP_SIM_AND_RENDER = True
 
-# Joystick button that grabs / releases the puller, the same action as the B key.
-# 1 is the trigger on the Sidewinder FF2.
-JOYSTICK_ATTACH_BUTTON = 1
-# The trigger's other job: on a playback playground (Play/Pause/Reset, i.e. sim
-# mode) there is no puller to grab, so the same button is the run switch. One
-# button, one meaning per playground -- "the main thing this scene does".
+# Start / stop the simulation, the same action as the Space key. 1 is the trigger
+# on the Sidewinder FF2, and this is what it means on EVERY playground: the
+# trigger is the most prominent control on the device, so it has to mean the one
+# thing every scene has in common. (It used to double as grab-the-bead on the
+# interactive playgrounds, which made the same finger do two unrelated things
+# depending on which scene was loaded. The puller is B, and moving the focus off
+# the viewport.)
 JOYSTICK_PLAY_PAUSE_BUTTON = 1
-# Reset the run to a fresh state, the same action as the R key.
+# Reset the run to a fresh state, the same action as the R key. Every playground,
+# for the same reason as the trigger.
 JOYSTICK_RESET_BUTTON = 2
 # Switch playground, the same action as Tab (forward) and the number keys.
 JOYSTICK_PREV_PLAYGROUND_BUTTON = 3

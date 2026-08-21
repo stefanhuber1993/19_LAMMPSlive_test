@@ -36,6 +36,11 @@ STYLE = DEFAULT_STYLE.varied(
     dof_focus=0.5,          # sharp plane mid-scene, not near the front
     dof_range=1.0,          # the whole span to go out of focus
     dof_bokeh_px=2.5,       # (8.0 by default) -- 0 switches DoF off entirely
+    # NOTE both of these are overwritten by the `.on_light()` below, which carries
+    # its own box and net alphas -- so this patch is drawn with the light theme's
+    # (190 and 120), not with these. Left as they are because that IS what the
+    # scene has always looked like and they are not worth a behaviour change here;
+    # mesomem_bead, which genuinely needs no box, varies them AFTER on_light().
     box_alpha=0,
     net_alpha=200,
     cue_end=0.9,            # fade completes only at the very back

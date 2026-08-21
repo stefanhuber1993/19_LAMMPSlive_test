@@ -83,6 +83,9 @@ class StubSession:
     def __init__(self, target, playground_ref="", on_log=None, log_lines=None):
         self.target = target.resolved()
         self.playground_ref = playground_ref
+        # The real session keeps both: what was asked for, and where a path landed
+        # on the cluster. Nothing is deployed here, so they never diverge.
+        self.playground_asked = playground_ref
         self.state = session_mod.DOWN
         self.detail = "not connected"
         self.error = None
@@ -95,11 +98,44 @@ class StubSession:
         self.shutdowns = 0
         self.cancels = 0
         self.lost = []
+        self.switches = []
 
     @property
     def busy(self):
         return self.state not in (session_mod.DOWN, session_mod.READY,
                                   session_mod.FAILED)
+
+    # The two questions the panel asks about a session it is thinking of reusing:
+    # is there still a job, and is it running the playground on screen? Same
+    # answers as the real thing -- see RemoteSession.holds_allocation / serves.
+    @property
+    def holds_allocation(self):
+        return self.job_id is not None and self.state not in (session_mod.FAILED,
+                                                              session_mod.CLOSING)
+
+    def serves(self, ref):
+        # The real one compares what was ASKED for, since a path gets rewritten to
+        # the far side's copy on deploy; nothing is deployed here, so the two are
+        # the same string.
+        return str(self.playground_ref) == str(ref)
+
+    def switch_playground(self, ref):
+        """Recorded, and applied at once -- the real one does it on a worker while
+        the far side rebuilds, which the panel only sees as `busy` then READY."""
+        if self.serves(ref):
+            return False
+        self.switches.append(ref)
+        self.playground_ref = self.playground_asked = ref
+        self.link = None
+        self.state = session_mod.SWITCH
+        return True
+
+    def connect_playground(self, ref):
+        if self.holds_allocation:
+            return self.switch_playground(ref) or self.reopen_link() is not None
+        self.playground_ref = self.playground_asked = ref
+        self.start()
+        return True
 
     def progress(self):
         return (0, 7)
@@ -139,7 +175,12 @@ class StubSession:
         if self.state != session_mod.READY:
             return None
         if not self.alive:
+            # A process of ours has exited, so the real session gives the rest back
+            # rather than claiming to still hold a GPU that Slurm has taken (see
+            # RemoteSession.reopen_link's two failure paths).
             self.note_link_lost("the job ended")
+            self.state = session_mod.FAILED
+            self.job_id = None
             return None
         self.reopened += 1
         self.link = StubLink()
@@ -385,9 +426,13 @@ def test_switching_away_mid_connect_does_not_cancel_the_queue_wait(panel):
     rebuilt.close()
 
 
-def test_a_different_playground_does_not_inherit_the_session(panel, tmp_path):
-    """Resuming is per playground: both ends have to agree on which one, or they
-    would disagree about how many beads there are."""
+def test_another_playground_keeps_the_gpu_and_offers_to_move_it(panel, tmp_path):
+    """The point of the whole exercise: one allocation, several demos.
+
+    Cycling to the other remote playground must not give the GPU back and must not
+    ask for another one -- the run you left is still running, and the card offers to
+    move the allocation rather than to queue for a second.
+    """
     p, _system, session = panel
     _connect(panel)
     p.detach_system()
@@ -397,7 +442,80 @@ def test_a_different_playground_does_not_inherit_the_session(panel, tmp_path):
 
     p.attach_system(system2, str(other))
 
-    assert p.session is not session
-    assert session.shutdowns == 1
+    assert p.session is session, "same session -- the GPU is not given back"
+    assert session.shutdowns == 0 and session.started == 0
+    assert p.visible, "the card is up: moving the GPU costs the other run"
+    assert not system2.connected, "and nothing happens until Connect is pressed"
+    assert p._is_switch()
+    assert "running" in p._held_note()
+    system2.close()
+
+
+def test_connect_on_the_other_playground_moves_the_gpu(panel, tmp_path):
+    p, _system, session = panel
+    _connect(panel)
+    p.detach_system()
+    other = tmp_path / "other_playground.py"
+    other.write_text(PLAYGROUND_SOURCE)
+    system2 = registry.build(str(other))
+    p.attach_system(system2, str(other))
+
+    p._act("connect")
+
+    assert session.started == 0, "no second allocation"
+    assert [os.path.basename(s) for s in session.switches] == \
+        ["other_playground.py"]
+    # The far side rebuilds while this end keeps drawing -- frames go by with the
+    # session mid-switch, and nothing is handed over.
+    p.update()
+    assert not system2.connected and p.visible
+    # When it lands, the link goes to the system on screen and the card gets out of
+    # the way.
+    session.state = session_mod.READY
+    session.link = StubLink()
+    p.update()
+    assert system2.connected and not p.visible
+    system2.close()
+
+
+def test_a_link_landing_for_another_playground_is_not_handed_over(panel, tmp_path):
+    """A switch in flight, and the user cycles back to the first playground before
+    it lands. That link is a stream of the OTHER simulation, and attaching it here
+    would draw one playground's beads into another's scene."""
+    p, system, session = panel
+    _connect(panel)
+    other = tmp_path / "other_playground.py"
+    other.write_text(PLAYGROUND_SOURCE)
+    system2 = registry.build(str(other))
+    p.attach_system(system2, str(other))
+    p._act("connect")                     # switching to `other`
+    system2.close()
+
+    rebuilt = registry.build(p.playground_path)
+    p.attach_system(rebuilt, p.playground_path)   # ... and back again, mid-switch
+    session.state = session_mod.READY
+    session.link = StubLink()
+    p.update()
+
+    assert not rebuilt.connected
     assert p.visible
+    rebuilt.close()
+
+
+def test_disconnect_is_reachable_while_a_gpu_is_held_unstreamed(panel, tmp_path):
+    """Whatever state a held allocation is in, giving it back has to be one click:
+    it is the one failure with a bill attached."""
+    p, _system, session = panel
+    _connect(panel)
+    p.detach_system()
+    other = tmp_path / "other_playground.py"
+    other.write_text(PLAYGROUND_SOURCE)
+    system2 = registry.build(str(other))
+    p.attach_system(system2, str(other))
+
+    p.draw(_renderer())
+
+    assert "disconnect" in p._shown and "connect" in p._shown
+    p._act("disconnect")
+    assert session.shutdowns == 1
     system2.close()

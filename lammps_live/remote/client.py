@@ -93,7 +93,8 @@ class FrameLink:
     BUILD_TIMEOUT = 600.0
 
     @classmethod
-    def connect(cls, host, port, token, timeout=10.0, on_notice=None):
+    def connect(cls, host, port, token, timeout=10.0, on_notice=None,
+                playground=None):
         """Open a link, or raise LinkClosed with something a user can act on.
 
         `timeout` covers reaching the server and its answer -- EXCEPT that a server
@@ -103,6 +104,16 @@ class FrameLink:
         working, and giving up on it drops a socket the server is about to answer
         (and, worse, makes it throw away the build and start over for the retry).
         `on_notice` receives such messages, so the panel can show the wait.
+
+        `playground` ASKS THE SERVER FOR A PARTICULAR DEMO, and is what lets one
+        allocation carry more than one of them: a server already holding a
+        different playground throws that simulation away and builds this one
+        instead, on the GPU it already has (see server.FrameServer.serve_client,
+        and session.RemoteSession.switch_playground, which is the caller). None --
+        the default, and what the CLI path uses -- means "whatever you were
+        started with", so a server pointed at a playground by its own --playground
+        flag is never second-guessed by a client that happens to name it
+        differently.
         """
         try:
             sock = socket.create_connection((host, int(port)), timeout=timeout)
@@ -110,9 +121,11 @@ class FrameLink:
             raise LinkClosed(f"could not reach {host}:{port} -- {exc.strerror or exc}. "
                              f"Is the tunnel up and the server running?") from exc
         protocol.set_socket_options(sock)
+        hello = {"t": "hello", "version": protocol.VERSION, "token": token}
+        if playground:
+            hello["playground"] = str(playground)
         try:
-            sock.sendall(protocol.pack({"t": "hello", "version": protocol.VERSION,
-                                        "token": token}))
+            sock.sendall(protocol.pack(hello))
             while True:
                 header, _payload = protocol.recv_message(sock)
                 if header is None or header.get("t") != "building":
@@ -986,6 +999,9 @@ class RemoteSystem(MDSystem3D):
 
     def get_torque_signals(self):
         return self.mode.torque_signals()
+
+    def get_torque_vectors(self):
+        return self.mode.torque_vectors()
 
     def get_control_grid(self):
         return self.mode.control_grid()

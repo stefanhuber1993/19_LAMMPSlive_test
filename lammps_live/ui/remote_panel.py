@@ -13,9 +13,27 @@ teardown matters more than the setup: an A100 held by a forgotten allocation is
 expensive, so the thing that ends the session has to be the thing you close --
 which means the app has to own it.
 
-NOTHING HERE BLOCKS. Every step runs on the session's worker thread; this reads its
-state once per frame. The app keeps drawing at 60 fps through an SSH login, a queue
-wait and a LAMMPS build on the far side.
+ONE GPU, SEVERAL DEMOS. There is more than one remote playground now, and only ever
+one session: the panel keeps it across playground changes rather than one per
+playground. What follows from that is the behaviour a conference talk needs --
+
+    cycling to the other remote playground with Tab or a number key costs nothing
+    and takes nothing away. The card comes up saying the GPU is held and what is
+    running on it; the run you left is still running, and going back to it is one
+    socket.
+    CONNECTING on the other one moves the allocation: the far side closes the
+    simulation it was holding and builds this one in its place, on the same node,
+    through the same tunnel, with the same job (see session.switch_playground).
+    Nothing queues, and nothing asks for a one-time code a second time.
+
+-- so the GPU is requested once, at the start, and the rest of the hour is spent
+switching between demos. What a switch costs is the state of the run being left
+behind, which is the honest price and the reason it takes a button press rather
+than happening on Tab.
+
+NOTHING HERE BLOCKS. Every step runs on the session's worker thread, the switch
+included; this reads its state once per frame. The app keeps drawing at 60 fps
+through an SSH login, a queue wait and a LAMMPS build on the far side.
 """
 import time
 
@@ -40,14 +58,19 @@ LOG_LINES = 14
 
 
 class RemotePanel:
-    """Owns the session, the buttons and the prompt field for one remote system."""
+    """Owns THE session -- one, for the whole app -- plus the buttons and the prompt
+    field, pointed at whichever remote playground is on screen."""
 
     def __init__(self):
         self.visible = False
         self.system = None
+        # One session, shared by every remote playground that describes the same
+        # cluster. What it is currently serving is `session.playground_asked`, which is
+        # not necessarily what is on screen -- that is `playground_key` below, and
+        # the gap between the two is what the card is for.
         self.session = None
-        # Which playground the session belongs to, so coming back to that one
-        # resumes it and coming back to a different one does not (see _resume).
+        # The remote playground on screen (or the last one, while a local playground
+        # is showing). Connect acts on this one; the session may be holding another.
         self.playground_key = None
         self.field = TextField(masked=True, placeholder="type the answer, then Enter")
         self.buttons = {
@@ -69,59 +92,75 @@ class RemotePanel:
     def attach_system(self, system, playground_key):
         """Point the panel at a newly built RemoteSystem.
 
-        A session that is still up is RESUMED rather than replaced: switching to
-        another playground and back must not cost another allocation and another
-        queue wait. The job, the tunnel and the server all stay as they were, the
-        server keeps the simulation it was holding, and coming back is one fresh
-        socket through the same tunnel. Only when there is nothing live to go back
-        to does this open a session and put the card up.
+        The session is KEPT, whichever remote playground is arriving: it is the
+        allocation, and the allocation is the expensive thing. Four outcomes, and
+        not one of them asks Slurm for a GPU:
+
+          * the session is streaming the playground that just arrived -- resume it,
+            and the card never appears;
+          * it is still working on that playground -- leave it working, and `update`
+            hands the link over when it lands. Cycling away mid-connect must not
+            cancel a queue wait that is nearly done;
+          * it holds a GPU, on the OTHER remote playground (or on this one with a
+            dead link) -- the card comes up and Connect moves it here. Nothing has
+            been given back and nothing has to be asked for again;
+          * there is no session, or the one there describes a different cluster
+            entirely -- open a new one and show the card. Connect on THAT one is
+            what queues.
         """
-        if self._resume(system, playground_key):
-            return
-        self.release()
+        from ..remote.session import READY
+        session = self.session
+        if session is not None and not _same_allocation(session.target,
+                                                        system.target):
+            # A remote playground pointed somewhere else -- another cluster, another
+            # account, another scratch path. There is nothing to share, so the old
+            # session is given back rather than quietly reused for a login it does
+            # not describe.
+            self.release()
+            session = None
         self.system = system
         self.playground_key = playground_key
-        from ..remote.session import RemoteSession
-        self.session = RemoteSession(system.target, playground_ref=playground_key)
-        self.visible = True            # nothing is connected yet, so say so
         self.field.clear()
+        if session is None:
+            self._new_session(system, playground_key)
+            return
+        if session.serves(playground_key):
+            if session.state == READY:
+                link = session.link
+                # A link the app closed on the way out (system.close -> detach) has
+                # to be reopened; one that arrived while this playground was not on
+                # screen is still good, and MUST be reused rather than reconnected
+                # -- the server serves one client at a time, so a second socket
+                # would sit in the backlog behind our own.
+                if link is None or link.closed.is_set():
+                    link = session.reopen_link()
+                if link is not None:
+                    system.attach(link)
+                    self.visible = False
+                    return
+            elif session.busy:
+                self.visible = True
+                return
+        if not session.holds_allocation:
+            # Nothing left to come back to -- it never started, or it found the job
+            # gone and gave the rest back. Replace it, so the card's Connect asks
+            # for a GPU rather than offering to move one that is not there.
+            self.release()
+            self._new_session(system, playground_key)
+            return
+        # A GPU is held: on the other remote playground, or on this one with a link
+        # that has gone. Either way the card goes up and Connect does the right thing
+        # (see RemoteSession.connect_playground).
+        self.visible = True
 
-    def _resume(self, system, playground_key):
-        """Adopt an existing session for a freshly rebuilt system. True if it took.
-
-        Three cases, and only the first two are worth keeping:
-          * READY -- reconnect (or adopt a link that landed while we were away) and
-            carry straight on from the state the server is holding;
-          * still working -- leave it working, and `update` hands the link over when
-            it lands. Switching playground mid-connect should not cancel a queue
-            wait that is nearly done;
-          * anything else (never started, link lost, failed) -- there is nothing to
-            come back to, so the caller starts a new session and shows the card.
-        """
-        session = self.session
-        if session is None or playground_key != self.playground_key:
-            return False
-        from ..remote.session import READY
-        if session.state == READY:
-            link = session.link
-            # A link the app closed on the way out (system.close -> detach) has to
-            # be reopened; one that arrived while this playground was not on screen
-            # is still good, and MUST be reused rather than reconnected -- the
-            # server serves one client at a time, so a second socket would sit in
-            # the backlog behind our own.
-            if link is None or link.closed.is_set():
-                link = session.reopen_link()
-            if link is None:
-                return False
-            self.system = system
-            system.attach(link)
-            self.visible = False
-            return True
-        if session.busy:
-            self.system = system
-            self.visible = True
-            return True
-        return False
+    def _new_session(self, system, playground_key):
+        """A fresh session for this playground, with the card up: nothing is
+        connected yet, so the panel should say so."""
+        from ..remote.session import RemoteSession
+        self.system = system
+        self.playground_key = playground_key
+        self.session = RemoteSession(system.target, playground_ref=playground_key)
+        self.visible = True
 
     def detach_system(self):
         """Switch away from the remote playground WITHOUT giving the GPU back.
@@ -156,8 +195,8 @@ class RemotePanel:
         return self.session is not None and self.system is not None
 
     def standby_note(self):
-        """One line for the panel when the GPU is held but its playground is not on
-        screen -- an allocation nobody can see is the one thing about this that
+        """One line for the panel when the GPU is held but no remote playground is
+        on screen -- an allocation nobody can see is the one thing about this that
         would be expensive to forget. None when there is nothing being held."""
         session = self.session
         if session is None or self.system is not None:
@@ -165,11 +204,19 @@ class RemotePanel:
         from ..remote.session import READY
         if session.state == READY:
             return (f"remote GPU still held: job {session.job_id or '-'} on "
-                    f"{session.node or session.target.label} -- switch back to "
-                    f"{self.playground_key} to use it")
+                    f"{session.node or session.target.label}, running "
+                    f"{session.playground_asked} -- switch back to it to use it")
         if session.busy:
             return (f"remote session still connecting ({session.detail}) -- switch "
-                    f"back to {self.playground_key} to watch it")
+                    f"back to {session.playground_asked} to watch it")
+        if session.holds_allocation:
+            # The awkward one, and the reason this line exists at all: a job that is
+            # still ours with nothing connected to it and nothing on screen saying
+            # so. It gives itself back eventually (the server's idle timeout), but
+            # not before it has been paid for.
+            return (f"remote GPU held with no link: job {session.job_id} on "
+                    f"{session.node or session.target.label} -- "
+                    f"{session.error or 'the link is down'}")
         return None
 
     def toggle(self):
@@ -186,10 +233,12 @@ class RemotePanel:
         session = self.session
         if session.state != self._last_state:
             self._last_state = session.state
-            if self.system is None:
-                # Another playground is on screen: there is nothing to hand a link
-                # to and nothing to show a failure over. The state is remembered
-                # here, and `_resume` acts on it when this playground comes back.
+            if self.system is None or not session.serves(self.playground_key):
+                # Nothing on screen to hand a link to, or what is on screen is not
+                # the playground this session just finished building. The state is
+                # remembered here and `attach_system` acts on it when that
+                # playground comes back -- handing the link over now would attach a
+                # stream of one simulation to a system that expects another.
                 pass
             elif session.state == READY and session.link is not None:
                 self.system.attach(session.link)
@@ -202,7 +251,7 @@ class RemotePanel:
         # dropped, the node failed) reopens the panel -- with the reason in the log
         # rather than a frozen picture and no explanation.
         if (self.system is not None and not self.system.connected
-                and session.state == READY):
+                and session.state == READY and session.serves(self.playground_key)):
             session.note_link_lost(self.system.link_error())
             self.visible = True
 
@@ -240,7 +289,11 @@ class RemotePanel:
     def _act(self, name):
         session = self.session
         if name == "connect":
-            session.start()
+            # One button, two things: get a GPU and put this playground on it, or
+            # move the GPU we already hold to this playground. The session decides
+            # which, because which it is is a fact about the session (see
+            # RemoteSession.connect_playground).
+            session.connect_playground(self.playground_key)
         elif name == "cancel":
             session.cancel()
         elif name == "disconnect":
@@ -292,7 +345,9 @@ class RemotePanel:
         lines = list(session.log)[-LOG_LINES:]
         error_lines = ([] if session.prompt or not session.error
                        else _wrap(session.error, small, width - UI(36)))
+        held = self._held_note()
         height = (UI(58)                               # title and subtitle
+                  + (UI(18) if held else 0)            # the held-GPU line
                   + UI(26) + UI(16)                    # state line, progress bar
                   + (UI(64) if session.prompt else 0)
                   + UI(15) * len(error_lines) + (UI(6) if error_lines else 0)
@@ -325,9 +380,16 @@ class RemotePanel:
         screen.blit(small.render(sub, True, DIM_TEXT_COLOR), (x, y))
         y += UI(20)
 
+        # THE LINE THAT MAKES THE SWITCH LEGIBLE. Pressing Connect with a GPU
+        # already held throws away a running simulation, so what is running has to
+        # be on the card -- not inferable from a log line four rows down.
+        if held:
+            screen.blit(small.render(held, True, OK_COLOR), (x, y))
+            y += UI(18)
+
         # State line: the step it is on, out of how many, and what it is doing.
         step, total = session.progress()
-        from ..remote.session import DOWN, FAILED, READY
+        from ..remote.session import DOWN, FAILED, READY, SWITCH
         color = {READY: OK_COLOR, FAILED: FAIL_COLOR,
                  DOWN: DIM_TEXT_COLOR}.get(session.state, BUSY_COLOR)
         label = session.state.upper()
@@ -373,12 +435,28 @@ class RemotePanel:
             y += UI(14)
 
         # Buttons, contextual: only the ones that mean something in this state.
-        if session.busy:
+        if session.state == SWITCH:
+            # A switch cannot be called off halfway: the far side has already thrown
+            # the old simulation away, so there is nothing to cancel back to. Close
+            # hides the card and it finishes in the background.
+            names = ("copy", "close")
+        elif session.busy:
             names = ("copy", "cancel")
+        elif session.holds_allocation and (self._is_switch()
+                                           or session.state != READY):
+            # A GPU is held but not streaming THIS playground: the other one's run,
+            # or a link here that has gone. Connect moves it -- and Disconnect is on
+            # the card too, because "give the GPU back" has to be reachable from
+            # every state that is holding one.
+            names = ("copy", "disconnect", "connect", "close")
         elif session.state == READY:
             names = ("copy", "disconnect", "close")
         else:
             names = ("copy", "connect", "close")
+        # The button says which of its two jobs it is about to do, because "Connect"
+        # over a held GPU reads as free and is not.
+        self.buttons["connect"].label = ("Move GPU here" if self._is_switch()
+                                         else "Connect")
         self._shown = names
         bw, bh, gap = UI(130), UI(30), UI(10)
         bx = rect.right - UI(18) - (len(names) * bw + (len(names) - 1) * gap)
@@ -395,11 +473,51 @@ class RemotePanel:
             hint, tint = self._notice, OK_COLOR
         elif session.prompt:
             hint, tint = "Enter sends the answer. C copies the report.", BUTTON_BORDER
+        elif self._is_switch():
+            hint = (f"The run on {session.playground_asked} is thrown away; the "
+                    f"allocation is not. N hides this panel.")
+            tint = BUTTON_BORDER
         else:
             hint = ("N hides this panel, C copies the whole report. Closing the "
                     "window cancels the job.")
             tint = BUTTON_BORDER
         screen.blit(small.render(hint, True, tint), (x, by - UI(18)))
+
+    def _is_switch(self):
+        """Would Connect move a GPU we already hold, rather than ask for one?"""
+        session = self.session
+        return bool(session is not None and session.holds_allocation
+                    and not session.serves(self.playground_key))
+
+    def _held_note(self):
+        """"There is a GPU held, and this is what is on it" -- or None."""
+        session = self.session
+        if session is None or not session.holds_allocation:
+            return None
+        if session.serves(self.playground_key):
+            return None
+        return (f"GPU held: job {session.job_id} on "
+                f"{session.node or session.target.label}, running "
+                f"{session.playground_asked}")
+
+
+# What has to match for two remote playgrounds to be able to share one session.
+# Not the whole target: the frame rate, the codec and the idle timeout are per-demo
+# and are pushed over the link, and the wall clock is whatever the first request
+# asked for. These are the fields that describe the LOGIN and the ALLOCATION, which
+# is the thing being shared -- if any of them differs, the held session simply is
+# not a session for the arriving playground.
+_ALLOCATION_FIELDS = ("host", "user", "partition", "gpus", "ntasks",
+                      "cpus_per_task", "account", "remote_dir", "env_script",
+                      "deploy_dir", "python", "profile", "tunnel")
+
+
+def _same_allocation(a, b):
+    """Whether two RemoteTargets describe the same GPU on the same cluster."""
+    if a is None or b is None:
+        return a is b
+    return all(getattr(a, f, None) == getattr(b, f, None)
+               for f in _ALLOCATION_FIELDS)
 
 
 def _wrap(text, font, width):

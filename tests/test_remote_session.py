@@ -185,6 +185,70 @@ def test_the_package_really_arrives(session, cluster):
     assert not list(deployed.rglob("__pycache__"))
 
 
+SECOND_PLAYGROUND_SOURCE = PLAYGROUND_SOURCE.replace("n=600", "n=300").replace(
+    "fake cluster assembly", "the other one")
+
+
+def test_a_second_playground_reuses_the_allocation(session, cluster):
+    """The conference case: request a GPU once, then move between demos on it.
+
+    Everything expensive stays -- the login, the deployed package, the job, the
+    server process, the tunnel -- and only the far side's simulation is rebuilt. The
+    proof that it was not re-requested is the fake cluster's own log: one salloc, and
+    no scancel until the teardown.
+    """
+    _drive(session)
+    # The LOCAL path, which is what the panel hands back when that playground comes
+    # round again -- `session.playground_ref` is by now the copy on the far side.
+    first_ref = cluster["playground"]
+    job = session.job_id
+    other = cluster["tmp"] / "the_other_playground.py"
+    other.write_text(SECOND_PLAYGROUND_SOURCE)
+
+    assert session.switch_playground(str(other))
+    deadline = time.monotonic() + 180.0
+    while session.busy and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    assert session.state == READY, f"{session.error}\n" + "\n".join(session.log)
+    assert session.job_id == job, "the same allocation"
+    assert session.link is not None
+    assert session.playground_ref.endswith("the_other_playground.py")
+    # The far side built the one that was asked for, and says so in the welcome --
+    # 300 beads rather than 600, so this is not the old simulation relabelled.
+    assert session.link.welcome["natoms"] == 300
+    slurm = cluster["slurm_log"].read_text()
+    assert slurm.count("salloc") == 1, "no second GPU was requested"
+    # No cancel of THIS job. (The literal string `scancel $SLURM_JOB_ID` is in the
+    # log as part of the server command line -- the far side's own backstop -- so
+    # the job id is what has to be matched, not the word.)
+    assert f"scancel {job}" not in slurm
+
+    # And back again, on the same job.
+    assert session.switch_playground(first_ref)
+    deadline = time.monotonic() + 180.0
+    while session.busy and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert session.state == READY, f"{session.error}\n" + "\n".join(session.log)
+    assert session.link.welcome["natoms"] == 600
+    assert session.job_id == job
+    assert cluster["slurm_log"].read_text().count("salloc") == 1
+
+
+def test_switching_to_the_loaded_playground_is_a_no_op(session, cluster):
+    """Asking for what is already running must not throw the run away.
+
+    `serves` answers in the CALLER's terms -- the name the app knows, which for a
+    path is the local one, not the copy `_deploy` made on the cluster.
+    """
+    _drive(session)
+    assert session.playground_asked == cluster["playground"]
+    assert session.playground_ref != session.playground_asked, "it was shipped"
+    assert session.serves(cluster["playground"])
+    assert session.switch_playground(cluster["playground"]) is False
+    assert session.state == READY
+
+
 def test_the_token_never_appears_in_a_command_line(session, cluster):
     _drive(session)
     # Everything the session ran, as the fake cluster saw it.

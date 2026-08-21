@@ -54,6 +54,25 @@ def select_controlled(positions, box, selector):
 _AXES = {"x": 0, "y": 1, "z": 2}
 
 
+def signed_axis(name):
+    """(axis index, sign) for a signed axis name: "y" -> (1, +1), "-x" -> (0, -1).
+
+    Torque axes are given signed (see Control.torque_axes) because which way a
+    director tips for a given stick push is a statement about the camera, and the
+    sign is the whole content of it -- so it belongs in the playground file next to
+    the axis, not folded into the mode as a minus somebody has to go and find.
+    """
+    text = str(name).strip()
+    sign = 1.0
+    if text[:1] in "+-":
+        sign = -1.0 if text[0] == "-" else 1.0
+        text = text[1:]
+    if text not in _AXES:
+        raise ValueError(f"axis must be one of x/y/z, optionally signed, "
+                         f"got {name!r}")
+    return _AXES[text], sign
+
+
 def plane_axes(plane):
     """(u_axis, v_axis, pinned_axis) indices for a two-letter plane name.
 
@@ -127,6 +146,9 @@ class Mode:
     def torque_signals(self):
         return None
 
+    def torque_vectors(self):
+        return None
+
     def control_grid(self):
         return None
 
@@ -149,12 +171,25 @@ class GameMode(Mode):
     """Drive one particle with an input device, and feel the force field push
     back.
 
-    The particle is confined to a control plane and a rectangular leash, and
-    capped below a runaway speed: without this a sustained max pull would
-    accelerate it (undamped by the thermostat, since it is deliberately excluded
-    from the bath) straight out of the box. The leash is drawn in the scene as a
-    net, whose extents ARE these limits, so the net marks exactly where the
-    particle can be dragged.
+    TWO DRIVES, one stick, chosen by `Control.drive`:
+
+      FORCE   the two axes push the particle, in the control plane. It is confined
+              to that plane and a rectangular leash, and capped below a runaway
+              speed: without this a sustained max pull would accelerate it
+              (undamped by the thermostat, since it is deliberately excluded from
+              the bath) straight out of the box. The leash is drawn in the scene as
+              a net, whose extents ARE these limits, so the net marks exactly where
+              the particle can be dragged. Its DIRECTOR is steered separately, by
+              the twist axis, and only within the control plane.
+      TORQUE  the two axes turn the particle's director instead, about two world
+              axes, and nothing pushes the particle at all: it goes where the force
+              field takes it. Nothing is confined -- no plane, no leash, no net, and
+              the director tumbles in three dimensions rather than in a plane --
+              because there is no longer an input whose two axes have to fully
+              determine a position, which is the only reason the constraint existed.
+
+    Both render the force field's REACTION back to the hand; which quantity that is
+    follows the drive (see `interaction_force`).
     """
 
     needs_control_particle = True
@@ -162,6 +197,11 @@ class GameMode(Mode):
     def __init__(self, control):
         self.control = control
         self.u_axis, self.v_axis, self.pin_axis = plane_axes(control.plane)
+        # Which world axis each input axis torques about, and which way, for a
+        # torque drive. Resolved once, here, so a bad axis name in a playground
+        # file is a build-time error rather than a silent no-op per frame.
+        self.torque_axes = (tuple(signed_axis(a) for a in control.torque_axes)
+                            if control.drives_torque else ())
         self._input_u = 0.0
         self._input_v = 0.0
         self._yaw = 0.0
@@ -201,18 +241,25 @@ class GameMode(Mode):
     def control_commands(self, params):
         if self.runtime.controlled_id is None:
             return []
-        # The drive is variable-driven rather than a literal force, so that
-        # steering it (set_input_force, potentially every frame) sets three
-        # internal variables instead of REDEFINING the fix. Redefining a fix
-        # invalidates `run ... pre no` -- so the old literal form silently cost
-        # every interactive system a full neighbour rebuild and force evaluation
-        # per chunk, for a number that fix addforce is perfectly happy to read
-        # from a variable each step. See PlaygroundSystem.command.
-        cmds = ["variable drive_x internal 0.0",
-                "variable drive_y internal 0.0",
-                "variable drive_z internal 0.0",
-                "fix drive controlled addforce v_drive_x v_drive_y v_drive_z",
-                f"fix damp controlled viscous {self._damping}"]
+        # The viscous drag is here for both drives. A torque drive applies no
+        # force, but the particle is still outside the Langevin bath (see
+        # group_commands) and would otherwise be the one particle in the scene with
+        # no translational friction at all -- so it keeps the damping slider, and
+        # what that slider means does not change with the drive.
+        cmds = [f"fix damp controlled viscous {self._damping}"]
+        if not self.control.drives_torque:
+            # The drive is variable-driven rather than a literal force, so that
+            # steering it (set_input_force, potentially every frame) sets three
+            # internal variables instead of REDEFINING the fix. Redefining a fix
+            # invalidates `run ... pre no` -- so the old literal form silently cost
+            # every interactive system a full neighbour rebuild and force evaluation
+            # per chunk, for a number that fix addforce is perfectly happy to read
+            # from a variable each step. See PlaygroundSystem.command.
+            cmds = ["variable drive_x internal 0.0",
+                    "variable drive_y internal 0.0",
+                    "variable drive_z internal 0.0",
+                    "fix drive controlled addforce v_drive_x v_drive_y v_drive_z",
+                    *cmds]
         if self.control.displacement_cap:
             # An unconfined particle needs a per-step displacement cap to survive
             # a hard contact impact instead of tunnelling through the lattice.
@@ -253,12 +300,23 @@ class GameMode(Mode):
         return self.attached
 
     def set_input_force(self, fx, fy):
-        """Input axis 1 -> the plane's u axis, axis 2 -> its v axis."""
+        """This frame's two input-axis values.
+
+        On a FORCE drive: axis 1 -> the plane's u axis, axis 2 -> its v axis, both
+        in force units, handed to the addforce fix.
+
+        On a TORQUE drive: the two values are TORQUES about `torque_axes`, and there
+        is no force fix to hand anything to -- they are stored and applied as
+        angular-momentum kicks in the next `constrain()`, the same mechanism the
+        twist axis has always used. Named `set_input_force` all the same, because it
+        is the app's one "here is this frame's input" call and splitting it would
+        mean every caller asking which drive it was talking to (see MDSystem).
+        """
         if not self.attached:
             fx = fy = 0.0
         self._input_u = fx
         self._input_v = fy
-        if self.runtime.controlled_id is None:
+        if self.runtime.controlled_id is None or self.control.drives_torque:
             return
         f = [0.0, 0.0, 0.0]
         f[self.u_axis] = fx
@@ -282,6 +340,15 @@ class GameMode(Mode):
     def steer_orientation(self, rate, dt):
         # Sign flipped so the twist turns the director the way the hand expects
         # on screen. Applied in the next constrain().
+        #
+        # Ignored on a torque drive: the two main axes already turn the director
+        # about both of the axes it can be turned about, and a third rotation --
+        # about the director itself -- is the identity on a unit vector. Leaving the
+        # twist wired up would mean one of the two mappings silently fought the
+        # other on whichever axis they shared.
+        if self.control.drives_torque:
+            self._yaw = 0.0
+            return
         self._yaw = -rate if self.attached else 0.0
 
     # --- per-frame constraint ------------------------------------------------
@@ -290,22 +357,40 @@ class GameMode(Mode):
         self.constrain()
 
     def constrain(self):
-        """Hold the controlled particle on its plane, inside the leash, below the
-        speed cap, and drive its director.
+        """Hold the controlled particle where the input can reach it, and drive its
+        director.
 
-        The director spring-back the user feels is genuine force-field physics
-        (the tilt term, integrated by LAMMPS). Only three things are added here:
-        the rotation is constrained to the control plane, the yaw command enters
-        as an angular-momentum kick (a torque is dL/dt), and a rotational drag
-        stands in for the controlled particle's share of the implicit solvent's
-        rotational friction -- it sits outside the Langevin bath, so without this
-        an undamped director would oscillate forever.
+        Two independent halves, because the two drives want different ones:
+
+          the PLANE, the leash and the speed cap -- only for a confined particle,
+          which is what a force drive needs so that two input axes fully determine
+          a 3D position;
+          the DIRECTOR, driven either in the control plane by the twist axis (force
+          drive) or freely about two world axes by the stick (torque drive).
+
+        The spring-back the user feels is genuine force-field physics (the tilt
+        term, integrated by LAMMPS) in both cases. What is added here is only the
+        command itself, which enters as an angular-momentum kick (a torque is dL/dt),
+        and a rotational drag that stands in for the controlled particle's share of
+        the implicit solvent's rotational friction -- it sits outside the Langevin
+        bath, so without this an undamped director would oscillate forever.
         """
-        if not self.control.confine:
-            return
         ic = self.runtime.controlled_local()
         if ic is None:
             return
+        if self.control.confine:
+            self._hold_in_leash(ic)
+        if not self.runtime.has_directors:
+            return
+        if self.control.drives_torque:
+            self._drive_director_freely(ic)
+        elif self.control.confine:
+            # Unchanged: on an unconfined FORCE drive nothing here ever ran, and
+            # the deposition playgrounds that use it have no directors anyway.
+            self._drive_director_in_plane(ic)
+
+    def _hold_in_leash(self, ic):
+        """The plane constraint, the leash and the speed cap."""
         lmp = self.runtime.lmp
         x = lmp.numpy.extract_atom("x")
         v = lmp.numpy.extract_atom("v")
@@ -335,12 +420,13 @@ class GameMode(Mode):
             v[ic][1] *= s
             v[ic][2] *= s
 
-        if not self.runtime.has_directors:
-            return
+    def _drive_director_in_plane(self, ic):
+        """The twist axis, on a force drive: spin about the plane normal only, so
+        the director's swing stays in the control plane and the two axes the stick
+        moves the particle along are not also rotating it."""
+        lmp = self.runtime.lmp
         mu = lmp.numpy.extract_atom("mu")
         omega = lmp.numpy.extract_atom("omega")
-        # Spin only about the pinned axis, so the director's swing stays in the
-        # control plane.
         omega[ic][self.u_axis] = 0.0
         omega[ic][self.v_axis] = 0.0
         omega[ic][self.pin_axis] = (omega[ic][self.pin_axis] * self.control.rot_damp
@@ -352,6 +438,39 @@ class GameMode(Mode):
             mu[ic][self.u_axis] = nu / m
             mu[ic][self.pin_axis] = 0.0
             mu[ic][self.v_axis] = nv / m
+
+    def _drive_director_freely(self, ic):
+        """The two input axes, on a torque drive: an angular-momentum kick about
+        each of `torque_axes`, and the same rotational drag, with nothing projected
+        away.
+
+        No axis is zeroed and the director is not renormalized, both deliberately.
+        The director tumbles in three dimensions here -- that is the point of this
+        drive -- so there is no out-of-plane component to call drift, and LAMMPS'
+        own `nve/sphere update dipole` preserves |mu| as it integrates, which the
+        in-plane version above has to undo its own projection to keep.
+
+        The input arrives already scaled by `max_input_torque` and enters as dL/dt,
+        exactly as the twist axis does -- so `max_input_torque` here and
+        `yaw_torque` there are the same kind of number, directly comparable, and
+        deliberately have the same default. It is NOT multiplied by `yaw_torque`
+        again: two knobs setting one gain is how a demo ends up 3x too twitchy for
+        reasons nobody can find.
+        """
+        omega = self.runtime.lmp.numpy.extract_atom("omega")
+        damp = self.control.rot_damp
+        for (axis, sign), value in zip(self.torque_axes,
+                                       (self._input_u, self._input_v)):
+            omega[ic][axis] = omega[ic][axis] * damp + sign * value
+        # The third axis is left to the physics: the force field's own torque about
+        # it is real (a director being tipped by its neighbours), and zeroing it
+        # would be inventing a constraint this drive exists not to have. It only
+        # needs the same drag as the two driven ones, or it would ring forever
+        # outside the bath.
+        driven = {axis for axis, _ in self.torque_axes}
+        for axis in (0, 1, 2):
+            if axis not in driven:
+                omega[ic][axis] *= damp
 
     # --- readouts ------------------------------------------------------------
 
@@ -371,8 +490,19 @@ class GameMode(Mode):
                 np.array([v[ic][self.u_axis], v[ic][self.v_axis]]))
 
     def interaction_force(self):
-        """The force field's reaction force on the controlled particle, projected
-        onto the control plane -- what the arrow draws and the stick renders.
+        """The force field's reaction on the controlled particle, along the two axes
+        the input drives -- what the arrows draw and the stick renders.
+
+        ON A TORQUE DRIVE it is the reaction TORQUE about `torque_axes`, read
+        straight off the pair style's per-atom torque. That is exact rather than
+        reconstructed, because nothing this end adds to that array: the user's
+        command is an angular-momentum kick applied directly to omega (see
+        `_drive_director_freely`), not a torque competing with the force field's for
+        a place in the same sum. It is the same quantity in the same units as the
+        force case, one domain over, so the whole pipeline downstream -- shaping,
+        smoothing, stiffness, the HUD -- works on it unchanged.
+
+        ON A FORCE DRIVE, the reaction force, projected onto the control plane.
 
         Recovered as total force minus the two forces we apply ourselves: the
         input drive (addforce) and the viscous damping (-gamma*v). The setforce on
@@ -393,6 +523,8 @@ class GameMode(Mode):
         """
         if not self.attached:
             return np.array([0.0, 0.0])
+        if self.control.drives_torque:
+            return self._reaction_torque()
         if self._has_group_force:
             vec = self.runtime.lmp.extract_compute("pairforce", 0, 1)
             f_uv = np.array([vec[self.u_axis], vec[self.v_axis]])
@@ -409,6 +541,23 @@ class GameMode(Mode):
                 f[ic][self.v_axis] - self._input_v + g * v[ic][self.v_axis],
             ])
         return f_uv * self._leash_release()
+
+    def _reaction_torque(self):
+        """The force field's restoring torque about the two driven axes, signed the
+        same way the input to those axes is -- so a command and the reaction to it
+        read as opposite, which is what the green/red pair means everywhere else.
+
+        No leash fade: there is no leash on a torque drive, so there is no boundary
+        for the signal to have to melt away at (see _leash_release).
+        """
+        ic = self.runtime.controlled_local()
+        tau = (self.runtime.lmp.numpy.extract_atom("torque")
+               if ic is not None and self.runtime.has_directors else None)
+        if tau is None:
+            return np.array([0.0, 0.0])
+        row = tau[:self.runtime.natoms][ic]
+        return np.array([sign * float(row[axis])
+                         for axis, sign in self.torque_axes])
 
     def _leash_release(self):
         """Per-axis 1 -> 0 fade of the reported force as the particle nears its
@@ -437,13 +586,21 @@ class GameMode(Mode):
         return np.array(gains)
 
     def torque_signals(self):
-        """(applied, reaction) torques about the control plane's normal,
-        normalized to [-1, 1] for the circular torque arrows.
+        """(applied, reaction) torque about ONE axis, normalized to [-1, 1] for the
+        circular torque arrows.
 
-        `applied` is the user's yaw command, which is already the per-frame
-        angular kick in [-1, 1]. `reaction` is the force field's restoring torque,
-        read straight off the pair style's per-atom torque -- the component about
-        the pinned axis is the part that rotates the director within the plane.
+        WHICH AXIS, and why one and not two. These feed the FLAT arcs, drawn as
+        circles on the screen around the bead, so they can only depict a rotation
+        the camera sees face on -- about the axis pointing at it. On a force drive
+        that is the control plane's normal, the axis the twist rotates the director
+        about, and the axis those scenes are looked down: honest, and the only one
+        that is. On a torque drive it is `torque_axes[0]`, and there the flat arc is
+        no longer drawn at all -- the rings (`torque_vectors`) show both driven axes
+        where they actually point. The scalar is kept because it is still the
+        first-axis reading, and cheap.
+
+        `applied` is the user's command as a fraction of full deflection; `reaction`
+        is the force field's restoring torque over `reaction_torque_max`.
         """
         # Both arcs describe a hand on the particle: your twist, and what the
         # membrane twists back with. Released, there is no hand, so there are no
@@ -452,12 +609,62 @@ class GameMode(Mode):
         ic = self.runtime.controlled_local()
         if ic is None or not self.runtime.has_directors or not self.attached:
             return None
-        applied = max(-1.0, min(1.0, self._yaw))
+        if self.control.drives_torque:
+            axis, sign = self.torque_axes[0]
+            ceiling = max(self.control.max_input_torque, 1e-9)
+            applied = max(-1.0, min(1.0, sign * self._input_u / ceiling))
+        else:
+            axis, sign = self.pin_axis, 1.0
+            applied = max(-1.0, min(1.0, self._yaw))
         tau = self.runtime.lmp.numpy.extract_atom("torque")
         reaction = 0.0
         if tau is not None:
-            raw = float(tau[:self.runtime.natoms][ic][self.pin_axis])
+            raw = sign * float(tau[:self.runtime.natoms][ic][axis])
             reaction = max(-1.0, min(1.0, raw / self.control.reaction_torque_max))
+        return applied, reaction
+
+    def torque_vectors(self):
+        """(applied, reaction) as world 3-VECTORS, for the two torque RINGS drawn
+        round the bead. None on a force drive, which has real force vectors to draw
+        instead.
+
+        A torque is an axial vector -- it points along the axis the rotation is
+        about, by the right-hand rule -- so these are genuine directions in the
+        scene and not a picture of one. The applied one is the two input axes
+        combined, `sum(sign_i * value_i * e_i)`; the reaction is the pair style's
+        own per-atom torque, all three components of it, because the membrane
+        resists about whatever axis it likes and projecting that onto the two driven
+        ones would be drawing the part of its answer we asked for.
+
+        NORMALIZED, each to its own full scale: 1.0 is a full stick deflection for
+        the applied one and `reaction_torque_max` for the reaction. They are in
+        different units from each other in no useful sense -- both are torques --
+        but they differ in SIZE by about the ratio of those two ceilings, and drawn
+        raw against one ring scale the input would be a hairline next to the
+        reaction. The header line carries the unnormalized numbers.
+
+        WHAT THE RENDERER MAKES OF IT is a circle in the plane perpendicular to the
+        vector, drawn in the scene and projected like everything else, with the
+        length setting how far round it sweeps (see Renderer._draw_torque_ring). It
+        is NOT drawn as an arrow along the axis: an axial vector is a bookkeeping
+        convention, nothing travels along it, and an arrow there is a picture of a
+        push this drive pointedly does not apply.
+        """
+        if not self.control.drives_torque:
+            return None
+        ic = self.runtime.controlled_local()
+        if ic is None or not self.runtime.has_directors or not self.attached:
+            return None
+        applied = np.zeros(3)
+        ceiling = max(self.control.max_input_torque, 1e-9)
+        for (axis, sign), value in zip(self.torque_axes,
+                                       (self._input_u, self._input_v)):
+            applied[axis] += sign * value / ceiling
+        reaction = np.zeros(3)
+        tau = self.runtime.lmp.numpy.extract_atom("torque")
+        if tau is not None:
+            reaction = (np.asarray(tau[:self.runtime.natoms][ic], dtype=float)
+                        / max(self.control.reaction_torque_max, 1e-9))
         return applied, reaction
 
     def control_grid(self):

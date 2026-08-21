@@ -18,20 +18,28 @@ oblique one, and it is re-picked as the camera moves (see `_cardinal`).
     live, camera-relative, and belongs to the person at the controls. They
     compose -- the renderer draws the intersection.
 
-THE LEVER IS A LEVER, NOT A BUTTON, and that is the whole design problem here.
-It is an absolute control with no detent: wherever it was left at the end of the
-last session is where it is at the start of this one, and a demo that came up
-sliced in half because nobody had touched the throttle would be a bug. So:
+THE LEVER IS A POSITION, AND THE POSITION IS THE WHOLE ANSWER. It is an absolute
+control with no detent, so the one thing it must never do is mean something
+different from what it looks like it means. The two STOPS are therefore "off":
 
-  * UNTOUCHED SINCE STARTUP -> no slicing, whatever the lever reads. The first
-    value seen is only recorded, never acted on.
-  * MOVED -> the slab engages and follows the lever, over `TRANSITION_SECONDS`.
-  * STILL FOR `HOLD_SECONDS` -> it opens back up to the whole box, over the same
-    transition. The lever keeps its position; touching it again picks the slice
-    straight back up.
+  * lever hard back, or hard forward -> NO slicing, the whole box on screen.
+  * anywhere in between -> the slab is engaged, and the lever's position within
+    that band is where the plane sits, near face to far.
+  * the last `EDGE_FRACTION` of travel at each end is the transition: the slab
+    widens smoothly back out to the whole box as the lever runs into its stop,
+    so there is no frame where the scene snaps together.
 
-That last rule is what makes it usable one-handed mid-demo: cut in, look, let go,
-and the scene puts itself back together without anything to remember to reset.
+Two stops rather than one because the lever has two and neither is privileged:
+whichever end your hand is nearest, shoving it there gives you the whole scene
+back. Nothing here is timed -- there is no idle timeout that opens the box up
+under you (there was, and it made the lever a control you had to keep touching to
+be believed). Cut in, let go, and it stays cut until you move it.
+
+  * UNTOUCHED SINCE STARTUP -> no slicing, whatever the lever reads, because
+    "whatever it reads" is wherever the last session happened to leave it. The
+    first value seen is only recorded, never acted on. This is the one piece of
+    state left: it is what stops a demo coming up sliced in half before anybody
+    has touched anything.
 """
 import math
 from dataclasses import dataclass
@@ -39,17 +47,24 @@ from dataclasses import dataclass
 import numpy as np
 
 # The slab's thickness once fully engaged, as a fraction of the box's width along
-# the cutting axis. 5% of a 100-sigma cell is five bead diameters -- thin enough
-# to be a section rather than a slice of the whole thing, thick enough that the
-# section of a one-bead-thick membrane is a continuous ring rather than a dotted
-# one.
-THICKNESS_FRACTION = 0.05
+# the cutting axis. 15% of a 100-sigma cell is fifteen bead diameters: a slab
+# with some depth in it rather than a single sheet of beads, which is what makes
+# the cut face read as a solid surface you are looking into. It started at 5%,
+# which is a genuine section but leaves a closed membrane as a thin ring with
+# nothing behind it.
+THICKNESS_FRACTION = 0.15
 # How long the slab takes to close from "whole box" to that thickness, and to
 # open back up again. Short enough to feel like a response to the lever, long
-# enough to read as one object opening rather than beads vanishing.
+# enough to read as one object opening rather than beads vanishing. It is a rate
+# LIMIT on top of the lever, not a timer: a slow push is followed exactly, and
+# only a shove is smoothed.
 TRANSITION_SECONDS = 0.5
-# How long the lever may sit still before the box opens back up.
-HOLD_SECONDS = 3.0
+# How much of the lever's travel at EACH END means "no slicing", and over which
+# the slab opens back out. Wide enough that shoving the lever to a stop without
+# looking is reliably "off" -- the point of putting it at the stops -- and narrow
+# enough that the remaining 70% of the travel still sweeps the plane across the
+# whole box at a usable resolution.
+EDGE_FRACTION = 0.15
 # How much the lever has to move to count as touched. The device reports it as 7
 # bits, so one notch is 1/127 ~ 0.008; this is a few notches -- past the last
 # bit's dither, well inside a deliberate nudge.
@@ -118,11 +133,11 @@ class ViewSlice:
 
     def __init__(self, thickness_fraction=THICKNESS_FRACTION,
                  transition_seconds=TRANSITION_SECONDS,
-                 hold_seconds=HOLD_SECONDS, touch_epsilon=TOUCH_EPSILON,
+                 edge_fraction=EDGE_FRACTION, touch_epsilon=TOUCH_EPSILON,
                  open_factor=OPEN_FACTOR, reaim_degrees=REAIM_DEGREES):
         self.thickness_fraction = thickness_fraction
         self.transition_seconds = transition_seconds
-        self.hold_seconds = hold_seconds
+        self.edge_fraction = edge_fraction
         self.touch_epsilon = touch_epsilon
         self.open_factor = open_factor
         self.reaim_cos = math.cos(math.radians(reaim_degrees))
@@ -130,18 +145,51 @@ class ViewSlice:
         # not been touched since this session started", since the device only
         # reports on change.
         self._lever = None
-        self._idle = 0.0
-        self._engaged = False
+        self._touched = False
+        # How much cut the lever's CURRENT position asks for, 0..1 -- a function
+        # of that position and nothing else (see `demand`). `_progress` is what is
+        # actually on screen, chasing it at the transition's rate.
+        self._demand = 0.0
         self._progress = 0.0      # 0 = whole box, 1 = fully sliced
         self._axis = None         # the cutting normal, a signed cardinal axis
         self._plane = None
+
+    # ---- the lever's position -> what it asks for ----------------------------
+
+    def demand(self, lever):
+        """How much cut a lever position asks for, 0 (whole box) .. 1 (full slab).
+
+        1 across the middle of the travel, easing to 0 over the last
+        `edge_fraction` at EACH end -- so both stops mean "no slicing" and the
+        scene comes back smoothly as the lever runs into either of them.
+        """
+        if lever is None:
+            return 0.0
+        edge = self.edge_fraction
+        if edge <= 0.0:
+            return 1.0
+        lever = min(max(float(lever), 0.0), 1.0)
+        return _smoothstep(min(lever, 1.0 - lever) / edge)
+
+    def sweep(self, lever):
+        """Where along the box the plane sits, 0 (near face) .. 1 (far face).
+
+        The middle band of the travel -- everything the two "off" ends leave --
+        stretched over the whole box, so no part of the sweep is unreachable and
+        the plane arrives at a face exactly as the slab starts opening back up.
+        """
+        if lever is None:
+            return 0.0
+        edge = self.edge_fraction
+        span = max(1.0 - 2.0 * edge, 1e-6)
+        return min(max((float(lever) - edge) / span, 0.0), 1.0)
 
     # ---- state ---------------------------------------------------------------
 
     @property
     def engaged(self):
-        """Whether the lever is currently asking for a cut (before easing)."""
-        return self._engaged
+        """Whether the lever's position is asking for a cut (before easing)."""
+        return self._demand > 0.0
 
     @property
     def progress(self):
@@ -159,8 +207,8 @@ class ViewSlice:
         into a scene you have not touched the lever for is the same surprise the
         untouched-at-startup rule exists to avoid."""
         self._lever = None
-        self._idle = 0.0
-        self._engaged = False
+        self._touched = False
+        self._demand = 0.0
         self._progress = 0.0
         self._axis = None
         self._plane = None
@@ -170,29 +218,31 @@ class ViewSlice:
     def update(self, lever, dt, forward=None, box_bounds=None):
         """One frame. `lever` is 0..1 (or None on a device with no lever),
         `forward` the camera's view direction, `box_bounds` the cell as
-        (xlo, xhi, ylo, yhi, zlo, zhi). Returns this frame's plane, or None."""
+        (xlo, xhi, ylo, yhi, zlo, zhi). Returns this frame's plane, or None.
+
+        Nothing here is timed: the lever's position is read every frame and
+        `demand` turns it into how much cut it is asking for. The only history is
+        whether it has been touched at all -- see the module docstring.
+        """
         if lever is None:
             # No lever on this input device -- open back up rather than freezing
             # whatever the last joystick session left behind.
-            self._engaged = False
+            self._touched = False
         elif self._lever is None:
             self._lever = float(lever)          # recorded, deliberately not acted on
-        else:
-            if abs(float(lever) - self._lever) > self.touch_epsilon:
-                self._lever = float(lever)
-                self._idle = 0.0
-                self._engaged = True
-            else:
-                self._idle += dt
-                if self._idle > self.hold_seconds:
-                    self._engaged = False
+        elif abs(float(lever) - self._lever) > self.touch_epsilon:
+            self._lever = float(lever)
+            self._touched = True
+        self._demand = self.demand(self._lever) if self._touched else 0.0
 
+        # The lever leads, the picture follows at a bounded rate: a slow push is
+        # tracked exactly (the step is bigger than any one frame's change), and
+        # only a shove is smoothed into the half second the transition is worth.
         step = dt / max(self.transition_seconds, 1e-6)
-        target = 1.0 if self._engaged else 0.0
-        if self._progress < target:
-            self._progress = min(target, self._progress + step)
-        elif self._progress > target:
-            self._progress = max(target, self._progress - step)
+        if self._progress < self._demand:
+            self._progress = min(self._demand, self._progress + step)
+        elif self._progress > self._demand:
+            self._progress = max(self._demand, self._progress - step)
 
         self._plane = self._resolve(forward, box_bounds)
         return self._plane
@@ -209,8 +259,10 @@ class ViewSlice:
         span = max(hi - lo, 1e-9)
         # The lever's travel maps to the whole of the box along the cutting axis,
         # near face to far: pushed forward, the plane moves away from the eye,
-        # which is the direction the axis was signed to point in.
-        center = lo + float(self._lever or 0.0) * span
+        # which is the direction the axis was signed to point in. Only the middle
+        # band of the travel carries the sweep -- the ends are "off" (see
+        # `sweep`).
+        center = lo + self.sweep(self._lever) * span
         target_half = 0.5 * self.thickness_fraction * span
         open_half = self.open_factor * span
         # Geometric, not linear, between the open and closed thicknesses: the slab

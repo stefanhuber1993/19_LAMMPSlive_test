@@ -99,15 +99,38 @@ VECTOR_MAX_PX = 130.0
 ARROWHEAD_LEN = 8
 ARROWHEAD_ANGLE = math.radians(25)
 
-# Circular "torque" arrows drawn around the puller bead: an arc starting at the
-# top of a ring and sweeping up to a semicircle left/right in proportion to the
-# applied (green) / reaction (red) torque about the control-plane normal. Radius
-# is a fraction of the puller's on-screen radius; the two arcs use slightly
-# different radii so they don't overdraw each other.
+# FLAT circular "torque" arrows drawn around the puller bead on a FORCE drive:
+# an arc starting at the top of a ring and sweeping up to a semicircle left/right
+# in proportion to the applied (green) / reaction (red) twist about the control-
+# plane normal. Radius is a fraction of the puller's on-screen radius; the two
+# arcs use slightly different radii so they don't overdraw each other.
+#
+# Flat is defensible only here. On a force drive the twist is about the control
+# plane's normal, which is the axis those scenes are looked down -- so the circle
+# the camera would see IS a circle. A torque drive turns the director about two
+# axes at once and neither of them is that one, which is what the rings below are
+# for.
 TORQUE_ARC_APPLIED_RADIUS = 0.62  # x puller radius (green, user's steering torque)
 TORQUE_ARC_REACTION_RADIUS = 0.82  # x puller radius (red, membrane's restoring torque)
 TORQUE_ARC_WIDTH = 3
 TORQUE_ARC_HEAD_LEN = 9
+
+# TORQUE RINGS -- what a torque drive draws instead (see Renderer._draw_torque_ring).
+# A real circle in the scene, in the plane the rotation happens in, so the camera
+# turns it into the ellipse that plane is actually seen as. Radii are multiples of
+# the bead's WORLD radius, and both are outside the bead: the ring has to pass
+# behind its own bead for the near/far halves to be tellable apart.
+TORQUE_RING_APPLIED_RADIUS = 1.30   # x bead radius (green, your steering torque)
+TORQUE_RING_REACTION_RADIUS = 1.75  # x bead radius (red, the membrane's answer)
+TORQUE_RING_WIDTH = 3.6             # px at the near edge, tapering with depth
+TORQUE_RING_HEAD_LEN = 11
+TORQUE_RING_MIN = 0.05              # hide below 5% of full scale, to declutter
+# How far the far half of a ring fades toward the scene background, and how much
+# of its width it loses. Both are depth cues and both are needed: a projected
+# ellipse on its own is the same ellipse for an axis tipped toward the camera and
+# one tipped away, so without them the sense of the rotation is a coin flip.
+TORQUE_RING_DEPTH_FADE = 0.55
+TORQUE_RING_DEPTH_TAPER = 0.45
 
 # --- 3D scene (MesoMem membrane patch and future 3D systems) ---------------
 # The 3D scene's own palette -- what it is drawn ON (and so what its fog fades

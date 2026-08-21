@@ -114,6 +114,7 @@ in float in_bright;     // per-instance albedo brightness multiplier (1 = normal
 in float in_energy;     // per-instance potential energy, for the energy colouring
 in vec4 in_tint;        // per-instance flat albedo (rgb) + how much of it to use (a)
 in float in_fade;       // per-instance 1 = full strength, 0 = fully faded to the background
+in float in_material;   // 0 = an ordinary bead, else a body's own material (renderer.BODY_MATERIALS)
 out vec3 v_centerView;
 out float v_radius;
 out vec3 v_dirView;
@@ -122,6 +123,7 @@ out float v_bright;
 out float v_energy;
 out vec4 v_tint;
 out float v_fade;
+out float v_material;
 void main() {
     vec4 cv = view * vec4(in_center, 1.0);
     vec3 C = cv.xyz;
@@ -133,6 +135,7 @@ void main() {
     v_energy = in_energy;
     v_tint = in_tint;
     v_fade = in_fade;
+    v_material = in_material;
 
     // ---- THE EXACT SILHOUETTE BILLBOARD ---------------------------------
     // A sphere's silhouette is a disc perpendicular to the direction TO THE
@@ -179,6 +182,9 @@ uniform float clipEnable; // 1 for periodic scenes (clip beads to the box), 0 ot
 uniform float colorMode;  // 0 = director bands, 1 = energy colormap, 2 = per-bead tint
 uniform vec2 energyRange; // (lo, hi) of the colormap, in the model's energy units
 uniform vec3 ramp[32];    // the colormap, sampled (see theme.INFERNO)
+uniform vec3 bodyLight;   // the mottling's two colours (style.body_color_light/dark),
+uniform vec3 bodyDark;    // ... already in linear light
+uniform float bodyMottle; // world size of the coarsest noise octave
 in vec3 v_centerView;
 in float v_radius;
 in vec3 v_dirView;
@@ -187,9 +193,40 @@ in float v_bright;
 in float v_energy;
 in vec4 v_tint;
 in float v_fade;
+in float v_material;
 layout(location=0) out vec4 o_albedo;
 layout(location=1) out vec3 o_normal;
 layout(location=2) out vec4 o_viewpos;
+
+// ---- value noise, for the bacterium material -------------------------------
+// A hash-per-lattice-point 3D value noise, trilinearly interpolated, summed over
+// three halving octaves. Cheap (no gradients, no permutation table) and this is
+// not asking for Perlin's isotropy: what it has to produce is blotches on a
+// surface a few sigma across, which the smoothstep interpolation already reads as
+// organic. The hash is the usual sin-fract one -- its artefacts are periodic at
+// scales far outside anything on screen here.
+float _hash3(vec3 p) {
+    return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123);
+}
+float _vnoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = p - i;
+    vec3 w = f * f * (3.0 - 2.0 * f);        // smoothstep, so octaves have no creases
+    float n000 = _hash3(i + vec3(0.0, 0.0, 0.0));
+    float n100 = _hash3(i + vec3(1.0, 0.0, 0.0));
+    float n010 = _hash3(i + vec3(0.0, 1.0, 0.0));
+    float n110 = _hash3(i + vec3(1.0, 1.0, 0.0));
+    float n001 = _hash3(i + vec3(0.0, 0.0, 1.0));
+    float n101 = _hash3(i + vec3(1.0, 0.0, 1.0));
+    float n011 = _hash3(i + vec3(0.0, 1.0, 1.0));
+    float n111 = _hash3(i + vec3(1.0, 1.0, 1.0));
+    return mix(mix(mix(n000, n100, w.x), mix(n010, n110, w.x), w.y),
+               mix(mix(n001, n101, w.x), mix(n011, n111, w.x), w.y), w.z);
+}
+float _fbm(vec3 p) {
+    return 0.57 * _vnoise(p) + 0.29 * _vnoise(p * 2.0) + 0.14 * _vnoise(p * 4.0);
+}
+
 void main() {
     vec3 dir = normalize(v_rayView);          // ray from the eye (origin) out
     vec3 c = v_centerView;
@@ -220,6 +257,48 @@ void main() {
     // arrive already converted to linear light (see to_linear).
     float s = dot(N, normalize(v_dirView));   // signed cos-latitude (+ = +n pole)
     vec3 albedo;
+    if (v_material > 0.5) {
+        // A BODY'S OWN MATERIAL, ahead of every colouring and instead of all of
+        // them (see RenderStyle.body_material for why the rod cannot wear any of
+        // them). Mottled cell wall: fbm between the two body colours, plus a
+        // finer, higher-contrast octave for granularity.
+        //
+        // NOTHING HERE MAY DEPEND ON THE SPHERE'S OWN NORMAL. A body is a row of
+        // overlapping impostors, so any per-sphere term -- a rim darkening
+        // toward the silhouette was the one tried -- is a stripe per sphere, and
+        // the capsule comes back as the stack of coins that handing every sphere
+        // an axis ACROSS the body was there to avoid (see
+        // MesoMemRod.glyph_spheres). The albedo is a function of world POSITION
+        // alone, and the rounding comes from the lighting pass, off the real
+        // per-pixel normals, as it does for a bead.
+        //
+        // The noise is sampled in the OWNER's frame -- v_tint.xyz carries its
+        // world position, which for this material is what that channel is for
+        // (the tint itself is dead here, and adding a fourth vec3 per instance to
+        // every bead in a 50k scene to serve one rod is not worth the bandwidth).
+        // Anchoring it there is what keeps the texture ON the rod as it is
+        // steered, instead of the rod sliding through a fixed field of blotches.
+        vec3 wp = (viewInv * vec4(hit, 1.0)).xyz;
+        vec3 q = (wp - v_tint.xyz) / max(bodyMottle, 1e-3);
+        // Stretched past 0..1 and clipped, so the blotches have flat cores and
+        // definite edges instead of everything sitting in the muddy middle of
+        // the ramp -- fbm's own distribution is heaped around 0.5.
+        float m = clamp(_fbm(q) * 2.1 - 0.55, 0.0, 1.0);
+        albedo = mix(bodyDark, bodyLight, m);
+        albedo *= 0.82 + 0.36 * _vnoise(q * 9.0);
+        o_albedo = vec4(albedo * v_bright, v_fade);
+        o_normal = N;
+        // w = 0 marks this pixel as a BODY, and the composite's outline pass is
+        // the one thing that asks. A body is a row of overlapping impostors, so
+        // its surface is faintly scalloped -- the creases where consecutive
+        // spheres meet -- and a depth-gradient outline finds every one of them
+        // and rules the capsule like a barcode. The silhouette's depth gradient
+        // is orders larger, so raising the threshold there (see
+        // BODY_OUTLINE_SCALE) keeps the contour and drops the creases. Every
+        // other pass reads only .xyz.
+        o_viewpos = vec4(hit, 0.0);
+        return;
+    }
     if (colorMode > 1.5) {
         // A colour the CPU picked for this bead and nothing more -- which cluster
         // it belongs to, crossfaded (see renderer._cluster_tints). Flat for the
@@ -256,7 +335,7 @@ void main() {
     // periodic image fades out with distance.
     o_albedo = vec4(albedo * v_bright, v_fade);
     o_normal = N;
-    o_viewpos = vec4(hit, 1.0);
+    o_viewpos = vec4(hit, 1.0);   // ... a bead, not a body: see the branch above
 }
 """
 
@@ -442,6 +521,12 @@ uniform float curvAO;
 uniform float outlineOn;
 uniform float outlineStrength;
 uniform float outlineThresh;
+// How much higher the outline's threshold is on a body than on a bead. Big,
+// because the two gradients it has to tell apart are: a silhouette (a jump of
+// the whole scene's depth) and a crease between two impostors a fraction of a
+// radius apart. Anywhere in this neighbourhood works; it is not a taste dial,
+// which is why it is a constant here rather than a RenderStyle field.
+#define BODY_OUTLINE_SCALE 12.0
 uniform vec3 outlineColor;
 uniform float cueOn;
 uniform float cueNear;
@@ -522,8 +607,14 @@ void main() {
             float du = -texture(posTex, uv + vec2(0.0,  texel.y)).z;
             float g = max(abs(dl - dr), abs(dd - du));
             // The threshold scales with distance, or ordinary perspective
-            // foreshortening would outline everything far away.
-            float t0 = outlineThresh * dist;
+            // foreshortening would outline everything far away. And it is raised
+            // on a BODY (posTex.w = 0, see the geometry shader): a body's surface
+            // is a row of overlapping sphere impostors and the creases between
+            // them are real depth gradients, small ones -- so this is the number
+            // that separates "the edge of the object" from "where two of the
+            // spheres it is built out of meet".
+            float t0 = outlineThresh * dist
+                     * (texture(posTex, uv).w < 0.5 ? BODY_OUTLINE_SCALE : 1.0);
             float edge = smoothstep(t0, t0 * 4.0, g);
             col = mix(col, outlineColor, clamp(edge * outlineStrength, 0.0, 1.0));
         }
@@ -893,6 +984,13 @@ class GLScene:
             self.geom_prog["pole_col"].value = to_linear(BEAD_POLE_COLOR, gamma)
             self.geom_prog["white_col"].value = to_linear(BEAD_WHITE_POLE_COLOR, gamma)
             self._albedo_gamma = gamma
+        # The body material's two colours. Per style rather than cached with the
+        # bead bands above, because a playground declares them (the bands are
+        # fixed by the model) -- and a uniform write is nothing.
+        self.geom_prog["bodyLight"].value = to_linear(style.body_color_light, gamma)
+        self.geom_prog["bodyDark"].value = to_linear(style.body_color_dark, gamma)
+        self.geom_prog["bodyMottle"].value = style.body_mottle_r * max(
+            float(bead_radius), 1e-6)
 
         r = max(float(bead_radius), 1e-6)
         light = tuple(float(v) for v in light_dir_view)
@@ -949,22 +1047,28 @@ class GLScene:
     # ---- per-frame instance / line uploads ----------------------------------
 
     def _upload_instances(self, centers, radii, directors, brights, energies,
-                          tints, fades):
-        """Upload all beads (opaque) into the geometry VAO. Layout is 14 floats
+                          tints, fades, materials):
+        """Upload all beads (opaque) into the geometry VAO. Layout is 15 floats
         per instance: center(3), radius(1), director(3), brightness(1),
-        energy(1), tint(4), fade(1).
+        energy(1), tint(4), fade(1), material(1).
 
         The energy and the tint are the two colourings that are not derived from
         the bead's own geometry, and only one of them is live at a time (see
-        `colorMode`), so four of those thirteen floats are always dead. Kept as
+        `colorMode`), so four of those fifteen floats are always dead. Kept as
         separate channels anyway: the energy is a NUMBER the shader ramps, which
         is what lets the ramp be retuned without touching the CPU, while the tint
         is already a colour, because what it encodes -- which cluster, crossfaded
-        -- is not a number the shader could map."""
+        -- is not a number the shader could map.
+
+        `material` is one float rather than a colour because it selects a whole
+        shading BRANCH (a body's own material -- see RenderStyle.body_material),
+        and that branch has no use for the tint, so the tint's three colour
+        channels carry its noise anchor instead. One float per bead for a feature
+        one playground uses is a fair price; four more would not be."""
         n = len(centers)
         if n == 0:
             return 0
-        data = np.empty((n, 14), dtype="f4")
+        data = np.empty((n, 15), dtype="f4")
         data[:, 0:3] = centers
         data[:, 3] = radii
         data[:, 4:7] = directors
@@ -972,19 +1076,21 @@ class GLScene:
         data[:, 8] = energies
         data[:, 9:13] = tints
         data[:, 13] = fades
+        data[:, 14] = materials
         raw = data.tobytes()
         if n > self._inst_capacity:
             if self._inst_vbo is not None:
                 self._inst_vbo.release()
             if self._geom_vao is not None:
                 self._geom_vao.release()
-            self._inst_vbo = self.ctx.buffer(reserve=max(1, n) * 14 * 4, dynamic=True)
+            self._inst_vbo = self.ctx.buffer(reserve=max(1, n) * 15 * 4, dynamic=True)
             self._inst_capacity = n
             self._geom_vao = self.ctx.vertex_array(
                 self.geom_prog,
                 [(self._quad_vbo, "2f", "in_corner"),
-                 (self._inst_vbo, "3f 1f 3f 1f 1f 4f 1f /i", "in_center", "in_radius",
-                  "in_dir", "in_bright", "in_energy", "in_tint", "in_fade")],
+                 (self._inst_vbo, "3f 1f 3f 1f 1f 4f 1f 1f /i", "in_center", "in_radius",
+                  "in_dir", "in_bright", "in_energy", "in_tint", "in_fade",
+                  "in_material")],
             )
         self._inst_vbo.write(raw)
         return n
@@ -1018,8 +1124,8 @@ class GLScene:
                line_verts=None, line_colors=None, brights=None,
                box_half=None, edge_fade=0.0, style=DEFAULT_STYLE,
                bead_radius=None, focal_px=None, light_dir_world=None,
-               energies=None, tints=None, fades=None, overlay_verts=None,
-               overlay_cols=None, color_mode=None):
+               energies=None, tints=None, fades=None, materials=None,
+               overlay_verts=None, overlay_cols=None, color_mode=None):
         """Render the beads (+ optional depth-occluded lines) into self.final_fbo.
 
         view/proj are row-major 4x4 numpy matrices (see view_matrix/proj_matrix).
@@ -1045,6 +1151,10 @@ class GLScene:
         arrays arrived, which is the older behaviour and is what a caller that
         only ever paints clusters wants. `fades` (per bead, 1 = full strength) blends a bead toward the
         background, which is how periodic image copies are made to trail off.
+        `materials` (per bead, 0 = an ordinary bead) switches an instance to a
+        body's own material instead of any colouring -- see
+        RenderStyle.body_material, and note that such an instance's `tints` rgb is
+        read as its noise anchor rather than as a colour.
         `overlay_verts/cols` are lines drawn over everything, depth test off.
         """
         c = self.ctx
@@ -1063,6 +1173,8 @@ class GLScene:
         energies = np.zeros(n, "f4") if energies is None else np.asarray(energies, "f4")
         tints = np.zeros((n, 4), "f4") if tints is None else np.asarray(tints, "f4")
         fades = np.ones(n, "f4") if fades is None else np.asarray(fades, "f4")
+        materials = (np.zeros(n, "f4") if materials is None
+                     else np.asarray(materials, "f4"))
         if bead_radius is None:
             bead_radius = float(np.median(radii)) if n else 1.0
 
@@ -1086,14 +1198,20 @@ class GLScene:
                           edge_fade, focal_px)
 
         n_op = self._upload_instances(centers, radii, directors, brights,
-                                      energies, tints, fades)
+                                      energies, tints, fades, materials)
 
         # --- geometry pass -> G-buffer (all beads, opaque) ---
         self.geom_prog["view"].write(vb)
         self.geom_prog["proj"].write(pb)
+        # view -> world, for the two things in the geometry shader that need a
+        # bead's WORLD position: clipping to the periodic cell's faces, and
+        # anchoring a body material's noise (see RenderStyle.body_material). One
+        # 4x4 inverse a frame, so it is written unconditionally rather than only
+        # for the periodic scenes -- the alternative is a stale matrix reaching a
+        # non-periodic scene that has a body in it, which is exactly the rod.
+        self.geom_prog["viewInv"].write(_gl(np.linalg.inv(view)))
         # Periodic clipping of beads to the box faces (opaque). Off for non-periodic.
         if box_half is not None:
-            self.geom_prog["viewInv"].write(_gl(np.linalg.inv(view)))
             self.geom_prog["boxHalf"].value = (float(box_half[0]), float(box_half[1]))
             self.geom_prog["clipEnable"].value = 1.0
         else:

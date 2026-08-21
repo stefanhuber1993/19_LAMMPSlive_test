@@ -37,6 +37,9 @@ while looking for it: a rod already held by adhesion cannot be twisted, because
 the restoring torque on the arc is bigger than the steering. That clamping IS the
 wrap.
 
+The rod is drawn as a mottled capsule rather than in the membrane's own colours,
+because it is not made of membrane: see `body_material` in STYLE below.
+
 The HUD's three numbers are the wrapping story: how deep the rod sits (negative
 once the mean membrane surface has closed over its centre), how many beads are
 touching it, and whether it is lying flat or standing up.
@@ -94,6 +97,14 @@ STYLE = DEFAULT_STYLE.varied(
     ao_strength=9.83,           # contact darkening where the beads meet the rod
     outline_strength=12.0,
     outline_edge_fraction=0.90,
+    # THE ROD IS NOT A BEAD, so it is not painted like one. Its body is drawn in
+    # its own mottled material -- see RenderStyle.body_material for the two
+    # reasons the bead colourings cannot serve it, the second of which is a hard
+    # one: on the energy ramp the rod's own potential runs to several hundred eps
+    # against a bead's single digits, so it sits pinned at the bright end in every
+    # configuration and the brightest object in the frame is the one whose colour
+    # means nothing. A cell wall instead, whichever colouring the beads are in.
+    body_material="bacterium",
 ).on_light()
 
 # Rod geometry, in sigma. Repeated here because three declarations below need to
@@ -147,7 +158,7 @@ PLAYGROUND = Playground(
         # therefore takes the same wall time to form either way; it just arrives
         # in more frames.
         timestep=0.005,
-        sim_time_per_frame=0.03,
+        sim_time_per_frame=0.08,
         rod_height=ROD_HEIGHT,
         # Lying flat, along the control plane's horizontal axis -- the orientation
         # adhesion wants, so the demo starts from the interesting configuration

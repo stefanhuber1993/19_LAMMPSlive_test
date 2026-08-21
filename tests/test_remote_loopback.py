@@ -510,8 +510,8 @@ def test_switching_playground_and_back_keeps_the_servers_simulation(server,
     The client closes its link on the way out; the server holds the simulation where
     it was and waits for the next client (`serve_forever`), which is what lets the
     app come back to the same coarsened box over the tunnel it never closed -- see
-    RemoteSession.reopen_link and RemotePanel._resume. What is checked here is the
-    half that involves an actual socket: that a second client picks the run up
+    RemoteSession.reopen_link and RemotePanel.attach_system. What is checked here is
+    the half that involves an actual socket: that a second client picks the run up
     rather than starting one.
     """
     srv, port = server
@@ -549,6 +549,65 @@ def test_switching_playground_and_back_keeps_the_servers_simulation(server,
         assert second.get_sim_time() > t_away
     finally:
         second.close()
+
+
+def test_a_client_can_move_the_server_to_another_playground(server, tmp_path):
+    """One allocation, two demos -- the half of it that crosses a socket.
+
+    A client whose hello names a playground other than the one loaded gets that one
+    built in its place, on the same server, through the same port: no second
+    allocation, and no second queue wait. Switching back builds the first again. What
+    is NOT preserved is either run's state, which is the honest cost and the reason
+    the panel makes it a button press (see server.FrameServer.switch_playground).
+    """
+    srv, port = server
+    from lammps_live.playground import registry
+
+    other = tmp_path / "other_loopback.py"
+    # The same deck at a different size, so "which one is loaded" is a fact the
+    # client can read off the welcome rather than take on trust.
+    other.write_text(PLAYGROUND_SOURCE.replace("n=900", "n=420")
+                                      .replace("loopback assembly", "smaller"))
+    first_ref = srv.playground_ref
+
+    def client(ref):
+        sys_ = registry.build(str(ref),
+                              remote_override=RemoteTarget(host="127.0.0.1",
+                                                           local_port=port,
+                                                           profile="local"))
+        sys_.attach(FrameLink.connect("127.0.0.1", port, TOKEN, timeout=60.0,
+                                      playground=str(ref)))
+        return sys_
+
+    moved = client(other)
+    try:
+        assert srv.playground_ref == str(other)
+        assert moved.natoms == 420
+        assert moved.link.welcome["playground"] == str(other)
+        assert moved.get_sim_time() == 0.0, "a rebuilt run starts from zero"
+        moved.set_playing(True)
+        _advance(moved, frames=3)
+    finally:
+        moved.close()
+
+    back = client(first_ref)
+    try:
+        assert srv.playground_ref == first_ref
+        assert back.natoms == 900
+        back.set_playing(True)
+        _advance(back, frames=3)
+    finally:
+        back.close()
+
+
+def test_a_client_that_names_nothing_leaves_the_server_alone(server, system):
+    """The CLI path sends no playground, and a server started with --playground must
+    not be second-guessed by it -- that is the difference between "connect to what is
+    running" and "put this on the GPU"."""
+    srv, _port = server
+    loaded = srv.playground_ref
+    _advance(system, frames=2)
+    assert srv.playground_ref == loaded
 
 
 def test_a_bad_parameter_does_not_take_the_server_down(system, server):

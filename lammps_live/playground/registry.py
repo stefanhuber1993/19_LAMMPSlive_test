@@ -48,16 +48,29 @@ def _playground_of(module, fallback_key):
 
 
 # The order the picker, the number keys and Tab walk through. Not alphabetical:
-# the three MesoMem playgrounds are the point of the demo and build on each other
-# (one patch -> a sheet of them -> a box that assembles itself), so they come
-# first and in that order. Anything not named here follows, alphabetically, so a
-# new playground file appears without editing this list.
-# mesomem_rod adds a second species to the membrane rather than more of it, so it
-# follows the three that build the membrane up; then the two that run on a cluster
-# GPU, in the order they build on what came before -- mesomem_remote is the
-# assembly box scaled up, and mesomem_polymer closes the membrane into a vesicle
-# and puts something inside it.
-_ORDER = ("mesomem_patch", "mesomem_sheet", "mesomem_assembly", "mesomem_rod",
+# the MesoMem playgrounds are the point of the demo and build on each other, so
+# they come first and in the order a talk goes through them. Anything not named
+# here follows, alphabetically, so a new playground file appears without editing
+# this list.
+#
+# The sequence, and what each one adds to the one before it:
+#
+#   mesomem_bead          one bead: the controls, and no physics at all
+#   mesomem_patch         seven, driven by FORCE -- pull one out of the plane
+#   mesomem_patch_torque  the same seven, driven by TORQUE -- twist one instead
+#   mesomem_sheet         a periodic monolayer of them
+#   mesomem_assembly      a box that finds the monolayer for itself
+#   mesomem_rod           a second species: something for the membrane to wrap
+#   mesomem_remote        the assembly box scaled up on a cluster GPU
+#   mesomem_polymer       and closed into a vesicle with a polymer inside it
+#
+# The two force/torque patches are adjacent deliberately: they are the same seven
+# beads and the same force field, and switching between them with Tab is the
+# comparison (see mesomem_patch_torque's docstring). The two remote ones are last
+# and adjacent for a different reason -- they share one GPU allocation, and moving
+# between them is a thing the connect panel has to handle (see ui/remote_panel.py).
+_ORDER = ("mesomem_bead", "mesomem_patch", "mesomem_patch_torque",
+          "mesomem_sheet", "mesomem_assembly", "mesomem_rod",
           "mesomem_remote", "mesomem_polymer")
 
 

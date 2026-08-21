@@ -176,11 +176,17 @@ class OrbitController:
         Same three numbers the drag and the auto-orbit write, so this composes
         with both -- and, like a drag, taking the stick stops the automatic turn
         (a camera that is both flown and turning is unusable, and C hands it
-        back). The convention is the PILOT's, not the drag's "globe under your
-        finger": push right and you travel right around the box, push forward and
-        you climb over the top of it. That is the mapping a stick in the hand
-        reads as movement, and it is why this is not just drag() with the pixels
-        swapped for a rate.
+        back).
+
+        BOTH AXES MOVE THE SCENE, NOT THE CAMERA -- the same "globe under your
+        finger" convention as drag(), which is why both rates go in negated. Push
+        right and the near face of the box goes right (the eye travels left);
+        push forward and the near face tips up (the eye sinks). The other
+        mapping, the PILOT's -- push right and you travel right AROUND the box --
+        was what this shipped with first, and in the hand it reads as inverted on
+        both axes: what you are looking at is one object a metre in front of you,
+        so the hand expects to be turning THAT, not flying around it. The mouse
+        drag has always said so; this now agrees with it.
         """
         s = self.spec
         rate_x = self._stick_rate(x, s.stick_slow_speed, s.stick_speed)
@@ -189,8 +195,8 @@ class OrbitController:
             return
         self.auto = False
         limit = np.radians(s.elev_limit_deg)
-        self.azimuth += rate_x * dt
-        self.elev = float(np.clip(self.elev + rate_y * dt, -limit, limit))
+        self.azimuth -= rate_x * dt
+        self.elev = float(np.clip(self.elev - rate_y * dt, -limit, limit))
 
     def steer_zoom(self, twist, dt):
         """Dolly from a held twist axis, in wheel notches per second, through the

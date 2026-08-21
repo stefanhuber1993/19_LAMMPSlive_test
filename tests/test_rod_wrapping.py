@@ -464,13 +464,14 @@ def test_the_drawn_body_wears_the_rods_own_colour():
     # that lines up with the real array's row numbering.
     m = 2 * (n - 1)
     tiled = (np.zeros((m, 3)), np.zeros((m, 3)), np.ones(m), np.zeros(m),
-             np.zeros((m, 3)), np.ones(m), np.full(m, 0.5, dtype=np.float32))
+             np.zeros((m, 3)), np.ones(m), np.full(m, 0.5, dtype=np.float32),
+             np.zeros(m, dtype=np.float32))
 
     centers = np.linspace(-2.0, 2.0, k)[:, None] * np.array([1.0, 0.0, 0.0])
     glyphs = (centers, np.full(k, 1.5), np.tile([1.0, 0.0, 0.0], (k, 1)),
               np.full(k, rod))
     out = renderer._append_bodies(glyphs, np.array([rod]), real, 0.5, *tiled)
-    gpts, gdips, gbright, genergy, gtint, gfade, gradii = out
+    gpts, gdips, gbright, genergy, gtint, gfade, gradii, gmaterial = out
 
     assert len(gpts) == m + 1 + k
     assert np.array_equal(gpts[:m], tiled[0])       # the tiled beads, untouched
@@ -485,6 +486,50 @@ def test_the_drawn_body_wears_the_rods_own_colour():
     assert genergy[m:] == pytest.approx(real["energy"][rod])
     assert gtint[m:] == pytest.approx(np.tile(real["tint"][rod], (1 + k, 1)))
     assert gfade[m:] == pytest.approx(1.0)          # drawn once, never faded
+    assert gmaterial == pytest.approx(0.0)          # no declared body material
+
+
+def test_a_declared_body_material_takes_the_whole_object_off_the_colourings():
+    """`RenderStyle.body_material` marks the owner particle AND every sphere of its
+    body, and hands each of them the OWNER's position in the tint channel.
+
+    Both halves matter. Marking the body but not the particle inside it would
+    leave a bead of a different colour showing through the ends of the capsule.
+    And the tint channel stops being a colour here and becomes the anchor the
+    shader samples the material's noise about -- the owner's position, the same
+    for every sphere of one body, which is what keeps the texture ON the rod as it
+    is steered rather than the rod sliding through a fixed field of it.
+    """
+    import os
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+    from lammps_live.ui.renderer import BODY_MATERIALS, Renderer
+
+    renderer = Renderer.__new__(Renderer)
+    n, k, rod = 6, 4, 2
+    real = dict(
+        pts=np.arange(3 * n, dtype=float).reshape(n, 3),
+        dips=np.tile([0.0, 0.0, 1.0], (n, 1)),
+        bright=np.ones(n),
+        energy=np.arange(n, dtype=float) * -3.0,
+        tint=np.tile(np.arange(n, dtype=float)[:, None], (1, 4)),
+    )
+    empty = (np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0), np.zeros(0),
+             np.zeros((0, 4)), None, np.zeros(0, dtype=np.float32),
+             np.zeros(0, dtype=np.float32))
+    centers = np.linspace(-2.0, 2.0, k)[:, None] * np.array([1.0, 0.0, 0.0])
+    glyphs = (centers, np.full(k, 1.5), np.tile([1.0, 0.0, 0.0], (k, 1)),
+              np.full(k, rod))
+
+    material = BODY_MATERIALS["bacterium"]
+    out = renderer._append_bodies(glyphs, np.array([rod]), real, 0.5, *empty,
+                                  material)
+    gtint, gmaterial = out[4], out[7]
+    assert len(gmaterial) == 1 + k
+    assert gmaterial == pytest.approx(material), "the particle is marked too"
+    # The anchor, not a colour: the owner's world position, on every row.
+    assert gtint[:, :3] == pytest.approx(np.tile(real["pts"][rod], (1 + k, 1)))
+    assert gtint[:, 3] == pytest.approx(0.0)
 
 
 # --- constant lateral pressure -------------------------------------------------

@@ -301,11 +301,52 @@ class FrameServer:
             return None
         return header
 
+    def switch_playground(self, ref):
+        """Point this server at a different playground, throwing away the one it is
+        holding. True if anything changed.
+
+        THIS IS WHAT MAKES ONE ALLOCATION SERVE SEVERAL DEMOS. Getting a GPU is the
+        expensive, queued, prompt-answering part; building a playground on one that
+        is already ours is tens of seconds and no queue at all. So a client that
+        connects naming a playground other than the one loaded gets the loaded one
+        closed -- which frees its LAMMPS instance, and with it the GPU memory it was
+        holding -- and the named one built in its place, on the same node, through
+        the same tunnel, with the same job id. Switching back later is the same move
+        in reverse; what is NOT preserved is the state of the run being left, which
+        is the honest cost of the trade (see ui/remote_panel.py, which is what asks).
+
+        Closing here is safe for the one reason that matters: the server serves one
+        client at a time, and this runs during a handshake, so the serve loop has
+        returned and nothing is inside `lmp.command("run ...")` (see `close`).
+
+        THE TOKEN IS THE BOUNDARY. `ref` reaches `registry.load`, which will import
+        a path as well as a bundled name -- but only a client holding the session
+        token gets this far, and such a client can already drive the deck through
+        every control message there is. This adds no capability it did not have.
+        """
+        if not ref or ref == self.playground_ref:
+            return False
+        self.log(f"client asked for {ref}, holding {self.playground_ref} -- "
+                 f"switching")
+        self.close()
+        self.playground_ref = ref
+        # The new run starts stopped and from sequence zero, which is how the client
+        # recognises it as a different run rather than a jump in the old one (see
+        # RemoteSystem._is_new_run).
+        self.playing = False
+        self.seq = 0
+        self._fault = None
+        return True
+
     def serve_client(self, sock):
         protocol.set_socket_options(sock)
-        if self._authenticate(sock) is None:
+        header = self._authenticate(sock)
+        if header is None:
             return
         sock.settimeout(None)
+        # Asked for before anything is said about building, so the message below
+        # names the playground that is actually about to be built.
+        self.switch_playground(header.get("playground"))
         if self.system is None:
             # SAY SO FIRST. Building 10k beads is `plugin load`, a rejection-sampled
             # random fill and LAMMPS' own setup -- tens of seconds, all of it before

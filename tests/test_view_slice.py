@@ -34,10 +34,10 @@ def test_moving_the_lever_engages_and_fully_closes_within_the_transition():
     vs = ViewSlice()
     step(vs, 0.5, 0.1)                 # the first reading is recorded, not acted on
     assert vs.plane is None
-    plane = step(vs, 0.8, vs.transition_seconds + 0.05)
+    plane = step(vs, 0.6, vs.transition_seconds + 0.05)
     assert vs.progress == pytest.approx(1.0)
-    # 5% of a 20-sigma box, as a half-thickness.
-    assert plane.half == pytest.approx(0.5 * 0.05 * 20.0, rel=1e-6)
+    # 15% of a 20-sigma box, as a half-thickness.
+    assert plane.half == pytest.approx(0.5 * 0.15 * 20.0, rel=1e-6)
 
 
 def test_noise_below_the_touch_epsilon_is_not_a_touch():
@@ -49,18 +49,48 @@ def test_noise_below_the_touch_epsilon_is_not_a_touch():
     assert vs.plane is None
 
 
-def test_it_opens_back_up_after_the_hold_and_re_engages_on_the_next_touch():
+def test_a_cut_stays_cut_for_as_long_as_the_lever_is_left_where_it_is():
+    """There is no idle timeout: the lever is a position, and nobody should have
+    to keep touching it to be believed."""
     vs = ViewSlice()
     step(vs, 0.5, 0.1)
-    step(vs, 0.8, 1.0)
-    assert vs.engaged
-    # Held still for longer than the hold, plus the transition back out.
-    step(vs, 0.8, vs.hold_seconds + vs.transition_seconds + 0.2)
+    step(vs, 0.6, 1.0)
+    assert vs.engaged and vs.progress == pytest.approx(1.0)
+    plane = step(vs, 0.6, 30.0)             # half a minute of not touching it
+    assert vs.engaged and vs.progress == pytest.approx(1.0)
+    assert plane.half == pytest.approx(0.5 * 0.15 * 20.0, rel=1e-6)
+
+
+def test_both_stops_mean_no_slicing_and_the_middle_means_slicing():
+    """The lever's two ends are "off" -- whichever one your hand is nearest,
+    shoving it there gives the whole scene back."""
+    vs = ViewSlice()
+    step(vs, 0.5, 0.1)
+    assert vs.demand(0.0) == 0.0
+    assert vs.demand(1.0) == 0.0
+    assert vs.demand(0.5) == pytest.approx(1.0)
+    assert vs.demand(vs.edge_fraction) == pytest.approx(1.0)
+    assert vs.demand(1.0 - vs.edge_fraction) == pytest.approx(1.0)
+    # ...and the ramp between is monotone, so running the lever into a stop opens
+    # the box smoothly rather than snapping it together.
+    ramp = [vs.demand(x * vs.edge_fraction) for x in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert ramp == sorted(ramp)
+    assert 0.0 < ramp[2] < 1.0
+
+
+def test_the_lever_at_a_stop_opens_the_box_back_up():
+    vs = ViewSlice()
+    step(vs, 0.5, 0.1)
+    step(vs, 0.6, 1.0)
+    assert vs.plane is not None
+    step(vs, 1.0, vs.transition_seconds + 0.2)     # hard forward
     assert not vs.engaged
     assert vs.progress == 0.0 and vs.plane is None
-    # ...and touching it again picks the slice straight back up.
-    step(vs, 0.6, vs.transition_seconds + 0.05)
+    # Back into the band and the slice picks straight back up.
+    step(vs, 0.4, vs.transition_seconds + 0.05)
     assert vs.engaged and vs.progress == pytest.approx(1.0)
+    step(vs, 0.0, vs.transition_seconds + 0.2)     # hard back: also off
+    assert not vs.engaged and vs.plane is None
 
 
 def test_the_transition_is_monotone_and_cuts_nothing_at_the_open_end():
@@ -84,12 +114,17 @@ def test_the_transition_is_monotone_and_cuts_nothing_at_the_open_end():
 
 
 def test_the_lever_sweeps_the_plane_from_the_near_face_to_the_far_one():
+    """The sweep is carried by the middle band of the travel -- the ends are the
+    "off" positions -- so the plane reaches both faces while still cutting."""
     vs = ViewSlice()
     step(vs, 0.5, 0.1)
-    near = step(vs, 0.0, 1.0)
+    edge = vs.edge_fraction
+    near = step(vs, edge, 1.0)
     assert near.center == pytest.approx(-10.0)
-    far = step(vs, 1.0, 1.0)
+    assert vs.engaged, "the near face is still a cut, not the off position"
+    far = step(vs, 1.0 - edge, 1.0)
     assert far.center == pytest.approx(10.0)
+    assert vs.engaged
     # The normal points AWAY from the eye, so pushing the lever forward pushes
     # the cut into the scene.
     assert np.dot(near.normal, FORWARD) > 0
@@ -147,8 +182,13 @@ def test_reset_forgets_the_lever():
 def test_mask_keeps_the_slab_and_nothing_else():
     vs = ViewSlice()
     step(vs, 0.5, 0.1)
-    plane = step(vs, 0.75, 1.0)          # centre at -10 + 0.75*20 = +5 along +y
-    pts = np.array([[0.0, y, 0.0] for y in (-9.0, 0.0, 4.8, 5.0, 5.2, 9.0)])
+    # 0.15 + 0.75 * 0.70 = 0.675 on the lever -> three quarters along the box,
+    # i.e. a centre at -10 + 0.75 * 20 = +5 along +y, and a 1.5-sigma half-slab
+    # (15% of the 20-sigma box, halved).
+    plane = step(vs, vs.edge_fraction + 0.75 * (1.0 - 2 * vs.edge_fraction), 1.0)
+    assert plane.center == pytest.approx(5.0)
+    assert plane.half == pytest.approx(1.5)
+    pts = np.array([[0.0, y, 0.0] for y in (-9.0, 0.0, 3.6, 5.0, 6.4, 9.0)])
     keep = plane.mask(pts)
     assert list(keep) == [False, False, True, True, True, False]
 

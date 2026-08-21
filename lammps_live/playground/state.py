@@ -357,6 +357,69 @@ def icosphere_faces(nu):
     return centres, normals
 
 
+def nearest_neighbour_distances(points):
+    """Distance from every point to its nearest OTHER point, as an (N,) array.
+
+    Pure numpy, and that is the point of it. This is reached from a scenario's
+    `build`, and `build` runs on the REMOTE server, which is given numpy and
+    nothing else -- scipy is a client-side dependency, because the analysis is
+    what needs it (see `build_pairs`). A `cKDTree` on this path is a
+    ModuleNotFoundError that arrives after the cluster has already allocated the
+    node, which is exactly how it was found.
+
+    Exact, not an estimate. The points are sorted by z and each is compared only
+    against those within `band` of it on that axis. Since |dz| <= |dr|, anything
+    the band excludes is further away than the band itself, so a distance that
+    comes out BELOW the band is provably the nearest neighbour -- and if any does
+    not, the band doubles and the sweep runs again. The band starts at a few
+    times the spacing a uniform cloud of this size would have, which for the
+    geodesic spheres this is called on settles in a pass or two.
+    """
+    p = np.asarray(points, dtype=float)
+    n = len(p)
+    if n < 2:
+        return np.zeros(n)
+
+    order = np.argsort(p[:, 2], kind="stable")
+    q = p[order]
+    z = q[:, 2]
+    span = float(z[-1] - z[0])
+    band = span * 4.0 / math.sqrt(n)
+    if not band > 0.0:
+        # A cloud flat in z (or one so thin the ratio underflows): compare
+        # everything against everything and be done in one pass, rather than
+        # doubling a band of zero forever.
+        band = span
+    best = np.zeros(n)
+
+    while True:
+        # Rows per block, so that one distance matrix stays a few million
+        # entries however wide the band has grown.
+        share = 1.0 if span <= 0.0 else min(1.0, 2.0 * band / span)
+        rows = max(1, min(256, int(4.0e6 / max(1.0, n * share))))
+        s = 0
+        while s < n:
+            e = min(s + rows, n)
+            lo = int(np.searchsorted(z, z[s] - band, side="left"))
+            hi = int(np.searchsorted(z, z[e - 1] + band, side="right"))
+            diff = q[s:e, None, :] - q[None, lo:hi, :]
+            d2 = np.einsum("ijk,ijk->ij", diff, diff)
+            # lo <= s and hi >= e always (the band is non-negative), so every row
+            # contains its own point, at the column its own index maps to.
+            d2[np.arange(e - s), np.arange(s, e) - lo] = np.inf
+            best[s:e] = np.sqrt(d2.min(axis=1))
+            s = e
+        # Every distance inside the band means every one of them is the true
+        # nearest; a band as wide as the cloud has already compared everything.
+        if best.max() < band or band >= span:
+            break
+        band *= 2.0
+
+    out = np.empty(n)
+    out[order] = best
+    return out
+
+
 @lru_cache(maxsize=32)
 def icosphere_spacing(nu):
     """Mean nearest-neighbour distance between the faces of `icosphere_faces(nu)`
@@ -376,16 +439,14 @@ def icosphere_spacing(nu):
     poles. The membrane is a fluid and relaxes it out within a few hundred steps.
 
     Cached, because `VesiclePolymer.radius` is asked for it on every camera fit and
-    every ring-count query, and at the shipped size this is a tree over 18,000
+    every ring-count query, and at the shipped size this is a sweep over 18,000
     points.
     """
     nu = max(1, int(nu))
-    from scipy.spatial import cKDTree
     centres, _ = icosphere_faces(nu)
     if len(centres) < 2:
         return 1.0
-    d, _ = cKDTree(centres).query(centres, k=2)
-    return float(d[:, 1].mean())
+    return float(nearest_neighbour_distances(centres).mean())
 
 
 def lattice_ring(nx, ny, nz):
