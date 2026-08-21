@@ -52,9 +52,13 @@ def _playground_of(module, fallback_key):
 # (one patch -> a sheet of them -> a box that assembles itself), so they come
 # first and in that order. Anything not named here follows, alphabetically, so a
 # new playground file appears without editing this list.
-# mesomem_remote is the same assembly run on a cluster GPU, so it comes straight
-# after the local one it scales up.
-_ORDER = ("mesomem_patch", "mesomem_sheet", "mesomem_assembly", "mesomem_remote")
+# mesomem_rod adds a second species to the membrane rather than more of it, so it
+# follows the three that build the membrane up; then the two that run on a cluster
+# GPU, in the order they build on what came before -- mesomem_remote is the
+# assembly box scaled up, and mesomem_polymer closes the membrane into a vesicle
+# and puts something inside it.
+_ORDER = ("mesomem_patch", "mesomem_sheet", "mesomem_assembly", "mesomem_rod",
+          "mesomem_remote", "mesomem_polymer")
 
 
 def bundled_keys():

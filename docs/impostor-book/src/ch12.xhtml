@@ -127,7 +127,7 @@ cutoff that bounds how many pairs get drawn at all, which is what keeps this
 <h3>Per-vertex colour, and the fog</h3>
 
 <pre>fog = self._fog(depth[idx], near, far)
-r, g, bb = _lerp_color(BOND_3D_COLOR, HAZE_COLOR, fog)</pre>
+r, g, bb = _lerp_color(style.bond_color, style.background, fog)</pre>
 
 <p>Each endpoint gets its own colour, computed at its own depth, and the GPU
 interpolates between them along the segment. A single line therefore fogs

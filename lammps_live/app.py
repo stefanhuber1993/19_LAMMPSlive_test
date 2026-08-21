@@ -1,6 +1,6 @@
 """Main control loop: owns the active system, the input source, the
 renderer, and the force-feedback shaping that connects them. Switching
-systems at runtime (number keys / Tab / joystick buttons 3-4) tears down the old
+systems at runtime (number keys / Tab / shift-Tab / joystick buttons 3-4) tears down the old
 LAMMPS instance and rebuilds the UI state (renderer scale, sliders, history,
 smoothers) for the new one, in place.
 
@@ -10,8 +10,10 @@ what decides whether the stick is flying the camera, holding a bead, or setting 
 value. See control_focus.py for the model, and _route_stick / _poll_device_buttons
 below for the mapping.
 """
+import atexit
 import math
 import os
+import signal
 import sys
 from time import perf_counter
 
@@ -19,6 +21,7 @@ import pygame
 
 from . import config, units
 from .control_focus import Choice, ControlFocus
+from .view_slice import ViewSlice
 from .forcefeedback import (
     ExponentialSmoother2D, shape_damper_coefficient, shape_interaction_force,
     shape_stiffness, shape_velocity_damping,
@@ -29,7 +32,7 @@ from .input import (
     CP_OFFSET_MAX, DAMPER_COEFFICIENT_MAX, JoystickInput, KeyboardInput,
     MouseInput, SPRING_STIFFNESS_MAX,
 )
-from .ui import AtomTrails, Renderer, RollingHistory, Slider
+from .ui import BEAD_COLOR_MODES, AtomTrails, Renderer, RollingHistory, Slider
 from .ui.camera import Camera3D, OrbitController
 from .ui.alert import Alert
 from .ui.remote_panel import RemotePanel
@@ -43,6 +46,11 @@ class App:
                  ui_scale=None):
         self.input_mode = input_mode
         self.debug = debug
+        # Whether `_shutdown` has run. It is reachable from the loop's `finally`,
+        # from an atexit hook and from a signal that unwinds through both, and
+        # releasing the same session twice is not free -- the second scancel goes
+        # out over an ssh that is already closing.
+        self._shut_down = False
         # `--remote HOST:PORT`: connect a remote playground straight to a server
         # that is already running, instead of allocating one. The loopback path --
         # no SSH, no Slurm, no connect panel.
@@ -60,8 +68,17 @@ class App:
         # playground layer adds between LAMMPS steps (energy decomposition and
         # observables); keeping it visible is what makes the frame budget
         # something you can check rather than assume.
+        # "gather" is the block that reads a frame's worth of state out of the
+        # system (step 3 of _tick): whole-system position, director and energy
+        # arrays, the RDF sample, the panels. It grows with the bead count and it
+        # runs on THIS thread, in front of the drawing, so on the big scenes it is
+        # the part of "other" worth being able to see.
         self._prof_ms = {"sim": 0.0, "analysis": 0.0, "read": 0.0, "ff": 0.0,
-                         "render": 0.0, "other": 0.0}
+                         "gather": 0.0, "render": 0.0, "other": 0.0}
+        # Wall time the last frame's analysis took on the stepper thread, whether
+        # or not any of it landed on the frame. Reported alongside the breakdown
+        # rather than inside it -- see _update_debug.
+        self._analysis_wall_ms = 0.0
         self._debug_line = None
         # [(key, SystemSpec), ...] in a stable order for the picker and the
         # number keys. Specs only -- no LAMMPS instance is built to list them.
@@ -134,13 +151,18 @@ class App:
         # or one slider -- rebuilt per system in _build_system. See
         # control_focus.py; the hat switch is what moves it.
         self.focus = ControlFocus()
+        # The thrust lever's cut through the scene. Not part of the focus cycle --
+        # it has its own axis on the device and drives nothing else, so it works
+        # whatever the stick is currently pointed at. See view_slice.py.
+        self.view_slice = ViewSlice()
         # The bead colouring, as a focus stop: the same state the mouse toggle
-        # flips (renderer.bead_color_energy), reachable from the hat cycle. Its
+        # flips (renderer.bead_color_mode), reachable from the hat cycle. Its
         # options are pictures rather than points on a scale, so it steps once per
         # push instead of walking -- see control_focus.Choice.
         self.color_choice = Choice(
-            "bead colour", ("director", "energy"),
-            on_change=lambda i: setattr(self.renderer, "bead_color_energy", bool(i)))
+            "bead colour", BEAD_COLOR_MODES,
+            on_change=lambda i: setattr(self.renderer, "bead_color_mode",
+                                        BEAD_COLOR_MODES[i]))
         # Whether the puller was released BY moving the focus off the viewport, so
         # coming back re-grabs it -- and a bead the user let go of with the trigger
         # is left alone (see _cycle_focus).
@@ -351,10 +373,13 @@ class App:
         # the playground's.
         choices = ()
         if spec.render_3d:
-            self.color_choice.index = int(self.renderer.bead_color_energy)
+            self.color_choice.index = BEAD_COLOR_MODES.index(
+                self.renderer.bead_color_mode)
             choices = (self.color_choice,)
         self.focus.set_stops([s for s in self._sliders() if not s.advanced], choices)
         self._focus_released_puller = False
+        # A different box, and a lever nobody has touched since: start whole again.
+        self.view_slice.reset()
 
         if self.history is None:
             self.history = RollingHistory(config.HISTORY_WINDOW_SECONDS, ["temp", "press", "ke", "pe", "etotal"])
@@ -483,19 +508,84 @@ class App:
     def run(self):
         dt = 1.0 / 60  # seconds; seed value, replaced by the real measured frame time below
         running = True
+        self._install_exit_signals()
+        # The last line of defence, and the only one that covers a `sys.exit` from
+        # somewhere that never entered this loop. `_shutdown` is idempotent, so the
+        # ordinary path running it first costs nothing.
+        atexit.register(self._shutdown)
         try:
             while running:
                 running = self._handle_events(dt)
                 dt = self._tick(dt)
         finally:
-            self._sim_idle()
-            self.source.close()
-            # Before closing the system: this cancels the cluster job and closes the
-            # tunnel, and it is the whole reason the allocation is safe to start from
-            # a GUI. It is a no-op for a local playground.
-            self.remote_panel.release()
-            self.system.close()
-            pygame.quit()
+            self._shutdown()
+
+    # Signals whose default action is to end the process, and which therefore skip
+    # every `finally` in this file. `kill` sends the first, a closed terminal the
+    # second, a macOS logout both. SIGKILL is not here because it cannot be: that
+    # one is what the server's own idle timeout exists for.
+    EXIT_SIGNALS = ("SIGTERM", "SIGHUP", "SIGINT")
+
+    def _install_exit_signals(self):
+        """Turn a kill, a closed terminal or a logout into a normal exit.
+
+        AN ALLOCATION IS NOT A FILE HANDLE. Everything else this app holds is
+        released by the OS when the process goes; a GPU on the other side of the
+        country is not, and stays held until Slurm's own hour is up. So the signals
+        that would otherwise end the process silently are caught and turned into a
+        `SystemExit`, which unwinds through `run`'s `finally` and gives the job
+        back on the way out.
+
+        Raised rather than handled in place because the handler runs on the main
+        thread at an arbitrary point: unwinding puts the teardown back on the
+        thread that owns the window, in the one place that already knows the order
+        to do it in.
+        """
+        def _bail(signum, _frame):
+            print(f"[lammps-live] signal {signum} -- closing down")
+            raise SystemExit(128 + signum)
+
+        for name in self.EXIT_SIGNALS:
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, _bail)
+            except (ValueError, OSError):
+                # Not the main thread, or a platform without it. The `finally` and
+                # the atexit hook still cover everything that unwinds.
+                pass
+
+    def _shutdown(self):
+        """Give everything back, once, however the app is ending.
+
+        EACH STEP GUARDED SEPARATELY, and the allocation released first. This used
+        to be five statements in a `finally`, which meant that anything raising --
+        a joystick whose device had already gone, a stepper re-raising the error
+        that ended the run -- skipped every step after it. The one that must not be
+        skipped is `remote_panel.release`: it is the call that runs `scancel`, and
+        the only one whose failure costs an A100 for the rest of the hour rather
+        than a warning on the way out.
+
+        The simulation thread does not have to be idle for it. A remote step reads
+        a socket the release has closed, which is answered rather than raised
+        (`FrameLink.send` and `take_frame` both treat a closed link as "nothing"),
+        so the release goes first and the wait for the worker follows it.
+        """
+        if self._shut_down:
+            return
+        self._shut_down = True
+        # Ordered by what it costs to skip. `release` is a no-op for a local
+        # playground; for a remote one it cancels the job and closes the tunnel.
+        for step in (self.remote_panel.release, self._sim_idle, self.source.close,
+                     self.system.close, pygame.quit):
+            try:
+                step()
+            except BaseException as exc:               # noqa: BLE001 -- reported
+                # Including KeyboardInterrupt: a second Ctrl-C while the teardown
+                # is running must not take the rest of the teardown with it.
+                print(f"[lammps-live] while closing down: "
+                      f"{type(exc).__name__}: {exc}")
 
     def _sliders(self):
         """Every slider that can be dragged, whatever system is loaded."""
@@ -548,7 +638,9 @@ class App:
                 elif event.key == pygame.K_F11:
                     self._toggle_fullscreen()
                 elif event.key == pygame.K_TAB:
-                    self._cycle_system(1)
+                    # Shift-Tab walks the picker backwards, Tab forwards.
+                    back = event.mod & pygame.KMOD_SHIFT
+                    self._cycle_system(-1 if back else 1)
                 elif event.key == pygame.K_SPACE and self.system.spec.playback_controls:
                     self.sim_playing = not self.sim_playing
                 elif event.key == pygame.K_r and self.system.spec.playback_controls:
@@ -864,6 +956,10 @@ class App:
         else:
             jx, jy = self.source.poll()
             yaw = self.source.poll_yaw()
+        # The thrust lever, read every frame whatever the stick is doing: it is a
+        # separate axis driving a separate thing (see view_slice.py), and it is a
+        # memory read like the rest of the cached device state.
+        lever = self.source.poll_throttle()
         read_seconds += perf_counter() - t_in
         # Whatever holds the joystick's focus takes the stick first; jx/jy/yaw
         # come back zeroed if the camera or a slider took it.
@@ -899,6 +995,7 @@ class App:
         # ---- 3. read everything this frame needs, while LAMMPS is idle -------
         # Every readout below hands back a copy, so the worker started in step 4
         # cannot move the data out from under the drawing in step 5.
+        t_gather_start = perf_counter()
         pos, vel = self.system.get_puller_state()
         interaction_force = self.system.get_interaction_force()
         temp, press, ke, pe, etotal = self.system.get_thermo_state()
@@ -916,12 +1013,23 @@ class App:
             hbond_pairs = self.system.get_hbond_pairs()
         scene_3d = None
         if spec.render_3d:
+            box_bounds_3d = self.system.get_box_bounds_3d()
+            # Where the lever has put the cut this frame. Advanced here rather
+            # than up with the other device reads because it needs the box and
+            # the view direction, and both are only known once the 3D scene is
+            # being gathered.
+            slice_plane = self.view_slice.update(
+                lever, dt, forward=self.camera3d.forward,
+                box_bounds=box_bounds_3d)
             ids3d, pos3d, is_puller3d = self.system.get_positions_3d()
             scene_3d = {
                 "positions3d": pos3d,
                 "dipoles3d": self.system.get_dipoles_3d(),
                 "is_puller": is_puller3d,
                 "bonds": self.system.get_bonds_3d(),
+                # Non-particle spheres: the rod's body. None on every system whose
+                # particles are the shape they are drawn as.
+                "glyph_spheres": self.system.get_glyph_spheres(),
                 "camera": self.camera3d,
                 "control_grid": self.system.get_control_grid(),
                 "potential_terms": self.system.get_potential_terms(),
@@ -933,9 +1041,20 @@ class App:
                 # exactly what the 3D path was cleaned up to stop doing.
                 "bead_energies": (self.system.get_bead_energies()
                                   if self.renderer.bead_color_energy else None),
-                "box_bounds": self.system.get_box_bounds_3d(),
+                # Same rule, for the same reason: the labelling is a pass over
+                # every bead (see clustering.py) and nothing else in the frame
+                # wants it, so it is gathered only while it is being painted.
+                "bead_clusters": (self.system.get_bead_clusters()
+                                  if self.renderer.bead_color_clusters else None),
+                "box_bounds": box_bounds_3d,
                 "box_periodic": self.system.get_box_periodic(),
+                # Static per-bead colours the playground declared (the polymer's
+                # own palette against the membrane's banding), or None.
+                "bead_tints": self.system.get_bead_tints(),
+                # This frame's cut through the scene, or None for the whole box.
+                "view_slice": slice_plane,
             }
+        gather_seconds = perf_counter() - t_gather_start
 
         # ---- 4. hand the next step to the worker -----------------------------
         # From here to the next frame's wait(), the simulation is off limits.
@@ -1041,43 +1160,61 @@ class App:
             analysis_seconds = getattr(self.system, "analysis_seconds", 0.0)
             self._update_debug(perf_counter() - t_frame_start, sim_seconds,
                                render_seconds, read_seconds, ff_seconds,
-                               analysis_seconds)
+                               analysis_seconds, gather_seconds)
 
         new_dt = self.clock.tick(60) / 1000.0
         self.sim_wall_time += new_dt
         return new_dt
 
     def _update_debug(self, work_seconds, sim_seconds, render_seconds,
-                      read_seconds, ff_seconds, analysis_seconds=0.0):
+                      read_seconds, ff_seconds, analysis_seconds=0.0,
+                      gather_seconds=0.0):
         """Fold this frame's timings into the smoothed breakdown and rebuild the
         header line for the next frame. 'work' is everything the app does per
         frame except the fps-cap sleep. The device I/O is split into 'read' (the
         stick poll) and 'ff' (the force-feedback writes), both broken out because
-        on the joystick they are blocking HID traffic; 'analysis' is the
-        playground layer's energy decomposition and observables, carved out of the
-        step so it can be budgeted; 'other' is the remainder after sim, render,
-        read and ff -- force shaping and the per-frame readouts.
+        on the joystick they are blocking HID traffic; 'gather' is step 3, reading
+        a frame's worth of state out of the system, which grows with the bead
+        count; 'other' is the remainder -- force shaping, the history, the panel.
 
         With the sim/render overlap on (config.OVERLAP_SIM_AND_RENDER), 'sim' is
         no longer the cost of the step: it is how long the frame had to WAIT for
         a step that has been running under the previous frame's drawing. It goes
         to zero whenever the simulation fits entirely under the render, which is
-        the point -- what it measures is the part that did not fit."""
-        # analysis_seconds is measured INSIDE step(), so it is already part of
-        # sim_seconds; subtract it out to keep the parts summing to the frame.
-        sim_only = max(0.0, sim_seconds - analysis_seconds)
+        the point -- what it measures is the part that did not fit.
+
+        'analysis' FOLLOWS THAT SAME RULE, and it did not used to. It is measured
+        on the stepper thread, where it runs under the drawing exactly as the step
+        does, so charging the frame its whole wall time claimed 150 ms of cost on
+        a frame that took 37 -- the breakdown added up to more than the frame and
+        pointed at the wrong thing. What lands on the frame is only the part the
+        drawing did not cover, which is the part inside the wait; the full wall
+        time is worth knowing too, so it is printed after the sum rather than
+        inside it."""
+        # Both are measured INSIDE step(), on the stepper thread, so what reaches
+        # this frame is bounded by what the frame waited for.
+        analysis_charged = min(analysis_seconds, sim_seconds)
+        sim_only = max(0.0, sim_seconds - analysis_charged)
         other_seconds = max(0.0, work_seconds - sim_seconds - render_seconds
-                            - read_seconds - ff_seconds)
+                            - read_seconds - ff_seconds - gather_seconds)
         alpha = 0.1   # EMA weight -- steady enough to read, quick enough to track
-        for name, secs in (("sim", sim_only), ("analysis", analysis_seconds),
+        for name, secs in (("sim", sim_only), ("analysis", analysis_charged),
                            ("read", read_seconds), ("ff", ff_seconds),
+                           ("gather", gather_seconds),
                            ("render", render_seconds), ("other", other_seconds)):
             self._prof_ms[name] += alpha * (secs * 1000.0 - self._prof_ms[name])
+        self._analysis_wall_ms += alpha * (analysis_seconds * 1000.0
+                                          - self._analysis_wall_ms)
         total = sum(self._prof_ms.values()) or 1e-9
         def part(name):
             ms = self._prof_ms[name]
             return f"{name} {100.0 * ms / total:2.0f}% ({ms:4.1f}ms)"
         self._debug_line = (
             f"DEBUG  {part('sim')}  {part('analysis')}  {part('read')}  "
-            f"{part('ff')}  {part('render')}  {part('other')}  frame {total:4.1f}ms"
+            f"{part('ff')}  {part('gather')}  {part('render')}  {part('other')}  "
+            f"frame {total:4.1f}ms  "
+            # Not part of the sum: what the analysis cost on its own thread,
+            # whether or not the drawing covered it. Bigger than its charged
+            # share means the overlap is doing its job.
+            f"[analysis {self._analysis_wall_ms:5.1f}ms wall]"
         )

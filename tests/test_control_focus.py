@@ -403,20 +403,19 @@ def test_the_colouring_stop_drives_the_renderer_and_the_mouse_toggle_agrees(sim_
     the Choice's back would make the next stick push step from the wrong option."""
     _flick(sim_app, 1)                       # -> bead colour
     assert sim_app.focus.choice is not None
-    assert not sim_app.renderer.bead_color_energy
+    assert sim_app.renderer.bead_color_mode == "director"
 
     sim_app._route_stick(1.0, 0.0, 0.0, FRAME)
-    assert sim_app.renderer.bead_color_energy
+    assert sim_app.renderer.bead_color_mode == "energy"
     assert sim_app.focus.label == "bead colour (energy)"
 
     # The mouse toggle moves the same Choice, so the stick carries on from there.
     sim_app.color_choice.step(1)
-    assert not sim_app.renderer.bead_color_energy
+    assert sim_app.renderer.bead_color_mode == "cluster"
     for _ in range(20):                      # re-arm, then push again
         sim_app._route_stick(0.0, 0.0, 0.0, FRAME)
     sim_app._route_stick(1.0, 0.0, 0.0, FRAME)
-    assert sim_app.renderer.bead_color_energy
-    sim_app.color_choice.step(1)             # leave it as it was found
+    assert sim_app.renderer.bead_color_mode == "director", "the cycle did not wrap"
 
 
 def test_a_stick_that_holds_nothing_gets_a_strong_centring_spring(sim_app):

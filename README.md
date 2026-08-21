@@ -41,14 +41,16 @@ model whose parameters otherwise stay pretty abstract.
 | `mesomem_patch` | seven beads. Pull the middle one out and feel tilt and splay resist |
 | `mesomem_sheet` | ~900 beads, periodic, so a piece of an endless membrane. Watch a deformation spread |
 | `mesomem_assembly` | 1500 beads from a random start, assembling. Play / Pause / Reset |
+| `mesomem_rod` | 3600 beads at constant tension, seen in section. Steer a rod-shaped "bacterium" in and watch the membrane invaginate it |
 | `mesomem_remote` | same thing at 10,000 beads, running on a cluster A100 |
+| `mesomem_polymer` | a closed vesicle with 32,000 beads of ring polymer sealed inside, on the same A100. Slice it open with the thrust lever to see in |
 | `cu_deposition`, `lj_argon`, `nacl` | the atomistic classics: copper (EAM), argon melting, and a salt lattice where you can switch the ionic charge off and watch it fall apart |
 
 `1`-`9` or `Tab` switches between them, `lammps-live --list` prints them.
 
 ## It runs on a supercomputer
 
-`mesomem_remote` puts the simulation on an A100 at
+`mesomem_remote` and `mesomem_polymer` put the simulation on an A100 at
 [Snellius](https://www.surf.nl) and keeps the picture here at 60 fps. You press
 `N` and the app does the rest: asks Slurm for the GPU, ships itself over, starts
 the server there, tunnels a port back, and gives the allocation up again when
@@ -77,6 +79,15 @@ on. Then you just push the stick to drive it. Most of the travel is a slow band
 for placing a value carefully, and it accelerates near the end when you want to
 cross the whole range. Trigger is play/pause (or grab the bead), and 2, 3 and 4
 are reset and scene back/forward.
+
+The thrust lever cuts the scene open. Nudge it and the view narrows to a slab a
+few per cent of the box thick, square-on to whichever direction you're looking
+from, and sliding the lever sweeps that slab through the box. Let go for three
+seconds and it opens back up. It works on any of the 3D scenes; on
+`mesomem_polymer` it's the only way to see anything at all, since a closed
+membrane is opaque and the whole point of that one is what's inside it. A lever
+you haven't touched since you started the app never cuts anything, wherever it
+happens to be sitting.
 
 The force feedback runs on the device itself instead of being streamed frame by
 frame: a spring whose centre and stiffness follow the contact force, a damper

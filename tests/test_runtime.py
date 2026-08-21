@@ -14,7 +14,7 @@ import pytest
 from lammps_live.playground import registry
 from lammps_live.playground.verify import verify_system
 
-PLAYGROUNDS = ["mesomem_patch", "mesomem_sheet", "mesomem_assembly",
+PLAYGROUNDS = ["mesomem_patch", "mesomem_sheet", "mesomem_assembly", "mesomem_rod",
                "lj_argon", "cu_deposition", "nacl"]
 
 
@@ -269,7 +269,8 @@ def test_unknown_preset_names_the_alternatives():
 
 # --- the force-field cross-check ---------------------------------------------
 
-@pytest.mark.parametrize("key", ["mesomem_patch", "mesomem_sheet", "mesomem_assembly"])
+@pytest.mark.parametrize("key", ["mesomem_patch", "mesomem_sheet", "mesomem_assembly",
+                                 "mesomem_rod"])
 def test_python_energy_matches_lammps(key):
     """The whole point of one vectorized energy expression: it can be checked
     against the compiled pair style."""
