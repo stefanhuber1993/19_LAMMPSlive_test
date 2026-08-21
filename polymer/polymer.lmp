@@ -1,0 +1,76 @@
+# Vesicle membrane + ring-polymer benchmark.
+# Reads a pre-combined (membrane + polymer) data file produced by
+# combine_vesicle_polymer.py. The driver script makes sure that file exists.
+#
+# Required variables (from the bench driver):
+#   data_file   path to combined data file (relative to bench_runs/<sim_id>/)
+#   t_run       number of timesteps
+#
+# Atom types:
+#   1  membrane  (dipole_sphere)
+#   2  polymer   (ring beads, FENE bonds, cosine angles)
+
+variable v_t_run    string ${t_run}
+variable v_data     string ${data_file}
+
+variable v_rcut    equal 2.5
+variable v_splay   equal 1.0
+variable v_tilt    equal 15.0
+variable v_wc      equal 2.0
+variable v_zeta    equal 5
+variable v_T       equal 0.2
+variable v_dt      equal 0.01
+variable t_dump    equal 5000
+
+units      lj
+atom_style dipole_sphere_angle
+neighbor   1.0 bin
+neigh_modify delay 0 every 1 check yes binsize 5
+boundary   p p p
+
+read_data ../../${v_data}
+
+group membrane type 1
+group polymer  type 2
+
+compute T_all_tr  all      temp
+compute T_mem_tr  membrane temp
+compute T_pol_tr  polymer  temp
+
+
+thermo_style custom step spcpu cpuremain temp &
+    c_T_all_tr c_T_mem_tr c_T_pol_tr &
+    pe ke press
+thermo ${t_dump}
+
+
+# ---- Pair potentials ----
+pair_style hybrid mesomem ${v_rcut} lj/cut 1.12246152962189
+pair_coeff 1 1 mesomem 1.0 1.0 ${v_tilt} ${v_splay} ${v_rcut} ${v_wc} ${v_zeta} 0.0
+pair_coeff 2 2 lj/cut 1.0 1.0 1.12246152962189
+pair_coeff 1 2 lj/cut 1.0 1.0 1.12246152962189
+
+# ---- Bond and angle styles (polymer rings) ----
+bond_style  fene
+bond_coeff  1 30.0 1.5 1.0 1.0
+special_bonds fene
+
+angle_style cosine
+angle_coeff 1 2.0
+
+timestep ${v_dt}
+
+dump dum1 all custom ${t_dump} position.lammpstrj id type mol x y z
+
+# velocity polymer create 1.0 4928459 dist gaussian
+
+# ---- Integrators ----
+fix f_nve_mem membrane nve/sphere update dipole
+fix f_nve_pol polymer  nve
+
+# Two separate fix langevin instances trigger a double-free in this Kokkos build. Why is it a problem?
+fix fLang1 membrane langevin ${v_T} ${v_T} 1.0 123 omega yes
+fix fLang2 polymer langevin 1.0 1.0 1.0 123
+
+
+run ${v_t_run}

@@ -19,9 +19,11 @@ from ..mdsystem import MDSystem3D, SliderSpec, SystemSpec
 from . import forcefield as ff_registry
 from .modes import GameMode, SimMode, select_controlled
 from .faults import Fault
+from . import jitter
 from .observables import Analysis
 from .rdf import InPlaneRDF, RadialRDF3D
 from .scenario import Scenario
+from .clustering import ClusterTracker, contact_cutoff
 from .smoothing import TrajectorySmoother
 from .state import Box, FrameState, normalize_rows
 
@@ -104,20 +106,41 @@ SMOOTHING_KEY = "view_smoothing"
 SMOOTHING_MAX_FRAMES = 20
 
 
-def smoothing_slider_specs(playground, scenario):
-    """The trajectory-smoothing slider, or nothing if the playground declines it.
+# The other view-only key, and the opposite effect: the synthetic thermal rattle
+# that keeps the picture moving between the frames a slow wire delivers. Offered
+# only where the state ARRIVES more slowly than it is drawn, i.e. on a remote
+# playground -- locally the simulation and the renderer share a frame and there
+# is nothing to fill in. See playground/jitter.py.
+JITTER_KEY = "view_jitter"
 
-    The span is expressed in the scenario's own simulated time, scaled to its
-    per-frame slice, so "full right" means the same ~20 frames of averaging on
-    every playground rather than an arbitrary constant that would be gentle on one
-    and glacial on the next.
+
+def smoothing_slider_specs(playground, scenario):
+    """The two view-only sliders, for the playgrounds that want them.
+
+    Both are advanced, both are visuals-only, and they are opposite ends of one
+    idea -- how much of the thermal rattle ends up on screen. Smoothing takes the
+    real rattle out; Liveliness puts a synthetic one back where the wire could not
+    afford to send it.
+
+    The smoothing span is expressed in the scenario's own simulated time, scaled
+    to its per-frame slice, so "full right" means the same ~20 frames of averaging
+    on every playground rather than an arbitrary constant that would be gentle on
+    one and glacial on the next.
     """
-    if not playground.trajectory_smoothing:
-        return ()
-    per_frame = scenario.sim_time_per_frame
-    return (SliderSpec("Smoothing", 0.0, SMOOTHING_MAX_FRAMES * per_frame, 0.0,
-                       fmt="{:.2f}", unit=" tau", key=SMOOTHING_KEY,
-                       advanced=True),)
+    specs = []
+    if playground.trajectory_smoothing:
+        per_frame = scenario.sim_time_per_frame
+        specs.append(SliderSpec("Smoothing", 0.0,
+                                SMOOTHING_MAX_FRAMES * per_frame, 0.0,
+                                fmt="{:.2f}", unit=" tau", key=SMOOTHING_KEY,
+                                advanced=True))
+    if playground.remote is not None:
+        # A pure multiplier on an amplitude measured live off the wire, so it has
+        # no unit -- 1.0 is "as much motion as the wire is dropping".
+        specs.append(SliderSpec("Liveliness", 0.0, jitter.JITTER_MAX,
+                                jitter.DEFAULT_JITTER, fmt="{:.2f}",
+                                key=JITTER_KEY, advanced=True))
+    return tuple(specs)
 
 
 class PlaygroundSystem(MDSystem3D):
@@ -177,6 +200,11 @@ class PlaygroundSystem(MDSystem3D):
         # it is switched on.
         self._energy_cache = None
         self._energy_render_frame = -1
+        # The cluster colouring's labelling (see clustering.py). Paced by frame
+        # count rather than cached per frame -- unlike the energies, recomputing
+        # it every frame would be both expensive and pointless, since it is a
+        # slow-moving fact about the configuration.
+        self._clusters = ClusterTracker(contact_cutoff(self.spec.atom_radius_A))
         self._last_step_dt = 0.0
         self.analysis_seconds = 0.0
         # Latched message once the simulation has been driven unstable, else None,
@@ -261,6 +289,7 @@ class PlaygroundSystem(MDSystem3D):
         self.box = build.box
         self.bonds = list(build.bonds)
         self.brightness = build.brightness
+        self._tints = self.scenario.render_tints(sparams)
 
         cmdargs = ["-log", "none", "-screen", "none"]
         if self.host_profile is not None:
@@ -298,7 +327,10 @@ class PlaygroundSystem(MDSystem3D):
         c(self.box.boundary_command())
         c("atom_modify map array")
         c(self.box.region_command("box"))
-        c(f"create_box {ff.n_types} box")
+        # The box's type counts, plus whatever a bonded force field needs sized
+        # up front -- bond and angle types, and the per-atom allowances that
+        # cannot be grown after the fact (see ForceField.box_keywords).
+        c(f"create_box {ff.n_types} box{ff.box_keywords()}")
 
         # Particles either come from the scenario's positions array in ONE call,
         # or are placed by LAMMPS itself (random fill with overlap rejection).
@@ -307,16 +339,22 @@ class PlaygroundSystem(MDSystem3D):
             for cmd in creation:
                 c(cmd)
         else:
-            n = len(build.positions)
+            # Only the particles the runtime is responsible for. A scenario
+            # carrying bonded particles builds those itself, in create_commands
+            # below, because bonds cannot come through create_atoms -- see
+            # ScenarioBuild.n_direct.
+            n = build.n_uploaded
             lmp.create_atoms(n, list(range(1, n + 1)),
-                             [int(t) for t in build.types],
-                             build.positions.ravel().tolist())
+                             [int(t) for t in build.types[:n]],
+                             build.positions[:n].ravel().tolist())
 
         for cmd in ff.setup_commands(params):
             c(cmd)
         for cmd in scenario.create_commands(sparams, build, seed):
             c(cmd)
         for cmd in ff.pair_commands(params):
+            c(cmd)
+        for cmd in ff.bonded_commands(params):
             c(cmd)
         c(f"neighbor {scenario.neighbor_skin} bin")
         c("neigh_modify every 1 delay 0 check yes")
@@ -397,6 +435,7 @@ class PlaygroundSystem(MDSystem3D):
         self._render_frame = -1
         self._energy_cache = None
         self._energy_render_frame = -1
+        self._clusters.reset()
         self._sim_time = 0.0
         # Populate the panels for the paused first frame (sim mode shows its fresh
         # state before Play is pressed, and would otherwise show empty bars).
@@ -694,6 +733,14 @@ class PlaygroundSystem(MDSystem3D):
         # local arrays, so every id-order and frame-state cache is now stale.
         # Everything below this line sees consistent, freshly-gathered data.
         self._frame += 1
+        # A scenario running a barostat has a cell that is a different size than
+        # it was a chunk ago. Read it back BEFORE anything derived from it is
+        # gathered: the frame state carries the box into the analysis (which
+        # minimum-images the pair list with it) and into the renderer (the drawn
+        # outline, the periodic seam). Six extract_globals, and only for the
+        # scenarios that say their cell moves.
+        if self.scenario.cell_is_live:
+            self._refresh_box_from_lammps()
         # The sim time this frame covered, which is the interval the visual
         # smoothing filter averages over (see _render_state). Taken from the actual
         # chunk rather than the scenario's nominal per-frame slice, so a capped or
@@ -710,7 +757,11 @@ class PlaygroundSystem(MDSystem3D):
             self.command(cmd)
         self._sim_time += dt
         t0 = perf_counter()
-        self.analysis.update(self._analysis_state(), self.params)
+        # The pulled bead is named so its own energy panel keeps a full pair list
+        # (see Analysis.update); on a system with no puller the analysis is free
+        # to sample.
+        self.analysis.update(self._analysis_state(), self.params,
+                             keep_index=self._panel_index())
         # Reported to the app's --debug breakdown as its own section, so the
         # Python-side analysis cost is visible rather than hidden inside "sim".
         self.analysis_seconds = perf_counter() - t0
@@ -719,7 +770,12 @@ class PlaygroundSystem(MDSystem3D):
         """Rebuild the frame state and tick the analysis. Used once at build time
         so the panels are populated on the paused first frame."""
         self._frame += 1
-        self.analysis.update(self._analysis_state(), self.params, force=force)
+        self.analysis.update(self._analysis_state(), self.params, force=force,
+                             keep_index=self._panel_index())
+
+    def _panel_index(self):
+        """The particle whose own neighbourhood a panel reads, or None."""
+        return None if self.controlled_id is None else self.controlled_id - 1
 
     def _apply_housekeeping(self, dt):
         """Apply the scenario's soft corrections as momentum kicks (delta v = F*dt
@@ -899,7 +955,8 @@ class PlaygroundSystem(MDSystem3D):
         """
         if self.controlled_id is None:
             return None
-        scale = self.force_field.energy_scale_per_particle * 2.0
+        scale = (self.playground.pulled_energy_scale
+                 or self.force_field.energy_scale_per_particle * 2.0)
         return self.analysis.energy_panel(
             "Pulled bead energy -- additive (reduced units)", scale,
             index=self.controlled_id - 1)
@@ -954,6 +1011,11 @@ class PlaygroundSystem(MDSystem3D):
     def get_bead_brightness(self):
         return self.brightness
 
+    def get_bead_tints(self):
+        # The scenario's, computed once at build: it is a fact about the
+        # composition, and the composition does not change while a build stands.
+        return self._tints
+
     def get_bead_energies(self):
         """Per-particle potential energy, in id order -- what the energy colouring
         paints.
@@ -977,6 +1039,22 @@ class PlaygroundSystem(MDSystem3D):
                       dtype=float)[order]
         energies = 2.0 * pe if self.force_field.energy_terms_labels else pe
         return self._smooth_energies(energies)
+
+    def get_bead_clusters(self):
+        """Per-bead cluster colour slot, in id order -- what the cluster colouring
+        paints. -1 for a bead in nothing worth naming; see clustering.py.
+
+        Run on the DRAWN coordinates, not the raw ones. Two beads are in the same
+        cluster if they are within a contact cutoff of each other, and at any
+        finite temperature the pair sitting right at that distance crosses it
+        several times a second -- so a labelling built on the raw coordinates
+        inherits the whole thermal rattle, exactly as the energy colouring did.
+        Reading the smoothed state instead puts the clusters on the same footing
+        as the picture they are painted on, for free, and the tracker's own
+        hysteresis then only has the genuine ambiguity left to absorb.
+        """
+        state = self._render_state()
+        return self._clusters.slots(state.positions, self.box, self._frame)
 
     def _smooth_energies(self, energies):
         """Put the colouring through the same low-pass as the drawn positions.
@@ -1015,6 +1093,15 @@ class PlaygroundSystem(MDSystem3D):
 
     def get_bonds_3d(self):
         return list(self.bonds)
+
+    def get_glyph_spheres(self):
+        """Extra spheres the force field wants drawn -- the rod's body.
+
+        Taken off the RENDER state, so the rod's body follows exactly the same
+        (optionally smoothed) coordinates as the bead at its centre; a physics
+        state here would let the two slide apart under smoothing.
+        """
+        return self.force_field.glyph_spheres(self._render_state(), self.params)
 
     def get_camera_params(self):
         return self.scenario.camera(self.box)

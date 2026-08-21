@@ -6,6 +6,8 @@ playground.forcefield.register), which is how a playground file's
 forcefield.get() -- so listing playgrounds does not pull in LAMMPS or scipy.
 """
 from .mesomem import MesoMem
+from .mesomem_polymer import MesoMemPolymer
+from .mesomem_rod import MesoMemRod
 from .stock import EAM, LennardJones
 
-__all__ = ["MesoMem", "LennardJones", "EAM"]
+__all__ = ["MesoMem", "MesoMemPolymer", "MesoMemRod", "LennardJones", "EAM"]

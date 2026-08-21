@@ -2,21 +2,26 @@
 
 Physically this is `mesomem_assembly`: the paper's spontaneous-lamellae run, N
 directored beads dropped at random into a fully periodic cube at reduced volume
-fraction phi = 0.1, coarsening under Langevin dynamics. Every coefficient, the
+fraction phi, coarsening under Langevin dynamics. Every coefficient, the
 thermostat, the two watchability nudges and the whole look are that playground's;
 what changes is where it runs and therefore how big it can be.
 
-    N = 10,000 beads in a 37.4 sigma cell, against 1,500 in a 20 sigma cell.
+    N = 50,000 beads in a 109 sigma cell, against 1,500 in a 20 sigma cell.
 
-WHY 10,000 AND NOT 100,000. This is the size the *client* can keep up with, not
-the size the GPU can run -- docs/a100-plan.md section 3 measures the Python
-analysis at 1.5 us/bead/chunk, which against a 16.7 ms frame caps N near 11,000
-however fast the simulation is. So 10k is the honest first target: it fills the
-frame budget on the drawing machine while leaving the A100 at a few percent of
-its capacity, which makes it the right size to find out whether the *pipeline*
-works before spending effort on making the analysis cheap enough for 100k. The
-two things that then have to change are named in that document, and neither is in
-this file.
+WHAT SETS THE SIZE. It used to be the *client*, not the GPU: the Python analysis
+rebuilt a full pair list over every bead, which docs/a100-plan.md section 3
+measured at 1.5 us/bead/chunk and which capped N near 11,000 however fast the
+simulation ran. That wall is gone. The pair list is now built over a bounded
+random sample of the beads (Analysis.MAX_PAIR_BEADS) with the dilution divided
+back out, so the analysis costs the same at 50k as it did at 6k -- measured 113 ms
+per due frame before, 11 ms after, five times a second on a 20 fps wire. What the
+sampling costs is a per cent or two of noise on the HUD observables and the energy
+bars, redrawn each frame so it averages away; what it buys is that the client is
+no longer the thing that decides how big this can be.
+
+The remaining per-bead costs on this end are the ones that must touch every bead
+because they are drawn: the wire payload, the drawn-state filtering, and the
+renderer's instance buffers.
 
 THE DECK IS NOT WRITTEN OUT ANYWHERE. `docs/snellius/in.mesomem_100k` exists to
 benchmark with, and had to be maintained by hand against this app's own setup.
@@ -45,13 +50,13 @@ from ..remote import RemoteTarget
 from .mesomem_assembly import STYLE
 from ..render_style import CameraOrbit
 
-# The size, and the cell that puts it at the paper's volume fraction. Written as
+# The size, and the cell that puts it at the chosen volume fraction. Written as
 # the relation rather than as a number so changing N keeps the physics: with
 # Vp = (pi/6) sigma^3, phi = N*Vp/L^3, so L = (N*(pi/6)/phi)^(1/3). 10k at
 # phi = 0.1 is 37.41 sigma, which holds several independent membranes rather than
 # the single one the 1500-bead cell manages.
 N_BEADS = 50_000
-PHI = 0.1
+PHI = 0.02
 BOX = (N_BEADS * (math.pi / 6.0) / PHI) ** (1.0 / 3.0)
 
 # The visual style is imported, not copied: this is the same scene as the local
@@ -90,10 +95,10 @@ PLAYGROUND = Playground(
     render_style=STYLE,
     camera_orbit=CameraOrbit(autostart=True, speed=0.16),
     # The frame budget, and the only concession this file makes to its size. The
-    # energy panels are a pass over every pair -- 2.5 us/bead measured -- and at
-    # 10k beads the default every-4-frames cadence costs 6 ms of a 16.7 ms frame
-    # on its own. Every 8 halves that for a panel whose aggregate barely changes
-    # between frames anyway. The observables keep their own declared cadences.
+    # energy panels are a pass over every pair, and while the pair list itself is
+    # now bounded by sampling, halving the cadence of the one consumer whose
+    # aggregate barely changes between frames is still free. The observables keep
+    # their own declared cadences.
     analysis_energy_every=8,
     # Where it runs. Everything here is overridable from the environment
     # (LAMMPS_LIVE_REMOTE_USER, _TIME, _PARTITION, ...) -- see remote/target.py.

@@ -66,6 +66,19 @@ class ForceField(ABC):
     dimension = 3
     atom_style = "atomic"
     n_types = 1
+    # Bonded topology, for a force field whose particles are chained rather than
+    # loose. Both counts and the per-atom allowances below become `create_box`
+    # keywords (see box_keywords) -- they have to be declared THERE, before any
+    # atom exists, because LAMMPS sizes its per-atom bond and special-neighbour
+    # arrays once and cannot grow them later.
+    n_bond_types = 0
+    n_angle_types = 0
+    # Extra `create_box` keywords, verbatim -- the `extra/*/per/atom` allowances a
+    # bonded force field needs. Left as strings rather than derived, because how
+    # many bonds an atom can carry is a fact about the topology the SCENARIO will
+    # build, and a force field that declares bonds at all is declaring the shape
+    # of that topology with them.
+    box_extras = ()
     # Set when the style is a custom C++ pair style needing compilation (see
     # plugin.PluginSpec); None for stock LAMMPS styles.
     plugin = None
@@ -112,6 +125,27 @@ class ForceField(ABC):
             return "fix integrate all nve/sphere update dipole"
         return "fix integrate all nve"
 
+    def box_keywords(self):
+        """Extra keywords for `create_box`, as one string starting with a space
+        (or empty). See n_bond_types."""
+        parts = []
+        if self.n_bond_types:
+            parts.append(f"bond/types {self.n_bond_types}")
+        if self.n_angle_types:
+            parts.append(f"angle/types {self.n_angle_types}")
+        parts += list(self.box_extras)
+        return (" " + " ".join(parts)) if parts else ""
+
+    def bonded_commands(self, params):
+        """The bond and angle styles and their coefficients, as command strings.
+
+        Separate from `pair_commands` because they are a separate installation
+        with a separate lifetime: the pair style is re-issued whenever a cutoff
+        moves, while a bond style is declared once and only its coefficients ever
+        change. Empty for a force field with no topology, which is most of them.
+        """
+        return []
+
     @abstractmethod
     def pair_commands(self, params):
         """The full pair-style installation, as a list of command strings --
@@ -145,6 +179,23 @@ class ForceField(ABC):
         to build the pair list for the energy decomposition and observables."""
         return 0.0
 
+    def extended_pairs(self, state, pairs, params):
+        """Extra pairs to append to the analysis list, or None.
+
+        For a force field where ONE species reaches much further than the rest.
+        Widening `interaction_cutoff` to cover it would be correct and very
+        expensive: it is a global cutoff, so every ordinary pair in the system
+        gets found at the long range too. On the rod playground that is the
+        difference between 55k pairs and 335k -- a 37 ms lump on the frame the
+        energy panels land on, to find the hundred pairs one rod is having.
+
+        So the long-ranged species names its own pairs instead, which for a single
+        particle is one small query rather than a whole-system tree. Indices are
+        into `state`, which is the same (possibly subsampled) state the rest of
+        `pairs` was built from.
+        """
+        return None
+
     @property
     def thermo_is_per_atom(self):
         """Whether LAMMPS normalizes this unit style's thermodynamic output per
@@ -152,6 +203,20 @@ class ForceField(ABC):
         false for `metal` and the other physical unit styles -- which the verifier
         must undo, or a correct force field looks off by a factor of N."""
         return self.units == "lj"
+
+    def glyph_spheres(self, state, params):
+        """Extra spheres to DRAW, for a force field whose particles are not the
+        shape LAMMPS integrates them as.
+
+        Returns (centers (K, 3), radii (K,), directors (K, 3), owners (K,)) or
+        None; `owners` names the particle each sphere belongs to, so the renderer
+        can paint it that particle's colour. They carry no state and take part in
+        no physics -- they exist because a rigid rod is one particle with a
+        length, and drawing it as a single sphere hides the only thing the user is
+        steering. The renderer appends them to the bead instances, so the real
+        particle is still there, inside its own body.
+        """
+        return None
 
     def energy_terms(self, state, pairs, params):
         """Per-pair energy in each additive term of the potential.

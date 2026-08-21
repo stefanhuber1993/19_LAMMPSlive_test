@@ -31,17 +31,20 @@ from ..render_style import DEFAULT_STYLE
 # Everything else -- the wet material, the contact shadows, the outline that
 # separates touching beads -- is what makes the patch read as solid, and is left
 # exactly as the showreel had it.
+# (`.on_light()` on the end draws the same patch on a light background.)
 STYLE = DEFAULT_STYLE.varied(
     dof_focus=0.5,          # sharp plane mid-scene, not near the front
     dof_range=1.0,          # the whole span to go out of focus
     dof_bokeh_px=2.5,       # (8.0 by default) -- 0 switches DoF off entirely
+    box_alpha=0,
+    net_alpha=200,
     cue_end=0.9,            # fade completes only at the very back
     cue_strength=0.35,      # and only a third of the way to the background
     # Left at the defaults, listed because they are the next dials to reach for:
     ao_strength=5.83,           # contact darkening between the touching beads
     outline_strength=12.0,      # how black the line around each bead is
     outline_edge_fraction=0.90,  # how far out it starts (0.94 = hairline)
-)
+).on_light()
 
 PLAYGROUND = Playground(
     name="MesoMem membrane patch (3D)",

@@ -1,0 +1,151 @@
+# Rod interacting with a planar membrane patch via
+# pair_style rod_lj.
+#
+# Rod geometry (fixed): length L = 5 sigma_mem, width D = 3 sigma_mem.
+# Sigma logic mirrors the original colloid script: sigma_mix = r_mem + r_rod
+# is the contact distance (sphere-surface to rod-surface).  
+
+# In rod_lj we get this by passing sigma_pair = r_mem; the code internally adds r_rod (from atom->radius) to form sigma_eff. Radius of a membrane bead is r_mem = 0.5 sigma.
+#
+# usage: mpirun -np 4 lmp_line -i planar_wrapping_rod.lmp -v N 2500 -v tension 0.0 -v e 3.0 -v r_rod 3.0 -v h_rod 5.0 
+
+# ----------------- Variables & Setup -----------------
+variable        SEED        equal   25356
+variable        t_dump      equal   500
+
+variable        sigma_mem   equal   1.0
+variable        r_mem       equal   ${sigma_mem}/2.0
+variable        v_tension   string  ${tension}
+
+# --------- Mode parameters ------------------------
+variable        v_rcut      equal  2.5
+variable        v_splay     equal  1
+variable        v_tilt      equal  15
+variable        v_wc        equal  2.0
+variable        v_zeta      equal  5.0
+
+# --------- Rod geometry ---------------------------
+variable        rod_length  equal   ${h_rod}         # L = 5 sigma_mem
+variable        rod_diam    equal   2*${r_rod} # D = 3 sigma_mem
+
+# Physics parameters for the membrane–rod pair
+# sigma_mix = r_mem + r_rod ; rod_lj will get sigma_pair = r_mem
+# and add r_rod from atom->radius -> sigma_eff = sigma_mix.
+variable        eps_mix     string  ${e}
+variable        sigma_mix   equal   ${r_rod}+${r_mem}
+variable        rc_mix      equal   1.12*${sigma_mix}+2.0*${r_mem} # this is the cutoff between rod and membrane
+
+# initial vertical clearance: rod center above the membrane
+variable        dist        equal   ${r_rod}+3.0
+
+processors      * * 1
+units           lj
+atom_style      hybrid sphere dipole molecular
+boundary        p p p
+neighbor        0.3 bin
+neigh_modify    delay 0 every 1 check yes
+
+# ----------------- Atom Creation -----------------
+read_data         input/lattice_d_0.90_N_${N}
+# it is important ot set q to zero for membrane beads to differentiate between point particles and rod particles. membrane particles has zero charge, rod particles has length equal to the charge.
+set      type 1 charge 0.0     
+
+
+variable my_diameter equal 4.0
+set      type 1 diameter ${my_diameter}
+variable my_volume equal (4.0/3.0)*PI*((${my_diameter}*0.5)^3)
+variable my_mass equal 1.0
+variable my_density equal ${my_mass}/${my_volume}
+set      type 1 density ${my_density}
+
+# Create rod (type 2) horizontal, long axis along +z, above the membrane.
+create_atoms    2 single 0.0 0.0 ${dist}
+group           mem     type 1
+group           rod     type 2
+
+# Rod properties: q = length, diameter = width, mu = orientation (unit x_hat).
+# Mass from cylindrical volume V = pi r^2 L at the same density as the membrane.
+variable        rod_volume  equal   PI*(${r_rod}^2)*${rod_length}
+variable        mass_rod    equal   ${rod_volume}*${my_density}
+mass            2 ${mass_rod}
+set             type 2 diameter ${rod_diam}
+set             type 2 charge   ${rod_length}
+set             type 2 dipole   0.0 0.0 1.0
+
+print "membrane: m:${my_mass} V:${my_volume} rho:${my_density}" file info_mass.dat screen yes
+print "rod:      m:${mass_rod} V:${rod_volume} L:${rod_length} D:${rod_diam}" append info_mass.dat screen yes
+
+# Initial velocity: gently push rod toward the membrane
+velocity        rod set 0 0 -1.0
+
+# ----------------- Interaction Potential -----------------
+# Membrane: sillano v2 ; membrane-rod: rod_lj ; rod-rod: nothing (single rod)
+pair_style      hybrid membrane_sillanov2 ${rcut} rod_lj ${rc_mix}
+
+# 1-1: Membrane-Membrane (Sillano)
+pair_coeff      1 1 membrane_sillanov2 1.0 1.0 ${ktilt} ${ksplay} ${rcut} ${wc} ${zeta} 0.0
+
+# 1-2: Membrane-Rod (rod_lj). pair_coeff: sigma eps cut
+#   sigma_pair = r_mem -> internal sigma_eff = r_mem + r_rod = sigma_mix
+pair_coeff      1 2 rod_lj ${r_mem} ${eps_mix} ${rc_mix}
+
+# 2-2: Rod-Rod (none — single rod). rod_lj would skip rod-rod anyway, but we
+# must declare the pair for the hybrid style. Pick rod_lj with a tiny cutoff.
+pair_coeff      2 2 rod_lj ${r_mem} 1.0 ${rc_mix}
+
+print ${sigma_mix}
+print ${rc_mix}
+
+# ----------------- Computes & Thermo -----------------
+compute         Tall all temp/sphere
+compute         C_temp_baro all temp
+compute         C_press_baro all pressure C_temp_baro
+
+compute         pe_mem mem pe/atom
+compute         pe_rod rod pe/atom
+compute         pe_mem_sum mem reduce sum c_pe_mem
+compute         pe_rod_sum rod reduce sum c_pe_rod
+
+timestep        0.01
+thermo          ${t_dump}
+thermo_style    custom step spcpu cpuremain c_Tall pe c_pe_mem_sum c_pe_rod_sum lx pxx pyy pzz
+
+variable vlx equal lx
+variable vly equal ly
+variable vlz equal lz
+variable vpxx equal pxx
+variable vpyy equal pyy
+variable vpzz equal pzz
+
+fix f_thermo all ave/time 10 100 1000 c_Tall c_pe_mem_sum c_pe_rod_sum v_vlx v_vly v_vlz v_vpxx v_vpyy v_vpzz file thermo.out
+
+# Dump trajectory (mu* needed to see rod orientation)
+dump            1 all custom ${t_dump} position.lammpstrj id type x y z mux muy muz
+dump            2 rod custom ${t_dump} position_rod.lammpstrj    id type x y z mux muy muz
+
+# ----------------- Run Phase 1: Relax membrane (rod held still) -----------------
+fix             nve_mem mem nve/sphere update dipole
+fix             lang_mem mem langevin 0.2 0.2 1.0 ${SEED} zero yes omega yes
+
+run             1000
+unfix nve_mem
+
+# ----------------- Phase 2: NPH membrane + rod dynamics -----------------
+fix   fNPH_membrane mem nph/sphere x 0.0 0.0 10 y 0.0 0.0 10 couple xy drag 1.0 dilate mem nreset 100 update dipole
+fix_modify fNPH_membrane temp C_temp_baro press C_press_baro
+
+# Rod gets translational + rotational integration; Langevin thermostat keeps T finite.
+fix             nve_rod  rod nve/sphere update dipole
+fix             lang_rod rod langevin 1.0 1.0 1.0 ${SEED} zero yes omega yes
+
+run 5000
+
+# ----------------- Phase 3: ramp tension -----------------
+fix   fNPH_membrane mem nph/sphere x 0.0 ${v_tension} 50 y 0.0 ${v_tension} 50 couple xy drag 1.0 dilate mem nreset 100 update dipole
+fix_modify fNPH_membrane temp C_temp_baro press C_press_baro
+run             50000
+
+# ----------------- Phase 4: hold tension -----------------
+fix   fNPH_membrane mem nph/sphere x ${v_tension} ${v_tension} 50 y ${v_tension} ${v_tension} 50 couple xy drag 1.0 dilate mem nreset 100 update dipole
+fix_modify fNPH_membrane temp C_temp_baro press C_press_baro
+run             150000

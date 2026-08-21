@@ -71,9 +71,10 @@ def verify_system(system, tolerance=1e-6):
     # integrating.
     system.lmp.command("run 0")
     state = system.frame_state()
-    from .state import build_pairs
-    pairs = build_pairs(state.positions,
-                        force_field.interaction_cutoff(system.params), state.box)
+    # The same list the live panels use -- including any pairs a long-ranged
+    # species names for itself. See observables.analysis_pairs.
+    from .observables import analysis_pairs
+    pairs = analysis_pairs(force_field, state, system.params)
     terms = force_field.energy_terms(state, pairs, system.params)
     if terms is None:
         return None

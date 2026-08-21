@@ -35,9 +35,11 @@ The cost is a bigger peak on the frames where everything lands, which is the rig
 trade here because the analysis runs on the stepper's thread alongside the drawing
 (see remote/client.py) and has a whole frame to hide in.
 """
+from dataclasses import replace
+
 import numpy as np
 
-from .state import PairData, build_pairs, principal_normal
+from .state import PairData, build_pairs, principal_normal, segment_distance
 
 _REGISTRY = {}
 
@@ -149,7 +151,13 @@ def _coordination(state, pairs, params):
     read on condensation: a dilute gas sits near zero, a packed membrane near the
     lattice's coordination number."""
     n = len(state.positions)
-    return (2.0 * len(pairs) / n) if n else float("nan")
+    if not n:
+        return float("nan")
+    # Divided by the dilution because a subsampled list drops each of a bead's
+    # neighbours with probability (1 - dilution): the raw mean is then that
+    # fraction of the real coordination, and correcting it here is what lets the
+    # number mean the same thing whether or not the analysis had to subsample.
+    return 2.0 * len(pairs) / n / max(pairs.dilution, 1e-9)
 
 
 @observable("mean_tilt_deg", "mean director tilt", unit=" deg", every=4,
@@ -168,7 +176,220 @@ def _mean_tilt(state, pairs, params):
     return float(np.degrees(np.arccos(c)).mean())
 
 
+# --- the rod (type 2) against the membrane (type 1) ---------------------------
+# The three numbers that say how far a wrapping run has got. None of them needs
+# the pair list: there is one rod and it is measured against every bead directly,
+# which is a single O(N) numpy pass -- far cheaper than the tree the pair list
+# would have to build (see `observable`'s needs_pairs).
+
+
+def _rod_and_membrane(state):
+    """(rod index, membrane mask), or None when the frame has no rod in it.
+
+    Type 2 is the rod by the convention MesoMemRod fixes. A single-species frame
+    (every other playground) has no types at all, and every rod observable is a
+    no-op on it rather than an exception -- an observable that is asked for on a
+    system it does not apply to should report nothing, not break the HUD.
+    """
+    types = state.types
+    if types is None or not len(types):
+        return None
+    rods = np.flatnonzero(np.asarray(types) == 2)
+    if len(rods) != 1:
+        return None
+    return int(rods[0]), np.asarray(types) == 1
+
+
+@observable("rod_height", "rod height over membrane", every=4)
+def _rod_height(state, pairs, params):
+    """The rod's centre height above the membrane's mean plane, along that
+    plane's own normal.
+
+    The single number the wrapping story is told in: it falls as the rod is
+    pulled into contact, and keeps falling -- past zero -- as the membrane closes
+    over it, because "wrapped" means the mean surface has moved to the far side of
+    the rod's centre.
+    """
+    found = _rod_and_membrane(state)
+    if found is None:
+        return float("nan")
+    rod, membrane = found
+    p = state.positions[membrane]
+    if len(p) < 3:
+        return float("nan")
+    normal = principal_normal(p)
+    return float((state.positions[rod] - p.mean(axis=0)) @ normal)
+
+
+@observable("rod_contacts", "beads touching the rod", every=4,
+            needs_directors=True)
+def _rod_contacts(state, pairs, params):
+    """Membrane beads within a contact shell of the rod's SURFACE.
+
+    Measured to the rod's axis segment and compared against the contact distance
+    sigma_eff = r_mem + r_rod, so it counts beads that are actually touching the
+    body rather than ones that happen to be near its centre. This is what climbs
+    as the membrane engulfs the rod, and it saturates when the wrap closes.
+    """
+    found = _rod_and_membrane(state)
+    if found is None or not params.has("rod_length"):
+        return float("nan")
+    rod, membrane = found
+    offsets = state.positions[membrane] - state.positions[rod]
+    if state.box is not None:
+        offsets = state.box.minimum_image(offsets)
+    d = segment_distance(offsets, state.directors[rod],
+                         float(params["rod_length"]))
+    # r_mem = sigma/2 in the paper's reduced units, and a quarter of the contact
+    # distance of slack past it -- comfortably inside the attractive well, so a
+    # bead is counted when it is held rather than merely nearby.
+    sigma_eff = 0.5 + float(params["rod_radius"])
+    return float(np.count_nonzero(d < 1.25 * sigma_eff))
+
+
+@observable("rod_tilt_deg", "rod tilt out of membrane", unit=" deg", every=4,
+            needs_directors=True)
+def _rod_tilt(state, pairs, params):
+    """Angle between the rod's long axis and the membrane's mean plane.
+
+    0 is lying flat along the surface (the orientation adhesion wants, and the
+    one that gets wrapped); 90 is standing on end, pointing into the membrane.
+    Folded onto [0, 90], because a rod has no head and no tail.
+    """
+    found = _rod_and_membrane(state)
+    if found is None or state.directors is None:
+        return float("nan")
+    rod, membrane = found
+    p = state.positions[membrane]
+    if len(p) < 3:
+        return float("nan")
+    normal = principal_normal(p)
+    c = np.clip(np.abs(state.directors[rod] @ normal), 0.0, 1.0)
+    return float(90.0 - np.degrees(np.arccos(c)))
+
+
+# --- the vesicle-with-polymer numbers -----------------------------------------
+# What a closed envelope with something pressing on it from inside is doing, in
+# three numbers: how big it is, how swollen the thing inside it is, and how much
+# of that thing is actually against the wall. Type 1 is the membrane and type 2
+# the polymer, the convention MesoMemPolymer fixes.
+
+
+def _membrane_and_polymer(state):
+    """(membrane mask, polymer mask), or None on a frame with no polymer in it.
+
+    A single-species frame (every other playground) has no types at all, and each
+    of these reports nothing on it rather than raising -- the same rule the rod's
+    observables follow, for the same reason.
+    """
+    types = state.types
+    if types is None or not len(types):
+        return None
+    types = np.asarray(types)
+    polymer = types == 2
+    if not polymer.any():
+        return None
+    return types == 1, polymer
+
+
+@observable("vesicle_radius", "vesicle radius", every=4)
+def _vesicle_radius(state, pairs, params):
+    """Mean distance of the membrane beads from their own centre.
+
+    The envelope's size, and so the number the polymer's push shows up in: a melt
+    that swells against the wall inflates it, and a floppy chain that collapses
+    lets it relax back. Its SPREAD would be the shape rather than the size, which
+    is what `thickness` measures on a flat sheet -- here that number is dominated
+    by the sphere's own curvature and says nothing.
+    """
+    found = _membrane_and_polymer(state)
+    membrane = None if found is None else found[0]
+    p = state.positions if membrane is None else state.positions[membrane]
+    if len(p) < 3:
+        return float("nan")
+    return float(np.linalg.norm(p - p.mean(axis=0), axis=1).mean())
+
+
+@observable("polymer_gyration", "polymer radius of gyration", every=4)
+def _polymer_gyration(state, pairs, params):
+    """Radius of gyration of the whole melt, about its own centre.
+
+    Read against `vesicle_radius`: the ratio is how much of the lumen the polymer
+    occupies. A uniformly filled sphere of radius R has Rg = sqrt(3/5) R ~ 0.775 R,
+    so a melt sitting near three quarters of the envelope's radius is filling it,
+    and one well below that has pulled away into the middle.
+    """
+    found = _membrane_and_polymer(state)
+    if found is None:
+        return float("nan")
+    p = state.positions[found[1]]
+    if len(p) < 2:
+        return float("nan")
+    return float(np.sqrt(np.mean(np.sum((p - p.mean(axis=0)) ** 2, axis=1))))
+
+
+# The contact shell for the two species, in sigma: the repulsive core's own reach
+# (its 12-6 minimum at 2^(1/6)) with a quarter of a sigma of slack, so a pair is
+# counted when it is actually pressing rather than merely nearby. Quoted here
+# rather than imported from the force field, which is the direction this module
+# deliberately does not depend in -- and it is the same 1.25x the rod's contact
+# count uses, for the same reason.
+_POLYMER_CONTACT_SHELL = 1.25 * 2.0 ** (1.0 / 6.0)
+
+
+@observable("polymer_contact", "membrane contacts per 100 polymer beads",
+            every=4, needs_pairs=True)
+def _polymer_contact(state, pairs, params):
+    """How hard the melt is leaning on the envelope.
+
+    The direct measure of the only coupling in this model: nothing sticks, so
+    every one of these pairs is a polymer bead being pushed back by the membrane.
+    Zero while the melt is clear of the wall, and it climbs as the chains swell
+    into contact and stay there.
+
+    A per-bead RATE rather than a count, and that is not cosmetic. Above
+    Analysis.MAX_PAIR_BEADS the pair list is built over a random subsample, and a
+    raw count off it is short by the dilution SQUARED with no way to tell from the
+    number itself; a mean per polymer bead is short by one factor of it, which is
+    exactly the correction `coordination` already applies. Per hundred beads
+    because per one it is a couple of per cent and reads as noise.
+    """
+    found = _membrane_and_polymer(state)
+    if found is None or not len(pairs):
+        return float("nan")
+    membrane, polymer = found
+    n_poly = int(np.count_nonzero(polymer))
+    if not n_poly:
+        return float("nan")
+    a, b = pairs.a, pairs.b
+    cross = (membrane[a] & polymer[b]) | (polymer[a] & membrane[b])
+    touching = np.count_nonzero(cross & (pairs.r < _POLYMER_CONTACT_SHELL))
+    return 100.0 * touching / n_poly / max(pairs.dilution, 1e-9)
+
+
 # --- scheduling ---------------------------------------------------------------
+
+def analysis_pairs(force_field, state, params):
+    """The pair list every consumer of a force field's energy must use.
+
+    One function, because there are two callers and they have to agree: the live
+    Analysis below, and verify.py's cross-check against LAMMPS. It is the global
+    cutoff's pairs plus whatever a long-ranged species names for itself (see
+    ForceField.extended_pairs) -- and the verifier building only the first half of
+    that reported the force field as WRONG when the code was right, which is
+    exactly the kind of false alarm a verifier must not raise.
+    """
+    pairs = build_pairs(state.positions,
+                        force_field.interaction_cutoff(params), state.box)
+    extra = force_field.extended_pairs(state, pairs, params)
+    if extra is None or not len(extra):
+        return pairs
+    return PairData(np.concatenate([pairs.a, extra.a]),
+                    np.concatenate([pairs.b, extra.b]),
+                    np.concatenate([pairs.d, extra.d]),
+                    np.concatenate([pairs.r, extra.r]),
+                    dilution=pairs.dilution)
+
 
 class Analysis:
     """Runs the energy decomposition and the requested observables on a budget.
@@ -181,6 +402,30 @@ class Analysis:
     # The energy panels are the most expensive consumer (a full pass over every
     # pair) and the aggregate barely changes frame to frame.
     ENERGY_EVERY = 4
+
+    # THE PAIR LIST IS WHAT AN ANALYSIS FRAME COSTS, and the cost is linear in
+    # the bead count with a large constant -- measured at 50k beads: 14 ms of
+    # KD-tree build, 66 ms of query_pairs over 313k pairs, ~15 ms of exact
+    # minimum-image filtering, so ~95 ms at best and ~190 ms warm. That arrives
+    # as one lump every ENERGY_EVERY frames, and no amount of threading hides a
+    # lump six times the size of the frame it lands in: on the remote demo it is
+    # the stall you can see a few times a second while the camera turns.
+    #
+    # So above this many particles the pair work runs on a uniform random
+    # SUBSAMPLE, redrawn every analysis frame, and what it feeds is corrected for
+    # the dilution (PairData.dilution). Nothing it feeds is worse off for that: a
+    # subsample of fraction f keeps each particle with probability f and each
+    # pair with probability f^2, so a per-particle mean over f and a pair sum
+    # over f^2 are both unbiased -- the HUD numbers and the energy bars come back
+    # with a per cent or two of sampling noise instead of a stall, and because
+    # the sample is redrawn each time the noise averages away over a second
+    # rather than sitting there as a fixed wrong answer.
+    #
+    # The budget is a particle count rather than a millisecond target because the
+    # cost is knowable from it and a self-tuning budget would make the numbers on
+    # screen depend on how busy the machine is. 6000 leaves every local
+    # playground (<= 6000 beads) untouched and costs ~5 ms.
+    MAX_PAIR_BEADS = 6000
 
     def __init__(self, force_field, names=(), energy_every=None, enabled=True):
         self.force_field = force_field
@@ -203,6 +448,9 @@ class Analysis:
         # other is then an index error -- which is exactly what happened.
         self._energy_pairs = None
         self._values = {}            # observable name -> last value
+        # Redrawn every analysis frame that has to subsample; seeded once so a
+        # replayed run is reproducible.
+        self._rng = np.random.default_rng(0)
 
     @property
     def pairs(self):
@@ -218,9 +466,18 @@ class Analysis:
     def _due(self, every):
         return self._frame % every == 0
 
-    def update(self, state, params, force=False):
+    def update(self, state, params, force=False, keep_index=None):
         """Advance one frame. Rebuilds the pair list only when something that
-        needs it is due, so a frame where nothing is scheduled costs nothing."""
+        needs it is due, so a frame where nothing is scheduled costs nothing.
+
+        `keep_index` names a particle whose OWN neighbourhood is going to be read
+        off the result (the pulled bead, for the single-particle energy panel).
+        Sampling cannot serve that: one bead's f-fraction of its own neighbours is
+        a handful of pairs, and no scale factor turns that into a panel worth
+        looking at. So naming a particle switches the subsampling off for the
+        whole frame -- the panels it exists for belong to the puller playgrounds,
+        which run an order of magnitude below the budget anyway.
+        """
         if not self.enabled:
             return
         self._frame += 1
@@ -230,20 +487,45 @@ class Analysis:
         if not energy_due and not due_obs:
             return
 
-        # The pair list is built only for the consumers that actually read one.
+        # The pair list is built only for the consumers that actually read one,
+        # and -- above the budget -- only over a sample of the particles. Whatever
+        # reads the pairs must read the same state they were built from, so the
+        # sampled state travels with them; everything else keeps the full one.
+        pair_state = state
         if energy_due or any(ob.needs_pairs for ob in due_obs):
-            cutoff = self.force_field.interaction_cutoff(params)
-            self._pairs = build_pairs(state.positions, cutoff, state.box)
+            pair_state, dilution = self._pair_state(state, keep_index)
+            self._pairs = analysis_pairs(self.force_field, pair_state, params)
+            self._pairs.dilution = dilution
         elif self._pairs is None:
             self._pairs = PairData.empty()
 
         if energy_due:
-            self._energy = self.force_field.energy_terms(state, self._pairs, params)
+            self._energy = self.force_field.energy_terms(pair_state, self._pairs,
+                                                         params)
             self._energy_pairs = self._pairs
         for ob in due_obs:
-            if ob.needs_directors and state.directors is None:
+            ob_state = pair_state if ob.needs_pairs else state
+            if ob.needs_directors and ob_state.directors is None:
                 continue
-            self._values[ob.name] = ob(state, self._pairs, params)
+            self._values[ob.name] = ob(ob_state, self._pairs, params)
+
+    def _pair_state(self, state, keep_index):
+        """`state` itself, or a uniform random subsample of it, plus the fraction
+        of the system that came back. See MAX_PAIR_BEADS."""
+        n = len(state.positions)
+        if n <= self.MAX_PAIR_BEADS or keep_index is not None:
+            return state, 1.0
+        # Without replacement: a repeated particle would sit on top of itself and
+        # the pair at zero separation would be dropped by build_pairs anyway,
+        # leaving the sample quietly smaller than it says it is.
+        pick = self._rng.choice(n, self.MAX_PAIR_BEADS, replace=False)
+        return replace(state,
+                       positions=state.positions[pick],
+                       directors=(None if state.directors is None
+                                  else state.directors[pick]),
+                       types=None if state.types is None else state.types[pick],
+                       ids=None if state.ids is None else state.ids[pick]), \
+            self.MAX_PAIR_BEADS / n
 
     def energy_panel(self, title, scale, index=None):
         """(title, [(label, value), ...], scale) for the renderer's signed-bar
@@ -255,6 +537,20 @@ class Analysis:
         """
         if self._energy is None or self._energy_pairs is None:
             return None
+        dilution = self._energy_pairs.dilution
+        if index is not None and dilution < 1.0:
+            # A sampled frame knows nothing about a particular particle: `index`
+            # is an index into the whole system and these pairs are numbered
+            # within the sample. There is no panel to draw rather than a wrong
+            # one -- and this cannot happen while the caller passes the same
+            # particle to update() as keep_index, which is what switches the
+            # sampling off (see update).
+            return None
+        # A pair survives a sample of fraction f with probability f^2, so the sum
+        # over the sampled pairs is that fraction of the system's own sum. One
+        # factor of f is the particles that were drawn, the other the partners
+        # they kept.
+        gain = 1.0 / (dilution * dilution)
         # Mask with the pair list the energy was computed with, NOT the live one.
         mask = None if index is None else self._energy_pairs.touching(index)
         terms = []
@@ -262,7 +558,8 @@ class Analysis:
             arr = self._energy.get(label)
             if arr is None:
                 continue
-            terms.append((label, float(arr.sum() if mask is None else arr[mask].sum())))
+            total = float(arr.sum() if mask is None else arr[mask].sum())
+            terms.append((label, gain * total))
         return (title, terms, scale) if terms else None
 
     def hud_lines(self):

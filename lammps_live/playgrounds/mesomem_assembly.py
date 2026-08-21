@@ -27,21 +27,25 @@ from ..render_style import DEFAULT_STYLE, CameraOrbit
 # their default values, because these are the dials worth reaching for first.
 # Every field and what it does is in lammps_live/render_style.py; the two
 # playgrounds next door show what changing them buys.
+#
+# Add `.on_light()` to the end of this call to draw the whole scene on a light
+# background instead -- background, fog, lighting, box outline, net and spokes
+# all move together, and everything tuned below survives the flip.
 STYLE = DEFAULT_STYLE.varied(
     # The cell is periodic in all three axes, so its images could be drawn too
     # (as the sheet does): (1, 1, 1) would tile 3x3x3 around it, and
     # (0.5, 0.5, 0.5) would put a half-cell fringe of surrounding material round
     # it for a quarter of the instances. Left at the single real cell for now.
     periodic_images=(0, 0, 0),
-    image_fade_start=0.0,
+    image_fade_start=0.7,
     image_fade_end=1.0,
     dof_focus=0.15,
     dof_range=0.40,
     dof_bokeh_px=5.0,
     # Fade into the background: complete by 55% of the depth span, and go 75% of
     # the way to the background colour when it does.
-    cue_end=0.55,
-    cue_strength=0.75,
+    cue_end=0.9,
+    cue_strength=0.35,
     # Contact darkening between packed beads. An exponent, so higher = deeper
     # crevices with open surfaces left at full brightness.
     ao_strength=5.83,
@@ -50,7 +54,7 @@ STYLE = DEFAULT_STYLE.varied(
     # 0.85 a heavy ink outline.
     outline_strength=12.0,
     outline_edge_fraction=0.90,
-)
+).on_light()
 
 PLAYGROUND = Playground(
     name="MesoMem self-assembly (3D)",
@@ -74,7 +78,7 @@ PLAYGROUND = Playground(
     ),
     mode="sim",
     observables=["nematic_S", "coordination", "thickness"],
-    param_ranges={"k_splay": (0.0, 40.0)},
+    param_ranges={"k_splay": (0.0, 5.0)},
     presets={
         "paper": {},
         # Below the k_tilt ~ 10 threshold: compact isotropic droplets instead of

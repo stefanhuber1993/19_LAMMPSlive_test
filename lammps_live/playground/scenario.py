@@ -21,6 +21,7 @@ sheet's barostat relaxation to zero lateral tension, which must not fight a
 puller); `post_control_settle` runs with everything already in place (the patch's
 short silent settle).
 """
+import itertools
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -28,7 +29,17 @@ from dataclasses import dataclass
 import numpy as np
 
 from .params import ParamSet, structural
-from .state import Box, hex_lattice_2d, hex_ring_2d, principal_normal
+from .state import (Box, hex_lattice_2d, hex_ring_2d, icosphere_faces,
+                    icosphere_spacing, lattice_ring, principal_normal)
+
+# The polymer's two-stop ramp, in display-space bytes (see
+# VesiclePolymer.render_tints). Deliberately nothing like the membrane's own
+# colours: those are a pale blue and a pale yellow, both of them light, so the
+# chains are given a saturated cool-to-warm pair that reads as a different KIND of
+# object rather than as more membrane in another shade -- and one that holds up on
+# the light background these scenes are drawn on, where a pale ramp would wash out.
+POLYMER_COLD = (26, 148, 140)      # teal
+POLYMER_WARM = (206, 66, 148)      # magenta
 
 
 @dataclass
@@ -42,10 +53,28 @@ class ScenarioBuild:
     # Per-particle render brightness multiplier (1.0 = normal), or None. Used to
     # spotlight a tracked cluster so it can be followed as it diffuses.
     brightness: np.ndarray = None
+    # How many of `positions` the runtime uploads itself; the rest are created by
+    # the scenario's own `create_commands`. None -> all of them, which is every
+    # scenario but one.
+    #
+    # It exists for a scenario carrying BONDED particles. Those cannot arrive
+    # through `create_atoms` -- it places points, and a polymer is points plus a
+    # topology -- so they come in through a LAMMPS molecule template instead (see
+    # VesiclePolymer.create_commands). But everything ELSE about the system still
+    # wants to know they are there: the client of a remote playground reads the
+    # composition off this build to know how many beads to expect and what colour
+    # to paint each one, and it has no LAMMPS to ask. So the build describes the
+    # WHOLE system and this says where the runtime's own uploading stops.
+    n_direct: int = None
 
     def __post_init__(self):
         if self.types is None:
             self.types = np.ones(len(self.positions), dtype=int)
+
+    @property
+    def n_uploaded(self):
+        """How many leading positions the runtime uploads with create_atoms."""
+        return len(self.positions) if self.n_direct is None else int(self.n_direct)
 
 
 class Scenario(ABC):
@@ -71,6 +100,15 @@ class Scenario(ABC):
     # Rendering hints, surfaced on the generated SystemSpec.
     director_arrows = True     # per-particle director spikes; clutter above ~50
     wrap_fade_fraction = 0.0   # periodic-seam crossfade, as a fraction of the side
+
+    # Whether the cell keeps changing size while the simulation runs -- a barostat
+    # that is still installed after setup. The runtime then re-reads the box every
+    # frame instead of trusting the geometry it asked for, because the drawn
+    # outline, the periodic seam handling and the minimum-imaging in the analysis
+    # pair list all key off it. False for a scenario whose cell is frozen once
+    # relaxed, which is every other one: it is six `extract_global` calls a frame,
+    # cheap but pointless when the answer cannot have changed.
+    cell_is_live = False
 
     # The thermostat this scenario wants. Langevin (implicit solvent) suits a
     # coarse-grained membrane in water; a crystal slab wants CSVR, which leaves the
@@ -210,6 +248,17 @@ class Scenario(ABC):
         """
         return None
 
+    def render_tints(self, params):
+        """Static per-particle colour, (N, 4) or None (the default).
+
+        Display-space r, g, b in 0..255 and a MIX in 0..1 saying how much of it
+        to paint over the director banding -- see MDSystem3D.get_bead_tints, which
+        is where it ends up. A scenario holding two species that should not look
+        alike is what this is for; one holding a single membrane says nothing and
+        lets the banding stand.
+        """
+        return None
+
     def camera(self, box):
         """dict(eye=, target=, up=, fov_deg=) for the 3D scene. The runtime then
         zooms to fit_points, so this only sets a good angle and rough distance."""
@@ -255,6 +304,26 @@ def align_normal_forces(points, strength):
     iang = np.eye(3) * np.sum(q * q) - q.T @ q
     a = np.linalg.solve(iang + 1e-6 * np.eye(3), torque)
     return np.cross(a[None, :], q)
+
+
+def _axis_permutations():
+    """The 48 signed permutation matrices -- every map that takes the cubic
+    lattice to itself and the origin to the origin. Cached on first use; it is a
+    fixed table of 48 3x3 matrices."""
+    global _AXIS_PERMUTATIONS
+    if _AXIS_PERMUTATIONS is None:
+        mats = []
+        for perm in itertools.permutations(range(3)):
+            for signs in itertools.product((1.0, -1.0), repeat=3):
+                m = np.zeros((3, 3))
+                for row, col in enumerate(perm):
+                    m[row, col] = signs[row]
+                mats.append(m)
+        _AXIS_PERMUTATIONS = np.array(mats)
+    return _AXIS_PERMUTATIONS
+
+
+_AXIS_PERMUTATIONS = None
 
 
 def _exclude(n, controlled):
@@ -505,6 +574,225 @@ class HexSheet(Scenario):
         return np.vstack([corners, [(0.0, aim, 2.6), (0.0, aim, -2.2)]])
 
 
+class RodOnSheet(HexSheet):
+    """A HexSheet with one rigid rod (atom type 2) hanging above it, at constant
+    lateral tension.
+
+    Most of the membrane -- the periodic lattice, the plane-centring housekeeping,
+    the tension-free settle -- is the sheet's, unchanged. What is added is one
+    particle of a second type, placed on the control plane at a clearance the
+    rod's own interaction cannot yet reach with its long axis lying IN that plane;
+    a barostat that KEEPS RUNNING; and a camera in the membrane's own plane,
+    because a wrap is a profile rather than a surface.
+
+    THE RUNNING BAROSTAT IS THE DIFFERENCE THAT MATTERS. HexSheet relaxes the cell
+    to zero lateral tension and then freezes it, which is right for pulling one
+    bead out of a fixed lattice. It is wrong for wrapping: covering a rod costs
+    membrane area, and in a frozen periodic cell the only place that area can come
+    from is stretching the lattice, so the membrane cannot invaginate the rod --
+    it just dents. Holding the lateral pressure at its target instead lets the
+    projected area shrink as the wrap grows, which is the same thing the
+    collaborator's reference deck does (`fix nph/sphere x .. y .. couple xy`
+    running through all three of its rod phases, with the target ramped to set the
+    tension). Zero pressure is the tension-free ensemble; `baro_press` is the dial
+    for putting the membrane under tension instead, which is what suppresses
+    wrapping.
+
+    It is a Berendsen barostat rather than the deck's Nose-Hoover one for the same
+    reason the settle uses one: `press/berendsen` rides on top of whatever
+    integrator is already there, so the force field keeps its own `nve/sphere
+    update dipole` and the directors keep being integrated. It also has no
+    oscillation of its own to fight the user's hand with.
+
+    Two deliberate choices about where the rod starts:
+
+      IT STARTS OUT OF CONTACT. `rod_height` is above the rod-membrane cutoff, so
+        the barostat settle relaxes a membrane the rod is not yet touching, and
+        the first thing the user does -- bringing it down until it grabs -- is the
+        beginning of the demo rather than something that already happened.
+      IT STARTS ON THE LEASH's plane, at y = 0 and inside its z half-extent. The
+        leash is centred on the origin (see modes.GameMode.constrain), so a rod
+        placed above it would be yanked down to the limit on the first frame.
+        `verify_reach` says so out loud rather than leaving that to be discovered.
+    """
+
+    name = "rod_on_sheet"
+    # The rod is a second species whose orientation is the whole point, and it is
+    # the only particle whose director is worth a spike -- but the sheet has
+    # thousands of them, and the renderer draws spikes for all or none. The rod's
+    # own body (see MesoMemRod.glyph_spheres) shows which way it points instead.
+    director_arrows = False
+    # The cell changes size every step, so the runtime has to read it back rather
+    # than trusting the geometry it asked for -- the drawn box outline, the
+    # periodic seam handling and the minimum-imaging in the analysis pair list all
+    # key off it. See PlaygroundSystem.step.
+    cell_is_live = True
+
+    params = HexSheet.params + (
+        structural("rod_height", 3.5,
+                   "the rod's starting height above the membrane plane"),
+        structural("rod_axis", (1.0, 0.0, 0.0),
+                   "the rod's initial long axis (must lie in the control plane)"),
+        # Slower than the settle's, because this one runs while a hand is on the
+        # membrane: the settle wants the lattice relaxed quickly from a made-up
+        # spacing, this wants the cell to follow a growing wrap without the box
+        # visibly breathing under the user.
+        structural("baro_damp_run", 20.0,
+                   "relaxation time of the barostat that keeps running"),
+        structural("hold_steps", 200,
+                   "silent settle after the running barostat is installed"),
+        structural("view_elevation_deg", 6.0,
+                   "camera elevation above the membrane plane (0 = exactly "
+                   "edge-on, so the membrane is a line)"),
+    )
+
+    def camera(self, box):
+        """Edge-on: the membrane is a LINE and the rod invaginates it in section.
+
+        This is the whole reason this scenario has its own camera. The sheet looks
+        down at its membrane from 35 degrees, which is right for watching a
+        deformation travel across a surface. A wrap is not that -- it is a
+        PROFILE. What there is to see is how far the rod has sunk below the
+        surface and how far the membrane has climbed around it, and both of those
+        are depths. Seen from above they are entirely along the view axis; seen
+        edge-on they are the picture.
+
+        It also happens to be the plane the rod is steered in: the control plane is
+        the world xz-plane, so a camera looking along -y puts the two joystick
+        axes exactly on screen-horizontal and screen-vertical. The rod goes where
+        the stick goes.
+
+        A few degrees up rather than exactly zero, so the membrane reads as a
+        narrow band -- a surface seen almost edge-on -- rather than a single row of
+        beads with no thickness to judge the rod against.
+
+        This angle only works together with `RenderStyle.section_min`, which is
+        declared alongside it in the playground. A monolayer is opaque: without
+        the cut, the rows of beads between the camera and the rod sit at exactly
+        the height the rod is being pushed to and hide the whole invagination, and
+        no elevation fixes it -- raise the camera and the depths foreshorten away,
+        lower it and the near rows are in the way. The cut removes them; this
+        angle then shows what is left.
+
+        The distance is measured from the CELL, not from the framed patch: this
+        cell is 46 sigma deep and the camera has to stand well outside it. Close
+        in, the nearest rows are a fraction of the distance the rod is and
+        perspective blows them up into a wall of beads across the bottom of the
+        frame; a long way back they are nearly the same size as the rod's own row.
+        The app zooms to `fit_points` afterwards, so standing back costs nothing
+        but the flatter perspective a section wants.
+        """
+        params = self.new_params()
+        span = max(box.lengths[0], box.lengths[1]) * params["view_span"]
+        el = math.radians(min(max(float(params["view_elevation_deg"]), 0.0), 85.0))
+        d = 0.5 * box.lengths[1] + 2.5 * span
+        return dict(eye=(0.0, -d * math.cos(el), d * math.sin(el)),
+                    target=(0.0, 0.0, 0.0), up=(0.0, 0.0, 1.0), fov_deg=34.0)
+
+    def build(self, params, rng):
+        sheet = super().build(params, rng)
+        axis = np.asarray(params["rod_axis"], dtype=float)
+        axis = axis / max(np.linalg.norm(axis), 1e-12)
+        rod = np.array([[0.0, 0.0, float(params["rod_height"])]])
+        positions = np.vstack([sheet.positions, rod])
+        directors = np.vstack([sheet.directors, axis[None, :]])
+        # Type 2 LAST, so `Control(atom="last")` names it -- and so the membrane
+        # keeps the ids the sheet's tracer highlight was chosen from.
+        types = np.concatenate([np.ones(len(sheet.positions), dtype=int), [2]])
+        brightness = sheet.brightness
+        if brightness is not None:
+            brightness = np.append(brightness, 1.0)
+        return ScenarioBuild(positions=positions, directors=directors,
+                            types=types, box=sheet.box, brightness=brightness)
+
+    def create_commands(self, params, build, seed):
+        """The membrane's directors point along +z; the rod's axis lies in the
+        control plane. Issued in that order, so the second overwrites the first
+        for type 2 only."""
+        axis = np.asarray(params["rod_axis"], dtype=float)
+        axis = axis / max(np.linalg.norm(axis), 1e-12)
+        return [
+            "set type 1 dipole 0.0 0.0 1.0",
+            f"set type 2 dipole {axis[0]} {axis[1]} {axis[2]}",
+        ]
+
+    def group_commands(self, params, controlled_id):
+        """A group for the membrane alone, by type.
+
+        By TYPE rather than reusing the mode's `bath` (which is also "everything
+        but the rod"): the barostat below has to exist in sim mode too, where
+        there is no controlled particle and so no `bath`.
+        """
+        return ["group membrane type 1"]
+
+    def post_control_settle(self, params):
+        """Install the barostat that keeps running, and let the cell find itself.
+
+        Runs in `post_control_settle` rather than alongside the settle's own so
+        the two do not overlap: HexSheet defines `settle_baro`, relaxes with it
+        and then unfixes it, and this one is a different fix with a different
+        relaxation time that outlives the setup.
+
+        `dilate partial` on the membrane group is what keeps the rescaling off the
+        rod: the pressure is still measured over the whole system (that is a
+        global quantity and `press/berendsen` computes it that way whatever its
+        group), but the coordinate rescaling touches membrane beads only, so the
+        rod is not quietly dragged toward the origin every time the cell shrinks
+        under it -- which would fight the leash and put the drawn control net
+        somewhere other than where the rod can actually go.
+        """
+        p, damp = params["baro_press"], params["baro_damp_run"]
+        return [
+            f"fix baro membrane press/berendsen x {p} {p} {damp} "
+            f"y {p} {p} {damp} couple xy dilate partial",
+            f"run {int(params['hold_steps'])}",
+        ]
+
+    def fit_points(self, params, box):
+        """The framed region, plus the rod's full travel.
+
+        Not the sheet's version: that frames the CELL's corners, and this cell is
+        several times the size of what the camera is looking at (`view_span` well
+        below 1), so fitting its corners would pull the camera back until the rod
+        was a speck. The framed patch is the in-plane extent `view_span` asks for,
+        and the two z points keep the rod in shot at both ends of its leash.
+        """
+        span = float(params["view_span"])
+        hx = 0.5 * box.lengths[0] * span
+        hy = 0.5 * box.lengths[1] * span
+        h = float(params["rod_height"])
+        return np.array([(x, y, 0.0) for x in (-hx, hx) for y in (-hy, hy)]
+                        + [(0.0, 0.0, h + 1.5), (0.0, 0.0, -h - 1.5)])
+
+    def verify_reach(self, control, rod_cutoff):
+        """Complain if the leash cannot express the demo.
+
+        Called from the playground's own test rather than at build time: these are
+        statements about a Control and a force field the scenario does not own, and
+        getting either wrong produces a demo that looks like it works and cannot
+        actually touch the membrane -- which is exactly the kind of thing worth a
+        test and not worth a runtime check on every build.
+        """
+        params = self.new_params()
+        h = float(params["rod_height"])
+        problems = []
+        if h > control.leash[1]:
+            problems.append(
+                f"rod_height {h} is outside the leash's z half-extent "
+                f"{control.leash[1]}: the rod would be clamped down to the limit "
+                f"on the first frame")
+        if h <= rod_cutoff:
+            problems.append(
+                f"rod_height {h} is inside the rod-membrane cutoff {rod_cutoff:.2f}: "
+                f"the rod starts already in contact")
+        if control.leash[1] < rod_cutoff:
+            problems.append(
+                f"the leash's z half-extent {control.leash[1]} is inside the "
+                f"rod-membrane cutoff {rod_cutoff:.2f}: the rod can never be "
+                f"lifted clear of the membrane")
+        return problems
+
+
 class RandomFill(Scenario):
     """N particles at random positions and orientations in a fully periodic cell
     -- the paper's spontaneous-assembly test.
@@ -656,9 +944,422 @@ class RandomFill(Scenario):
         return [f"set group all dipole/random {seed} 1.0"]
 
     def camera(self, box):
-        s = max(box.lengths)
-        return dict(eye=(0.6 * s, -1.1 * s, 0.7 * s), target=(0.0, 0.0, 0.0),
+        """A three-quarter view from a LONG lens, not a wide one.
+
+        The distance here is the perspective strength, and it is the only thing
+        that sets it -- the runtime zooms to fit (Camera3D.fit_to_points), so the
+        declared `fov_deg` never survives and moving the eye out is compensated by
+        a longer focal length rather than a smaller picture. Which means the one
+        number that matters is how far away the eye is compared to how big the
+        cell is.
+
+        At the 1.44 cell-widths this used to sit at, the fit came out at a 75
+        degree field: a wide-angle lens pressed up against a cube, with the near
+        beads drawn three times the size of the far ones and the cell's faces
+        visibly flaring outward. That reads as a fisheye photograph of a box
+        rather than as a box. At 3.0 the fit lands near the 34 degrees this
+        scenario asked for all along -- a normal lens, near beads about 1.6x the
+        far ones, the cell's opposite faces near enough parallel to read as a
+        cube, and enough perspective left that the turntable still tells you
+        which way it is turning. Further out approaches an orthographic
+        projection, where the depth stops doing any of the work of separating the
+        aggregates and the box flattens into a wall of beads.
+        """
+        s = 3.0 * max(box.lengths)
+        # The direction is unchanged: off to the right, well in front, above.
+        d = np.array([0.6, -1.1, 0.7])
+        eye = tuple(s * d / np.linalg.norm(d))
+        return dict(eye=eye, target=(0.0, 0.0, 0.0),
                     up=(0.0, 0.0, 1.0), fov_deg=34.0)
+
+
+class VesiclePolymer(Scenario):
+    """A closed MesoMem vesicle with a melt of ring polymers sealed inside it.
+
+    The collaborator's system (see polymer/ at the repo root): a spherical
+    monolayer of directored beads -- the membrane force field's beads, radial
+    directors, nothing else -- with a chromatin-like melt of self-avoiding ring
+    polymers filling the lumen. The rings interact with each other and with the
+    membrane through a purely repulsive core, so nothing sticks: what the polymer
+    does to the vesicle it does by PUSHING, which is the only mechanism in the
+    picture and is why it is worth watching.
+
+    THE VESICLE. Beads at the face centres of a geodesic sphere (see
+    state.icosphere_faces), which is the construction that gives a nearly uniform
+    triangulation -- the membrane is a fluid and will re-space itself, but it
+    cannot be handed two crowded poles to start from. Its RADIUS is not a free
+    parameter: it follows from the bead count and the spacing, because those two
+    are what the force field cares about. Ask for more beads at the same spacing
+    and you get a bigger vesicle, which is the honest relation.
+
+    Which also means `n_membrane` has a floor. MesoMem's tilt term prefers a FLAT
+    membrane (c0 = 0), so closing one into a sphere costs bending energy that goes
+    as 1/R^2, and a small enough vesicle is not a metastable object -- it roughens,
+    and a chain pressed against it can find its way out. At the shipped size
+    (18,000 beads, R ~ 35 sigma) nothing escapes over thousands of steps; a tenth
+    of that radius is visibly leaky, which is what the small system in
+    tests/test_vesicle_polymer.py is and why it asserts a fraction rather than a
+    maximum.
+
+    Also worth knowing: the packing on a geodesic sphere is not uniform, it varies
+    by about half between a parent face's centre and one of the icosahedron's
+    twelve five-fold vertices (see icosphere_spacing). The membrane relaxes that
+    out within a few hundred steps, and `a` is a mean rather than a promise.
+
+    THE POLYMER. Each ring is a Hamiltonian cycle on a small cubic lattice (see
+    state.lattice_ring): a closed, compact, self-avoiding walk in which every bond
+    is exactly one lattice step and no two beads are closer than one. That matters
+    more than it sounds. The obvious construction -- a random walk -- produces
+    overlapping beads, and a FENE bond plus a repulsive core applied to
+    overlapping beads is an explosion on the first step; the usual fix is an
+    offline soft-core push-off, which is exactly the pre-relaxed data file this
+    scenario exists to not need. A lattice ring needs no relaxation at all: it is
+    already a valid configuration of the potential it is about to be handed to.
+
+    The rings are then laid out on a coarse grid inside the lumen, thinly enough
+    to hit the reference system's volume fraction, and each is jittered off its
+    lattice so the run does not begin from a crystal. They swell and interpenetrate
+    within the first few hundred steps.
+
+    HOW THE POLYMER REACHES LAMMPS. Not through `create_atoms`, which places
+    points and knows nothing of bonds, but through a molecule template written at
+    build time and instanced once (see `create_commands`). So `build` returns the
+    positions of the WHOLE system -- which is what the remote client reads the
+    composition off -- while `n_direct` stops the runtime's own upload at the
+    membrane. The template's own coordinates are what LAMMPS actually places, up
+    to the rigid rotation `create_atoms ... mol` applies; nothing draws the
+    polymer half of `positions`.
+    """
+
+    name = "vesicle_polymer"
+    timestep = 0.005
+    sim_time_per_frame = 0.05
+    # As RandomFill: weak friction, so the rings can actually explore. A ring melt
+    # relaxes on its own slow timescale and a stiff bath would freeze it in the
+    # lattice it was built on.
+    langevin_damp = 1.0
+    neighbor_skin = 0.6
+    director_arrows = False     # tens of thousands of beads; spikes are cost and clutter
+
+    params = (
+        structural("n_membrane", 18000,
+                   "target membrane beads (rounded to the nearest 20*nu^2 -- an "
+                   "icosphere only comes in those sizes)"),
+        structural("a", 0.85,
+                   "membrane nearest-neighbour spacing. The sheet playgrounds' "
+                   "relaxed value: the vesicle then starts near tension-free "
+                   "rather than pre-compressed"),
+        structural("box_factor", 1.12,
+                   "cubic cell half-side, as a multiple of the vesicle radius"),
+        structural("n_polymer", 32000,
+                   "target polymer beads (rounded down to whole rings)"),
+        structural("ring_side", 8,
+                   "sites per side of a ring's cubic block, so ring_side^3 beads "
+                   "per ring. Must be even (see state.lattice_ring)"),
+        structural("bond_length", 1.0,
+                   "polymer bond length at build, and so the ring lattice's step"),
+        structural("fill_fraction", 0.74,
+                   "how far out the polymer is laid, as a fraction of the vesicle "
+                   "radius. Short of the membrane, so the first thing the run "
+                   "shows is the melt expanding to meet it"),
+        structural("jitter", 0.15,
+                   "random per-bead displacement off the ring lattice, in bond "
+                   "lengths -- enough that the melt does not begin as a crystal, "
+                   "small enough to leave every bond well inside FENE's range"),
+        structural("settle_steps", 400,
+                   "silent relaxation before the run is handed over"),
+        structural("view_span", 1.0,
+                   "camera framing: multiples of the cell's half-width"),
+    )
+
+    # --- geometry -------------------------------------------------------------
+
+    def subdivision(self, params):
+        """The icosphere subdivision nearest the requested membrane count, and the
+        count it actually gives (20*nu^2)."""
+        nu = max(1, int(round(math.sqrt(max(params["n_membrane"], 20) / 20.0))))
+        return nu, 20 * nu * nu
+
+    def radius(self, params):
+        """Vesicle radius, in sigma. Set by the bead count and the spacing -- see
+        the class docstring."""
+        nu, _ = self.subdivision(params)
+        return float(params["a"]) / icosphere_spacing(nu)
+
+    def ring_centres(self, params, radius):
+        """Where the ring blocks go: a cubic grid inside the lumen, at the pitch
+        that fits the requested number of them.
+
+        The pitch comes from the target count rather than the other way round, so
+        `n_polymer` means what it says. Solving it as a continuum -- how many cells
+        of pitch p fit in the available sphere -- then counting the real grid and
+        tightening if the estimate was optimistic, which it is at the corners.
+        """
+        side = int(params["ring_side"])
+        b = float(params["bond_length"])
+        per_ring = side ** 3
+        want = max(1, int(params["n_polymer"]) // per_ring)
+        block = (side - 1) * b
+        half_diag = 0.5 * math.sqrt(3.0) * block
+        # The centres have to sit far enough in that the whole block does.
+        reach = float(params["fill_fraction"]) * radius - half_diag
+        if reach <= 0.0:
+            return np.zeros((0, 3)), want
+        # A block may never be laid closer to its neighbour than one bond length,
+        # or the two rings start out overlapping.
+        min_pitch = block + b
+        pitch = max(min_pitch,
+                    ((4.0 / 3.0) * math.pi * reach ** 3 / want) ** (1.0 / 3.0))
+        for _ in range(12):
+            k = int(math.floor(reach / pitch)) + 1
+            g = np.arange(-k, k + 1) * pitch
+            grid = np.array(np.meshgrid(g, g, g, indexing="ij")).reshape(3, -1).T
+            inside = grid[np.linalg.norm(grid, axis=1) <= reach]
+            if len(inside) >= want or pitch <= min_pitch:
+                break
+            pitch = max(min_pitch, pitch * 0.94)
+        # Innermost first, so a target the lumen cannot hold gives a smaller,
+        # centred melt rather than a hollow shell of rings.
+        order = np.argsort(np.linalg.norm(inside, axis=1))
+        return inside[order[:want]], want
+
+    def build(self, params, rng):
+        nu, n_mem = self.subdivision(params)
+        radius = self.radius(params)
+        _, normals = icosphere_faces(nu)
+        # On the sphere exactly, not at the sub-triangle centroids, which sit a
+        # few parts in ten thousand inside it. Same spacing, one fewer thing for
+        # the membrane to relax out.
+        membrane = normals * radius
+        polymer = self._polymer(params, rng, radius)
+
+        positions = np.vstack([membrane, polymer]) if len(polymer) else membrane
+        directors = np.vstack([normals, np.zeros((len(polymer), 3))])
+        types = np.concatenate([np.ones(n_mem, dtype=int),
+                                np.full(len(polymer), 2, dtype=int)])
+        half = float(params["box_factor"]) * radius
+        return ScenarioBuild(
+            positions=positions, directors=directors, types=types,
+            # Free, not periodic: the vesicle is a finite object with vacuum
+            # around it, and there is nothing here that a periodic image would
+            # add except a second vesicle a fraction of a radius away.
+            box=Box.cube(2.0 * half), n_direct=n_mem)
+
+    def _polymer(self, params, rng, radius):
+        """Every polymer bead's position, rings laid end to end in ring order."""
+        centres, _ = self.ring_centres(params, radius)
+        if not len(centres):
+            return np.zeros((0, 3))
+        side = int(params["ring_side"])
+        b = float(params["bond_length"])
+        ring = (lattice_ring(side, side, side).astype(float) - (side - 1) / 2.0) * b
+        # Every ring is the SAME walk, and laid down unturned they all stack the
+        # same way -- which is not just ugly but misleading, since a melt of
+        # identically oriented rings is a lamellar phase and this is not one. So
+        # each is turned by a random signed permutation of the axes: one of the 48
+        # maps that take the cubic lattice to itself, so the block's footprint is
+        # exactly unchanged and no ring can be swung into its neighbour, while the
+        # serpentine inside it points somewhere else. A free rotation would look
+        # better still and cannot be had: at the pitch these are laid on, a block's
+        # corners sweep past its neighbour's.
+        turns = _axis_permutations()
+        blocks = np.empty((len(centres), len(ring), 3))
+        for i, centre in enumerate(centres):
+            blocks[i] = ring @ turns[rng.integers(len(turns))] + centre
+        jitter = float(params["jitter"]) * b
+        if jitter > 0.0:
+            blocks = blocks + rng.uniform(-jitter, jitter, size=blocks.shape)
+        return blocks.reshape(-1, 3)
+
+    def ring_count(self, params):
+        """How many rings this actually lays -- what `n_polymer` was rounded to."""
+        return len(self.ring_centres(params, self.radius(params))[0])
+
+    def particle_count(self, params):
+        """Membrane plus polymer, without building anything."""
+        _, n_mem = self.subdivision(params)
+        return n_mem + self.ring_count(params) * int(params["ring_side"]) ** 3
+
+    # --- LAMMPS side ----------------------------------------------------------
+
+    def create_commands(self, params, build, seed):
+        """The membrane's directors, and the polymer itself.
+
+        The directors are set with atom-style variables rather than one `set` per
+        bead: they are radial, so each one is its own position normalised, and
+        that is a three-line expression LAMMPS evaluates over every atom at once
+        instead of twenty thousand commands.
+
+        The polymer arrives as a MOLECULE TEMPLATE -- the one route into LAMMPS
+        that carries a topology, and the reason this scenario writes a file at
+        all. All of the rings go in one template and are instanced with a single
+        `create_atoms`: they are disconnected fragments of one object as far as
+        LAMMPS is concerned, which costs nothing and means the melt is placed
+        once rather than once per ring (`create_atoms ... mol` applies a random
+        rigid rotation, and rotating each ring separately would swing its corners
+        into its neighbours).
+        """
+        n_mem = build.n_uploaded
+        cmds = [
+            # r first, so the three components below are one divide each rather
+            # than three square roots.
+            "variable vp_r atom sqrt(x*x+y*y+z*z)",
+            "variable vp_mx atom x/v_vp_r",
+            "variable vp_my atom y/v_vp_r",
+            "variable vp_mz atom z/v_vp_r",
+            "set type 1 dipole v_vp_mx v_vp_my v_vp_mz",
+        ]
+        polymer = build.positions[n_mem:]
+        if not len(polymer):
+            return cmds
+        path = self._write_template(params, polymer)
+        return cmds + [
+            f"molecule vp_polymer {path}",
+            f"create_atoms 0 single 0.0 0.0 0.0 mol vp_polymer {int(seed)}",
+        ]
+
+    def _write_template(self, params, polymer):
+        """Write the rings out as a LAMMPS molecule file and return its path.
+
+        The per-particle attributes go in the file rather than being `set`
+        afterwards for an ordering reason: the force field's own setup runs
+        BEFORE this, when no polymer atom exists yet, so a `set type 2` there
+        would land on nothing. A template that carries its own diameters and
+        masses is self-sufficient whatever order it is instanced in.
+
+        The directory is held on the scenario, so it outlives the command list
+        being executed and is cleaned up when the process ends.
+        """
+        import os
+        import tempfile
+
+        if self._tmpdir is None:
+            self._tmpdir = tempfile.TemporaryDirectory(prefix="lammps-live-poly-")
+        path = os.path.join(self._tmpdir.name, "polymer.mol")
+        side = int(params["ring_side"])
+        per_ring = side ** 3
+        n = len(polymer)
+        n_rings = n // per_ring
+        with open(path, "w") as f:
+            f.write("ring-polymer melt, written by VesiclePolymer\n\n")
+            # A ring of L beads has L bonds and L angles: the walk closes, so
+            # the last bead is bonded to the first: there is no free end anywhere.
+            f.write(f"{n} atoms\n{n} bonds\n{n} angles\n\n")
+            f.write("Coords\n\n")
+            for i, (x, y, z) in enumerate(polymer, 1):
+                f.write(f"{i} {x:.5f} {y:.5f} {z:.5f}\n")
+            f.write("\nTypes\n\n")
+            f.write("".join(f"{i} 2\n" for i in range(1, n + 1)))
+            f.write("\nDiameters\n\n")
+            f.write("".join(f"{i} 1.0\n" for i in range(1, n + 1)))
+            f.write("\nMasses\n\n")
+            f.write("".join(f"{i} 1.0\n" for i in range(1, n + 1)))
+            f.write("\nMolecules\n\n")
+            f.write("".join(f"{i} {1 + (i - 1) // per_ring}\n"
+                            for i in range(1, n + 1)))
+            f.write("\nBonds\n\n")
+            bid = 0
+            for r in range(n_rings):
+                base = r * per_ring
+                for k in range(per_ring):
+                    bid += 1
+                    f.write(f"{bid} 1 {base + k + 1} "
+                            f"{base + (k + 1) % per_ring + 1}\n")
+            f.write("\nAngles\n\n")
+            aid = 0
+            for r in range(n_rings):
+                base = r * per_ring
+                for k in range(per_ring):
+                    aid += 1
+                    f.write(f"{aid} 1 {base + k + 1} "
+                            f"{base + (k + 1) % per_ring + 1} "
+                            f"{base + (k + 2) % per_ring + 1}\n")
+        return path
+
+    def group_commands(self, params, controlled_id):
+        """The two species, by type. They are what the integrators below split on
+        -- and they have to be groups rather than a single `all`, because only one
+        of the two carries an orientation."""
+        return ["group membrane type 1", "group polymer type 2"]
+
+    def integrator_commands(self, params):
+        """One integrator each, and the reason is the directors.
+
+        `nve/sphere update dipole` integrates a particle's orientation, which the
+        membrane needs and the polymer has nothing to integrate -- a polymer bead
+        carries no director at all, and handing a zero-length one to that fix asks
+        it to normalise nothing. Plain `nve` for the chains.
+        """
+        return [
+            "fix vp_int_mem membrane nve/sphere update dipole",
+            "fix vp_int_pol polymer nve",
+        ]
+
+    def post_control_settle(self, params):
+        return [f"run {int(params['settle_steps'])}"]
+
+    # --- rendering ------------------------------------------------------------
+
+    def render_tints(self, params):
+        """The polymer's own palette: a ramp along each ring's contour.
+
+        The membrane keeps the MesoMem banding -- a mix of 0 leaves it alone --
+        because that banding IS the physics on those beads, and the yellow
+        equator tilting with the director is what a membrane playground is for.
+        The polymer has no such thing to show (no director, no orientation), so
+        the colour is free to carry the one property those beads DO have that
+        nothing else in the picture shows: where along the chain each one sits.
+        Following a strand through a melt by eye is otherwise impossible.
+
+        A ramp per RING rather than across the whole melt, so every ring runs the
+        full range and reads as a closed loop of its own rather than as one more
+        sample of a global gradient.
+        """
+        _, n_mem = self.subdivision(params)
+        n_rings = self.ring_count(params)
+        per_ring = int(params["ring_side"]) ** 3
+        tints = np.zeros((n_mem + n_rings * per_ring, 4))
+        if not n_rings:
+            return tints
+        # Round-trip: the ramp has to come back to where it started, or a closed
+        # ring shows a seam where its two ends meet.
+        u = np.linspace(0.0, 1.0, per_ring, endpoint=False)
+        t = 0.5 - 0.5 * np.cos(2.0 * np.pi * u)
+        ramp = (np.array(POLYMER_COLD)[None, :] * (1.0 - t[:, None])
+                + np.array(POLYMER_WARM)[None, :] * t[:, None])
+        tints[n_mem:, :3] = np.tile(ramp, (n_rings, 1))
+        tints[n_mem:, 3] = 1.0
+        return tints
+
+    def camera(self, box):
+        """The assembly box's long lens, aimed at the vesicle. See
+        RandomFill.camera for why the distance is what sets the perspective."""
+        s = 2.6 * max(box.lengths)
+        d = np.array([0.6, -1.1, 0.7])
+        return dict(eye=tuple(s * d / np.linalg.norm(d)), target=(0.0, 0.0, 0.0),
+                    up=(0.0, 0.0, 1.0), fov_deg=34.0)
+
+    def fit_points(self, params, box):
+        """Frame the VESICLE, not the cell.
+
+        The box is a container with a margin of vacuum around a sphere, and
+        framing its corners spends a third of the picture's width on that vacuum.
+        Nor the sphere's BOUNDING BOX, which is the same mistake one step smaller:
+        a cube's corners stand out by sqrt(3) past the sphere inscribed in it, so
+        framing them leaves the vesicle filling 58% of the frame it was supposed
+        to fill. The six axial extremes are the sphere's own silhouette from any
+        angle, which is what there is to frame.
+        """
+        r = float(params["view_span"]) * self.radius(params)
+        return np.array([(r, 0.0, 0.0), (-r, 0.0, 0.0), (0.0, r, 0.0),
+                         (0.0, -r, 0.0), (0.0, 0.0, r), (0.0, 0.0, -r)])
+
+    def __init__(self, **overrides):
+        super().__init__(**overrides)
+        # Holds the molecule template alive for as long as this scenario object
+        # does -- which is the life of the process, since a playground file is a
+        # module-level constant. Rebuilt on every Reset, into the same directory.
+        self._tmpdir = None
 
 
 class Composite(Scenario):
@@ -753,5 +1454,13 @@ def hex_sheet(at=None, **overrides):
     return _configured(HexSheet, at, overrides)
 
 
+def rod_on_sheet(at=None, **overrides):
+    return _configured(RodOnSheet, at, overrides)
+
+
 def random_fill(at=None, **overrides):
     return _configured(RandomFill, at, overrides)
+
+
+def vesicle_polymer(at=None, **overrides):
+    return _configured(VesiclePolymer, at, overrides)

@@ -30,6 +30,7 @@ from ..render_style import DEFAULT_STYLE
 #
 # The strong outline is doing real work here: at 900 overlapping beads it is
 # what keeps the individual particles legible in the middle distance.
+# (`.on_light()` on the end draws the same sheet on a light background.)
 STYLE = DEFAULT_STYLE.varied(
     # The cell is periodic in-plane, i.e. this sheet is a window onto an endless
     # membrane -- so draw the neighbouring windows too and fade them out with
@@ -41,18 +42,20 @@ STYLE = DEFAULT_STYLE.varied(
     # are fractions of how far the copies reach, so 1.0 finishes exactly where
     # they are cut and 0.0 starts at the real cell's own edge.
     periodic_images=(2, (0.5, 3), 0),
-    image_fade_start=0.15,
+    image_fade_start=0.5,
     image_fade_end=1.0,
+    box_alpha=200,
+    net_alpha=150,
     dof_focus=0.25,         # the near quarter, incl. the pulled bead, stays sharp
     dof_range=1.5,          # half the span to go fully out of focus
     dof_bokeh_px=6.0,       # (8.0 by default) -- 0 switches DoF off entirely
-    cue_end=0.70,           # fade completes further back than the default 0.55
+    cue_end=0.90,           # fade completes further back than the default 0.55
     cue_strength=0.6,       # and stops short of the full 0.75
     # Left at the defaults, listed because they are the next dials to reach for:
-    ao_strength=5.83,           # contact darkening between the packed beads
+    ao_strength=9.83,           # contact darkening between the packed beads
     outline_strength=12.0,      # how black the line around each bead is
     outline_edge_fraction=0.90,  # how far out it starts (0.94 = hairline)
-)
+).on_light()
 
 PLAYGROUND = Playground(
     name="MesoMem membrane sheet (3D)",

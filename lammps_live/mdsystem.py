@@ -416,6 +416,39 @@ class MDSystem3D(MDSystem):
         (bonds would be invisible clutter, and would not tile across a periodic
         seam anyway)."""
 
+    def get_bead_tints(self):
+        """Optional (3D): the playground's own per-bead colour, or None.
+
+        (N, 4) aligned with get_positions_3d: display-space r, g, b in 0..255,
+        and a MIX in 0..1 saying how much of it to paint over the director
+        banding -- 0 leaves a bead banded, 1 makes it flat. That is what lets one
+        scene hold two species that should not look alike: the polymer inside a
+        vesicle is not a membrane bead and should not be painted like one, while
+        the membrane keeps the banding that is the whole point of it.
+
+        STATIC, and deliberately so. It is a fact about the composition, fixed
+        when the system is built, which is what keeps it off the wire on a remote
+        playground (the client builds the same scenario and knows it) and out of
+        the per-frame gather. The colourings that MEASURE something -- the energy
+        ramp, the cluster labelling -- are the ones that change every frame, and
+        they are separate readouts for that reason.
+        """
+        return None
+
+    def get_glyph_spheres(self):
+        """Extra spheres to draw that are not particles, or None.
+
+        (centers (K,3), radii (K,), directors (K,3), owners (K,)). They exist for
+        a particle whose SHAPE is not the sphere LAMMPS integrates it as: a rigid
+        rod is one particle with a length, and its body is drawn as a line of
+        overlapping impostors with the particle itself inside them. They carry no
+        state and take part in no physics; `owners` indexes the particle each
+        sphere belongs to, which is all the renderer needs to paint it the same
+        colour. Nothing else in the frame -- energies, brightness, the puller
+        mask -- has to know they exist.
+        """
+        return None
+
     @abstractmethod
     def get_camera_params(self):
         """dict(eye=, target=, up=, fov_deg=) for the scene's perspective

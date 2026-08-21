@@ -32,10 +32,17 @@ from ..playground.plugin import PluginSpec
 
 _FF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mesomem_ff")
 
+# One library, two pair styles: the membrane's own, and the rigid-rod/point LJ
+# the wrapping-rod playground pairs it with under `pair_style hybrid`. A hybrid
+# style needs every sub-style present in the same LAMMPS instance, and there is
+# nothing to gain from compiling the membrane twice, so both live here and the
+# playgrounds that want only the membrane simply never name the second.
 MESOMEM_PLUGIN = PluginSpec(
     directory=_FF_DIR,
-    sources=("mesomemplugin.cpp", "pair_membrane_sillano_v2.cpp"),
-    headers=("pair_membrane_sillano_v2.h", "lammpsplugin.h", "version.h"),
+    sources=("mesomemplugin.cpp", "pair_membrane_sillano_v2.cpp",
+             "pair_rod_lj.cpp"),
+    headers=("pair_membrane_sillano_v2.h", "pair_rod_lj.h", "lammpsplugin.h",
+             "version.h"),
     lib_stem="mesomem",
 )
 

@@ -9,6 +9,7 @@ handmade configuration and compare it against what LAMMPS computed.
 """
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
@@ -119,6 +120,14 @@ class PairData:
     b: np.ndarray      # (M,) second index
     d: np.ndarray      # (M, 3) minimum-image r_a - r_b
     r: np.ndarray      # (M,) |d|
+    # What fraction of the system's particles this list was built over. 1.0 for a
+    # list over everything; below that the analysis subsampled to stay inside its
+    # frame budget (see Analysis.MAX_PAIR_BEADS), and every extensive quantity
+    # read off these pairs is short by a known factor: a pair sum by dilution^2,
+    # since a pair survives only if BOTH its particles were drawn, and a
+    # per-particle mean by dilution. Carried here rather than passed alongside so
+    # that a consumer cannot be handed a diluted list without being told.
+    dilution: float = 1.0
 
     def __len__(self):
         return len(self.r)
@@ -199,6 +208,25 @@ def normalize_rows(v, eps=1e-9):
     return v / n
 
 
+def segment_distance(offsets, axis, length):
+    """Distance from each offset vector to a line SEGMENT through the origin.
+
+    The segment runs `length` along the unit `axis`, centred at the origin, so
+    `offsets` are positions measured from the segment's centre (minimum-imaged by
+    the caller if the cell is periodic). This is the geometry the rod pair style
+    is built on -- the closest point on the axis is at s = clamp(offset.axis,
+    +-L/2) -- and it is shared so the Python energy expression and the
+    observables cannot drift from each other, or from the C++.
+
+    `axis` is one (3,) vector or one per offset.
+    """
+    offsets = np.asarray(offsets, dtype=float)
+    axis = np.atleast_2d(np.asarray(axis, dtype=float))
+    along = np.einsum("ij,ij->i", offsets, np.broadcast_to(axis, offsets.shape))
+    s = np.clip(along, -0.5 * length, 0.5 * length)
+    return np.linalg.norm(offsets - s[:, None] * axis, axis=1)
+
+
 def principal_normal(points):
     """Unit normal of the best-fit plane through `points` (the smallest
     principal axis of the centred second-moment matrix), sign-fixed to point
@@ -260,3 +288,143 @@ def hex_ring_2d(n_rings, a):
         ring.sort(key=lambda p: math.atan2(p[1], p[0]) % (2.0 * math.pi))
         pts.extend(ring)
     return np.array(pts, dtype=float)
+
+
+# --- closed surfaces and closed chains ----------------------------------------
+# The two geometries a vesicle-with-polymer scenario is made of. Both are here
+# rather than in scenario.py for the same reason as the lattices above: they are
+# pure geometry, and the tests that pin them (tests/test_vesicle_polymer.py) want
+# nothing to do with LAMMPS.
+
+# Twelve vertices of a regular icosahedron on the unit sphere, and its twenty
+# faces. Written out rather than derived: it is a fixed object, and the winding of
+# the faces (counter-clockwise seen from outside) is what makes every face normal
+# below point OUT, which is the whole reason the vesicle's directors come out
+# right without a per-face sign check.
+_PHI = (1.0 + math.sqrt(5.0)) / 2.0
+_ICO_VERTS = np.array([
+    (-1, _PHI, 0), (1, _PHI, 0), (-1, -_PHI, 0), (1, -_PHI, 0),
+    (0, -1, _PHI), (0, 1, _PHI), (0, -1, -_PHI), (0, 1, -_PHI),
+    (_PHI, 0, -1), (_PHI, 0, 1), (-_PHI, 0, -1), (-_PHI, 0, 1),
+], dtype=float)
+_ICO_VERTS /= np.linalg.norm(_ICO_VERTS, axis=1, keepdims=True)
+_ICO_FACES = np.array([
+    (0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11),
+    (1, 5, 9), (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8),
+    (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9),
+    (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1),
+], dtype=int)
+
+
+def icosphere_faces(nu):
+    """Face centres and outward normals of a geodesic sphere, on the unit sphere.
+
+    Returns (centres (20 nu^2, 3), normals (20 nu^2, 3)). Each of the
+    icosahedron's twenty faces is split into nu^2 sub-triangles by subdividing
+    its edges and projecting the result onto the sphere; the centres are where
+    the beads go and the normals -- radial, since the surface is a sphere -- are
+    their directors.
+
+    A geodesic sphere rather than any of the easier constructions (a lat/long
+    grid, a Fibonacci spiral) because what the membrane needs is a nearly
+    UNIFORM triangulation: a lat/long grid crowds its poles by an unbounded
+    factor, and a bilayer force field reads that as two very compressed patches
+    that immediately buckle. Here the worst-case spacing varies by about 20% over
+    the whole sphere, which the membrane simply relaxes out.
+    """
+    nu = max(1, int(nu))
+    centres = []
+    for face in _ICO_FACES:
+        a, b, c = _ICO_VERTS[face]
+        # Barycentric grid over the face, projected out to the sphere. p[i, j]
+        # exists for i + j <= nu.
+        i, j = np.meshgrid(np.arange(nu + 1), np.arange(nu + 1), indexing="ij")
+        w = (nu - i - j) / nu
+        grid = (w[..., None] * a + (i / nu)[..., None] * b
+                + (j / nu)[..., None] * c)
+        grid /= np.maximum(np.linalg.norm(grid, axis=-1, keepdims=True), 1e-12)
+        # The nu^2 sub-triangles: nu(nu+1)/2 pointing the same way as the parent
+        # face, nu(nu-1)/2 pointing the other way.
+        up = [(i0, j0) for i0 in range(nu) for j0 in range(nu - i0)]
+        down = [(i0, j0) for i0 in range(nu) for j0 in range(nu - i0 - 1)]
+        for (i0, j0) in up:
+            centres.append((grid[i0, j0] + grid[i0 + 1, j0] + grid[i0, j0 + 1]) / 3.0)
+        for (i0, j0) in down:
+            centres.append((grid[i0 + 1, j0] + grid[i0, j0 + 1]
+                            + grid[i0 + 1, j0 + 1]) / 3.0)
+    centres = np.array(centres, dtype=float)
+    normals = centres / np.linalg.norm(centres, axis=1, keepdims=True)
+    return centres, normals
+
+
+@lru_cache(maxsize=32)
+def icosphere_spacing(nu):
+    """Mean nearest-neighbour distance between the faces of `icosphere_faces(nu)`
+    on the UNIT sphere -- what a chosen bead spacing has to be divided by to get
+    the vesicle's radius.
+
+    MEASURED, not approximated. The flat-triangle estimate (1/(nu sqrt(3)), times
+    the icosahedron's edge) is several per cent out, because projecting the
+    subdivision onto the sphere stretches the sub-triangles unevenly -- and this
+    number scales the radius of every vesicle built from it, so a few per cent
+    here is a membrane that starts a few per cent off its relaxed packing.
+
+    The spread it is a mean OF is not small: the faces nearest one of the
+    icosahedron's own twelve vertices are packed about 1.5x more tightly than the
+    ones at a parent face's centre, which is the price of this construction and is
+    still far better than the unbounded crowding a lat/long grid puts at its
+    poles. The membrane is a fluid and relaxes it out within a few hundred steps.
+
+    Cached, because `VesiclePolymer.radius` is asked for it on every camera fit and
+    every ring-count query, and at the shipped size this is a tree over 18,000
+    points.
+    """
+    nu = max(1, int(nu))
+    from scipy.spatial import cKDTree
+    centres, _ = icosphere_faces(nu)
+    if len(centres) < 2:
+        return 1.0
+    d, _ = cKDTree(centres).query(centres, k=2)
+    return float(d[:, 1].mean())
+
+
+def lattice_ring(nx, ny, nz):
+    """A closed self-avoiding walk visiting every site of an nx x ny x nz cubic
+    lattice exactly once, as (N, 3) integer coordinates in walk order.
+
+    A Hamiltonian CYCLE, so the chain it describes is a ring: consecutive sites
+    (and the last with the first) are one lattice step apart, and no two sites
+    coincide. That is exactly the guarantee a polymer's initial configuration
+    needs and the one a random walk cannot give -- every bond is at the bond
+    length, and no two beads are closer than one, so the chain can be handed
+    straight to a FENE bond and a repulsive core with nothing to push apart
+    first.
+
+    `ny` and `nx * ny` must be even; the construction needs the return corridor
+    to come out on the right side (see below), and the standard fix is to make
+    the grid even. Raises rather than returning something subtly not closed.
+    """
+    nx, ny, nz = int(nx), int(ny), int(nz)
+    if min(nx, ny, nz) < 2:
+        raise ValueError(f"a ring needs at least 2 sites per axis, got {nx}x{ny}x{nz}")
+    if ny % 2:
+        raise ValueError(f"lattice_ring needs an even ny (got {ny}): with an odd "
+                         f"one the snake ends on the wrong side of the grid and "
+                         f"the walk cannot close")
+    # 1. A Hamiltonian cycle on the nx x ny FLOOR. Row 0 is the outward leg;
+    #    rows 1.. are snaked over columns 1.., and column 0 is the return
+    #    corridor that brings the walk back to the start.
+    floor = [(x, 0) for x in range(nx)]
+    for y in range(1, ny):
+        cols = range(nx - 1, 0, -1) if y % 2 else range(1, nx)
+        floor += [(x, y) for x in cols]
+    floor += [(0, y) for y in range(ny - 1, 0, -1)]
+    # 2. Extrude it: walk the floor cycle, running up and down the z column over
+    #    each cell in turn. The cycle closes because the floor cycle has an even
+    #    number of cells, so the last column is descended and ends at z = 0
+    #    next to where the walk began.
+    out = []
+    for k, (x, y) in enumerate(floor):
+        zs = range(nz) if k % 2 == 0 else range(nz - 1, -1, -1)
+        out += [(x, y, z) for z in zs]
+    return np.array(out, dtype=int)

@@ -160,6 +160,14 @@ class Playground:
     # interest IS a slow collective change (assembly, a healing membrane);
     # pointless on a handful of beads whose individual motion is the subject.
     trajectory_smoothing: bool = False
+    # Bar half-range for the CONTROLLED particle's energy panel. None -> twice the
+    # force field's per-particle scale, which is right when the controlled
+    # particle is a typical one: it shares each pair with one neighbour, so its
+    # own share of the energy is of a bead's order. Set it where the controlled
+    # particle is NOT typical -- the rod, which is one particle in contact with a
+    # hundred beads at once and whose adhesion energy is two orders above any
+    # bead's. Without it that panel is simply pinned at full deflection.
+    pulled_energy_scale: float = None
     # Cadence of the energy-panel evaluation, in analysis frames (default 4, see
     # observables.Analysis). The one dial that matters on a big system: the panels
     # are a pass over every pair, measured at 2.5 us/bead, so a playground running
