@@ -49,7 +49,7 @@ import numpy as np
 from ..render_style import DEFAULT_STYLE
 from .theme import (
     BEAD_BAND_HALFWIDTH, BEAD_BAND_SOFT, BEAD_EQUATOR_COLOR, BEAD_POLE_COLOR,
-    BEAD_WHITE_POLE_COLOR, BEAD_WHITE_POLE_MIN, BEAD_WHITE_POLE_SOFT, BG,
+    BEAD_WHITE_POLE_COLOR, BEAD_WHITE_POLE_MIN, BEAD_WHITE_POLE_SOFT,
     INFERNO,
 )
 
@@ -112,6 +112,7 @@ in float in_radius;     // per-instance world radius
 in vec3 in_dir;         // per-instance unit director (world)
 in float in_bright;     // per-instance albedo brightness multiplier (1 = normal)
 in float in_energy;     // per-instance potential energy, for the energy colouring
+in vec4 in_tint;        // per-instance flat albedo (rgb) + how much of it to use (a)
 in float in_fade;       // per-instance 1 = full strength, 0 = fully faded to the background
 out vec3 v_centerView;
 out float v_radius;
@@ -119,6 +120,7 @@ out vec3 v_dirView;
 out vec3 v_rayView;
 out float v_bright;
 out float v_energy;
+out vec4 v_tint;
 out float v_fade;
 void main() {
     vec4 cv = view * vec4(in_center, 1.0);
@@ -129,6 +131,7 @@ void main() {
     v_dirView = mat3(view) * in_dir;
     v_bright = in_bright;
     v_energy = in_energy;
+    v_tint = in_tint;
     v_fade = in_fade;
 
     // ---- THE EXACT SILHOUETTE BILLBOARD ---------------------------------
@@ -173,7 +176,7 @@ uniform float white_min;
 uniform float white_soft;
 uniform vec2 boxHalf;     // periodic-box half-extents in world x,y (centered at origin)
 uniform float clipEnable; // 1 for periodic scenes (clip beads to the box), 0 otherwise
-uniform float energyMode; // 0 = director bands, 1 = per-bead energy colormap
+uniform float colorMode;  // 0 = director bands, 1 = energy colormap, 2 = per-bead tint
 uniform vec2 energyRange; // (lo, hi) of the colormap, in the model's energy units
 uniform vec3 ramp[32];    // the colormap, sampled (see theme.INFERNO)
 in vec3 v_centerView;
@@ -182,6 +185,7 @@ in vec3 v_dirView;
 in vec3 v_rayView;
 in float v_bright;
 in float v_energy;
+in vec4 v_tint;
 in float v_fade;
 layout(location=0) out vec4 o_albedo;
 layout(location=1) out vec3 o_normal;
@@ -216,7 +220,12 @@ void main() {
     // arrive already converted to linear light (see to_linear).
     float s = dot(N, normalize(v_dirView));   // signed cos-latitude (+ = +n pole)
     vec3 albedo;
-    if (energyMode > 0.5) {
+    if (colorMode > 1.5) {
+        // A colour the CPU picked for this bead and nothing more -- which cluster
+        // it belongs to, crossfaded (see renderer._cluster_tints). Flat for the
+        // same reason the energy is: it is a fact about the whole bead.
+        albedo = v_tint.rgb;
+    } else if (colorMode > 0.5) {
         // One flat colour per bead, from its own potential energy. Flat on
         // purpose: the number belongs to the WHOLE bead, so shading it like a
         // band would invite reading a gradient across a sphere that has none.
@@ -229,10 +238,17 @@ void main() {
         float cosl = abs(s);
         float tt = clamp((cosl - (band_half - band_soft)) / (2.0 * band_soft), 0.0, 1.0);
         albedo = mix(equator_col, pole_col, tt);
+        // ...and over that, whatever colour the playground gave THIS bead, by
+        // its own per-bead weight (see renderer._static_tints). Only here, in the
+        // banding: this is a statement about what a bead IS -- a polymer bead in
+        // a membrane -- and the other two colourings are deliberate whole-scene
+        // measurements that must show every bead on the one scale.
+        albedo = mix(albedo, v_tint.rgb, v_tint.a);
     }
     // Over-paint the +n pole white (down to ~80% latitude) so director sense
-    // reads. Kept in BOTH colourings: the energy tells you how bound a bead is,
-    // and without this cap it would cost you which way it points.
+    // reads. Kept in ALL THREE colourings: the energy tells you how bound a bead
+    // is and the cluster colour tells you what it is part of, and without this cap
+    // either would cost you which way it points.
     float w = smoothstep(white_min - white_soft, white_min + white_soft, s);
     albedo = mix(albedo, white_col, w);
     // The alpha channel is spare, and this is what it is for: a per-bead
@@ -420,6 +436,7 @@ uniform float specGain;
 uniform vec3 fresnelColor;
 uniform float fresnelGain;
 uniform vec3 bgColor;        // linear-light background
+uniform float bgGradient;    // signed brightness ramp toward the bottom of the frame
 uniform float aoStrength;
 uniform float curvAO;
 uniform float outlineOn;
@@ -456,7 +473,10 @@ void main() {
     // this framebuffer's own depth attachment, and sampling it here would be a
     // framebuffer feedback loop (undefined in GL; on a tile-based GPU like
     // Apple Silicon it surfaced as intermittent black tiles).
-    vec3 sky = bgColor * (1.0 + 0.35 * (1.0 - uv.y));
+    // The ramp is signed: it LIFTS the bottom of a dark void into a soft glow,
+    // and SINKS the bottom of a light one, where lifting it would only push the
+    // background through the top of the tonemap into a flat white band.
+    vec3 sky = bgColor * (1.0 + bgGradient * (1.0 - uv.y));
     vec3 P = texture(posTex, uv).xyz;
     vec3 col = sky;
 
@@ -754,7 +774,7 @@ class GLScene:
         # The energy colormap never changes; only which mode is active and what
         # range it spans do (per frame, in render()).
         self.geom_prog["ramp"].write(np.array(INFERNO, dtype="f4").tobytes())
-        self.geom_prog["energyMode"].value = 0.0
+        self.geom_prog["colorMode"].value = 0.0
         self.geom_prog["energyRange"].value = (-6.0, 0.0)
 
         # Texture unit assignments (fixed for the life of the programs).
@@ -897,7 +917,8 @@ class GLScene:
         p["specGain"].value = style.spec_gain
         p["fresnelColor"].value = tuple(style.fresnel_color)
         p["fresnelGain"].value = style.fresnel_gain
-        p["bgColor"].value = to_linear(BG, gamma)
+        p["bgColor"].value = to_linear(style.background, gamma)
+        p["bgGradient"].value = style.background_gradient
         p["aoStrength"].value = style.ao_strength
         p["curvAO"].value = 1.0 if style.curvature_ao else 0.0
         p["outlineOn"].value = 1.0 if style.outline else 0.0
@@ -927,33 +948,43 @@ class GLScene:
 
     # ---- per-frame instance / line uploads ----------------------------------
 
-    def _upload_instances(self, centers, radii, directors, brights, energies, fades):
-        """Upload all beads (opaque) into the geometry VAO. Layout is 10 floats
+    def _upload_instances(self, centers, radii, directors, brights, energies,
+                          tints, fades):
+        """Upload all beads (opaque) into the geometry VAO. Layout is 14 floats
         per instance: center(3), radius(1), director(3), brightness(1),
-        energy(1), fade(1)."""
+        energy(1), tint(4), fade(1).
+
+        The energy and the tint are the two colourings that are not derived from
+        the bead's own geometry, and only one of them is live at a time (see
+        `colorMode`), so four of those thirteen floats are always dead. Kept as
+        separate channels anyway: the energy is a NUMBER the shader ramps, which
+        is what lets the ramp be retuned without touching the CPU, while the tint
+        is already a colour, because what it encodes -- which cluster, crossfaded
+        -- is not a number the shader could map."""
         n = len(centers)
         if n == 0:
             return 0
-        data = np.empty((n, 10), dtype="f4")
+        data = np.empty((n, 14), dtype="f4")
         data[:, 0:3] = centers
         data[:, 3] = radii
         data[:, 4:7] = directors
         data[:, 7] = brights
         data[:, 8] = energies
-        data[:, 9] = fades
+        data[:, 9:13] = tints
+        data[:, 13] = fades
         raw = data.tobytes()
         if n > self._inst_capacity:
             if self._inst_vbo is not None:
                 self._inst_vbo.release()
             if self._geom_vao is not None:
                 self._geom_vao.release()
-            self._inst_vbo = self.ctx.buffer(reserve=max(1, n) * 10 * 4, dynamic=True)
+            self._inst_vbo = self.ctx.buffer(reserve=max(1, n) * 14 * 4, dynamic=True)
             self._inst_capacity = n
             self._geom_vao = self.ctx.vertex_array(
                 self.geom_prog,
                 [(self._quad_vbo, "2f", "in_corner"),
-                 (self._inst_vbo, "3f 1f 3f 1f 1f 1f /i", "in_center", "in_radius",
-                  "in_dir", "in_bright", "in_energy", "in_fade")],
+                 (self._inst_vbo, "3f 1f 3f 1f 1f 4f 1f /i", "in_center", "in_radius",
+                  "in_dir", "in_bright", "in_energy", "in_tint", "in_fade")],
             )
         self._inst_vbo.write(raw)
         return n
@@ -987,8 +1018,8 @@ class GLScene:
                line_verts=None, line_colors=None, brights=None,
                box_half=None, edge_fade=0.0, style=DEFAULT_STYLE,
                bead_radius=None, focal_px=None, light_dir_world=None,
-               energies=None, fades=None, overlay_verts=None,
-               overlay_cols=None):
+               energies=None, tints=None, fades=None, overlay_verts=None,
+               overlay_cols=None, color_mode=None):
         """Render the beads (+ optional depth-occluded lines) into self.final_fbo.
 
         view/proj are row-major 4x4 numpy matrices (see view_matrix/proj_matrix).
@@ -1006,10 +1037,15 @@ class GLScene:
         `edge_fade` (0..1) softens the resulting seam at the frame edge.
         `light_dir_world` overrides the style's sun direction (world space).
         `energies` (per bead), when given, switches the beads from the director
-        banding to the energy colormap over `style.energy_range`. `fades` (per
-        bead, 1 = full strength) blends a bead toward the background, which is
-        how periodic image copies are made to trail off. `overlay_verts/cols` are
-        lines drawn over everything, depth test off.
+        banding to the energy colormap over `style.energy_range`; `tints` (per
+        bead, linear-light rgb plus a mix weight) is the flat colour the cluster
+        colouring paints with, and, at a per-bead weight under the banding, the
+        colour a playground gives its own species. Which of the three is showing
+        is `color_mode` (0 bands, 1 energy, 2 tint); None derives it from which
+        arrays arrived, which is the older behaviour and is what a caller that
+        only ever paints clusters wants. `fades` (per bead, 1 = full strength) blends a bead toward the
+        background, which is how periodic image copies are made to trail off.
+        `overlay_verts/cols` are lines drawn over everything, depth test off.
         """
         c = self.ctx
         vb, pb = _gl(view), _gl(proj)
@@ -1018,10 +1054,14 @@ class GLScene:
         radii = np.asarray(radii, "f4")
         directors = np.asarray(directors, "f4")
         brights = np.ones(n, "f4") if brights is None else np.asarray(brights, "f4")
-        # Energy colouring is on exactly when the caller supplies energies.
-        self.geom_prog["energyMode"].value = 0.0 if energies is None else 1.0
+        # The colouring is whichever channel the caller supplied: the director
+        # banding needs neither, and is what is left when neither arrives.
+        self.geom_prog["colorMode"].value = float(
+            color_mode if color_mode is not None
+            else (2 if tints is not None else (0 if energies is None else 1)))
         self.geom_prog["energyRange"].value = tuple(style.energy_range)
         energies = np.zeros(n, "f4") if energies is None else np.asarray(energies, "f4")
+        tints = np.zeros((n, 4), "f4") if tints is None else np.asarray(tints, "f4")
         fades = np.ones(n, "f4") if fades is None else np.asarray(fades, "f4")
         if bead_radius is None:
             bead_radius = float(np.median(radii)) if n else 1.0
@@ -1046,7 +1086,7 @@ class GLScene:
                           edge_fade, focal_px)
 
         n_op = self._upload_instances(centers, radii, directors, brights,
-                                      energies, fades)
+                                      energies, tints, fades)
 
         # --- geometry pass -> G-buffer (all beads, opaque) ---
         self.geom_prog["view"].write(vb)

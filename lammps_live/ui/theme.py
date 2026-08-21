@@ -110,21 +110,28 @@ TORQUE_ARC_WIDTH = 3
 TORQUE_ARC_HEAD_LEN = 9
 
 # --- 3D scene (MesoMem membrane patch and future 3D systems) ---------------
-# Depth cueing ("haze"): distant beads are blended toward this color so the
-# scene recedes into the background instead of reading as a flat cluster. Kept
-# equal to BG so far atoms melt into the void; STRENGTH caps how much of the
-# original color is washed out at the far plane (1.0 = fully background).
-# The fog is now anchored to the scene's own depth extent: nothing hazes until
-# DEPTH_FADE_START of the farthest bead's distance, then it ramps LINEARLY to a
-# full wash-out at the farthest bead -- a strong, distance-proportional cue.
-HAZE_COLOR = BG
+# The 3D scene's own palette -- what it is drawn ON (and so what its fog fades
+# INTO), plus the box outline, the control net and the bond spokes -- is NOT
+# here: it lives on each system's RenderStyle (lammps_live/render_style.py),
+# because a scene can be drawn dark or light (`STYLE.on_light()`) and all of
+# those have to move together. What is left below is what every 3D scene shares
+# whichever background it is on: the bead colouring and the shading constants.
+#
+# Depth cueing ("haze"): distant beads are blended toward the scene's own
+# background so the scene recedes into it instead of reading as a flat cluster.
+# STRENGTH caps how much of the original color is washed out at the far plane
+# (1.0 = fully background). These two are the CPU fallback's ramp only -- the GL
+# path takes its cue range and strength from the RenderStyle (`cue_*`), which is
+# per system and anchored to the scene's own depth extent. Here it is anchored
+# to the farthest bead: nothing hazes until DEPTH_FADE_START of that distance,
+# then it ramps LINEARLY to a full wash-out at it.
 HAZE_STRENGTH = 1.0
 DEPTH_FADE_START = 0.5   # fraction of the max bead distance at which haze begins
 # Screen-space edge vignette applied to the beads of periodic scenes (the
 # membrane sheet): beads fade toward the background over the outer frame margin,
 # uniformly in screen space, softening the frame edge and the periodic clip seam
-# without darkening the white box outline. 0 disables it; 1 fully fades the very
-# edge to BG. See gl3d._COMPOSITE_FS.
+# without touching the box outline (drawn after the composite). 0 disables it;
+# 1 fully fades the very edge to the scene background. See gl3d._COMPOSITE_FS.
 EDGE_VIGNETTE_STRENGTH = 0.65
 # Light direction for the shaded-sphere sprite (points FROM the light, in
 # screen space: up-left and toward the viewer). Sphere shading is baked once
@@ -138,9 +145,9 @@ DIRECTOR_LEN_R = 1.55               # spike length as a multiple of bead radius
 DIRECTOR_BASE_R = 0.42              # spike base half-width as a multiple of bead radius
 # The control "net": the plane (perpendicular to the membrane, facing the
 # screen) that the joystick slides the active bead along, drawn as a faint grid.
-NET_COLOR = (120, 150, 210)
+# Its colour and line alpha are RenderStyle.net_color / net_alpha; this is the
+# fill alpha of the plane itself.
 NET_ALPHA = 60
-NET_LINE_ALPHA = 100
 # The net is redrawn, a little brighter, clipped to the active bead's disc, so
 # the control plane visibly cuts THROUGH that bead (a plane through a solid
 # sphere's centre is otherwise hidden by its near hemisphere) -- makes clear the
@@ -155,13 +162,11 @@ POTENTIAL_COLORS = ((120, 205, 225), (250, 180, 95), (200, 140, 240))  # isotrop
 POTENTIAL_TOTAL_COLOR = (225, 228, 236)
 POTENTIAL_PANEL_BG = (10, 12, 18, 185)
 POTENTIAL_TRACK_COLOR = (58, 62, 76)
-# Membrane bead fill and the bright stick backbone linking neighbors in 3D.
+# Membrane bead fill. (The stick backbone linking neighbours in 3D, and the
+# simulation-box outline drawn around the scene, are RenderStyle.bond_color and
+# .box_color/.box_alpha -- both are faded by depth cueing toward the scene's
+# background, so they belong with it.)
 MEMBRANE_BEAD_COLOR = (232, 104, 98)
-BOND_3D_COLOR = (150, 96, 92)
-# The simulation-box outline drawn around the 3D scenes: white, faded by depth
-# cueing like everything else so far edges recede into the background.
-BOX_3D_COLOR = (240, 240, 245)
-BOX_3D_ALPHA = 150   # out of 255; the box is a subtle frame, not a hard cage
 # The corner of the box nearest the eye hangs in front of everything and streaks
 # across the scene, so it is faded out. FADE_DEPTH is how much of the box's own
 # depth span the fade covers, measured back from its nearest corner: 0 disables
@@ -214,6 +219,70 @@ INFERNO = (
     (0.9846, 0.6011, 0.0236), (0.9879, 0.6603, 0.0517), (0.9856, 0.7208, 0.1122), (0.9775, 0.7823, 0.1859),
     (0.9625, 0.8515, 0.2855), (0.9487, 0.9105, 0.3953), (0.9517, 0.9606, 0.5242), (0.9884, 0.9984, 0.6449),
 )
+
+# --- the third bead colouring: which aggregate ---------------------------------
+# Neither of the two above says what a bead is PART OF. The director banding is a
+# property of one bead and the energy ramp is a property of one bead; a membrane
+# and the gas around it are painted from the same two pictures. This one paints
+# each connected aggregate in its own colour, so the coarsening on the assembly
+# box reads directly: the number of colours falls, the patches grow, and a merge
+# is two colours becoming one. See playground/clustering.py for how a cluster is
+# found and, harder, how it keeps its colour from frame to frame.
+#
+# WHY THESE TEN. The requirement is categorical -- ten labels that are only ever
+# compared, never ordered -- so it is the opposite problem from INFERNO above,
+# where the whole point is that the colours line up on a scale. What a categorical
+# set has to do is be equally strong: no member may look more important, closer or
+# more "selected" than another, because a cluster is not more of an aggregate for
+# being painted red.
+#
+# So they are ten hues spaced evenly (36 degrees apart) around the OkLCh wheel at
+# one lightness and one chroma, which is the closest thing to a guarantee of that
+# -- OkLCh being the space in which equal steps look equal. Two hand corrections
+# on top, both the usual ones: the yellow-green arc is raised in lightness and the
+# blue-violet arc lowered, because a yellow at the blues' lightness looks dirty
+# and a blue at the yellows' looks chalky; and each hue's chroma is pulled back to
+# 93% of what sRGB can actually hold there, so the saturated ones (magenta, green)
+# are not silently clipped into a different hue than the ones next to them.
+#
+# The band they all sit in -- L 0.62 to 0.78 -- is chosen for what happens AFTER:
+# these are albedos of lit spheres, multiplied by sun and sky and pushed through
+# half an ACES curve. Darker and the ambient occlusion between packed beads takes
+# them to mud; lighter and the specular highlight blows the hue out of them. It is
+# also the band that survives the light-mode flip (render_style.LIGHT_MODE), where
+# the background rises to near-white and a pale palette would have nothing to be
+# darker than.
+#
+# STORED IN THE ORDER THEY ARE HANDED OUT, which is not hue order: every third hue
+# (a stride of 3 over 10 is a cycle through all of them), so the first four
+# clusters on screen are coral, green, blue, pink rather than four neighbouring
+# reds. Adjacent hues are the pair most easily confused, and a scene with two
+# clusters should never be showing them.
+CLUSTER_COLORS = (
+    (240, 115, 108),   # coral
+    (132, 192,  83),   # green
+    ( 36, 157, 227),   # blue
+    (226, 113, 172),   # pink
+    (209, 181,  42),   # gold
+    ( 41, 177, 191),   # cyan
+    (178, 113, 211),   # violet
+    (238, 143,  45),   # orange
+    ( 42, 185, 145),   # jade
+    (114, 123, 227),   # indigo
+)
+# Beads in no cluster worth naming -- the monomer gas, and anything under
+# clustering.MIN_CLUSTER_SIZE -- are NOT here: they are RenderStyle's
+# `cluster_gas_color`, because unlike the ten above they have to recede toward
+# whichever background the scene is drawn on. A desaturated slate rather than one
+# more colour, either way: the gas is the ground of this picture, and it has to
+# read as "not one of these" at a glance.
+# Seconds for a bead to cross most of the way to a new colour. The slot changes in
+# one step (it is an integer); this is what makes that step a dissolve instead of
+# a pop, and it is the difference between a merge reading as two aggregates
+# becoming one and reading as a glitch. Long enough to be legible as a transition,
+# short enough that the picture is never lying about the current clustering for
+# more than a moment.
+CLUSTER_FADE_SECONDS = 0.45
 
 # Play / Pause / Reset playback buttons (self-assembly system), drawn along the
 # bottom of the sim view. The button matching the current state (e.g. Play while

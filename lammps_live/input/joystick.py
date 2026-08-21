@@ -104,6 +104,12 @@ class JoystickInput(InputSource):
         self._last_yaw = 0.0
         self._last_buttons = frozenset()
         self._last_hat = (0, 0)
+        # None until the first report arrives. The device only emits on change,
+        # so "no report yet" IS "nothing has been touched since startup" -- which
+        # is the state the view slicing needs to distinguish (see view_slice.py):
+        # the lever is absolute, and wherever it was left, an untouched one must
+        # not cut the scene open.
+        self._last_throttle = None
         self._twist_center = None  # captured from the first reading (see _process_twist)
         # Last force-feedback conditions actually written to the device, so a
         # redundant re-write is skipped. Each set_condition is a blocking HID
@@ -163,6 +169,10 @@ class JoystickInput(InputSource):
             return
         xy = (state.x, -state.y)             # device convention -> sim (+y up)
         yaw = self._process_twist(state.twist)
+        # Passed through as the driver reports it (0 = idle, 1 = full forward):
+        # unlike the stick axes there is no centre to find and no deadzone to
+        # apply, because it is a position control that stays where it is put.
+        throttle = float(state.throttle)
         buttons = frozenset(int(b) for b in state.pressed)
         # The hat arrives already decoded to (dx, dy) with dy = +1 forward (the
         # driver's own convention, which is pygame's); no remapping to do.
@@ -172,6 +182,7 @@ class JoystickInput(InputSource):
             self._last_yaw = yaw
             self._last_buttons = buttons
             self._last_hat = hat
+            self._last_throttle = throttle
 
     def _io_loop(self):
         """Daemon loop: sample the stick, then flush the latest requested force-
@@ -212,6 +223,15 @@ class JoystickInput(InputSource):
         with self._lock:
             return self._last_yaw
 
+    def poll_throttle(self):
+        # Held state, like the buttons and the hat: the last reported position,
+        # which stays correct until the lever is moved again. None until the
+        # device has reported anything at all.
+        if self._worker is None:
+            self._read_once(timeout_ms=0)
+        with self._lock:
+            return self._last_throttle
+
     def poll_buttons(self):
         # Held state, not an event: the caller edge-detects. The device only
         # emits on change, so this is the last reported set and stays correct
@@ -235,7 +255,8 @@ class JoystickInput(InputSource):
         stick around and twist it; x/y should reach +-1 at the stops and 'yaw'
         should swing symmetrically about 0."""
         import time
-        print("Move and twist the stick. x/y: -1..+1, yaw: -1..+1 after deadzone.")
+        print("Move and twist the stick, and slide the thrust lever. "
+              "x/y: -1..+1, yaw: -1..+1 after deadzone, thrust: 0..1.")
         print("(None means no report yet -- the device only reports on change; nudge the stick.)\n")
         for _ in range(n):
             state = self.ff.read_input()
@@ -245,7 +266,8 @@ class JoystickInput(InputSource):
                 yaw = self._process_twist(state.twist)
                 buttons = ",".join(str(b) for b in state.pressed) or "-"
                 print(f"x={state.x:+.3f}  y={state.y:+.3f}  twist={state.twist:+.3f}  "
-                      f"yaw={yaw:+.2f}  hat={state.hat_name:<13s} buttons={buttons}")
+                      f"yaw={yaw:+.2f}  thrust={state.throttle:.3f}  "
+                      f"hat={state.hat_name:<13s} buttons={buttons}")
             time.sleep(0.05)
 
     def send_force(self, fx, fy, stiffness=None):

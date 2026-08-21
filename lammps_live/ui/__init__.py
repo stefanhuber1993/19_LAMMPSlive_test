@@ -1,6 +1,6 @@
 from .plotting import RollingHistory
-from .renderer import Renderer
+from .renderer import BEAD_COLOR_MODES, Renderer
 from .trail import AtomTrails
 from .widgets import Slider
 
-__all__ = ["Renderer", "Slider", "RollingHistory", "AtomTrails"]
+__all__ = ["BEAD_COLOR_MODES", "Renderer", "Slider", "RollingHistory", "AtomTrails"]

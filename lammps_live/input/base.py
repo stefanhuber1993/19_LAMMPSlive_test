@@ -13,6 +13,16 @@ class InputSource:
         mode). 0 = no rotation. Default: no yaw input."""
         return 0.0
 
+    def poll_throttle(self):
+        """Return the thrust lever's position in [0, 1] (0 = idle/back, 1 = full
+        forward), or None on a device that has no such lever.
+
+        None is not 0: it means "this device cannot answer", which is what keeps
+        the view slicing (see view_slice.py) switched off entirely on the mouse
+        and the keyboard rather than pinned at one end of its travel.
+        """
+        return None
+
     def poll_buttons(self):
         """Return the set of device buttons currently held, as ints. Used for
         edge-triggered actions (grab / release the puller, Play/Pause, Reset,
