@@ -5,7 +5,9 @@ on the laptop at 60 fps, with every slider still live. This is the companion to
 [a100-plan.md](a100-plan.md) (which is the *plan* and its measurements) and
 [snellius/README.md](snellius/README.md) (which is *how to run it*). This file is
 the *why* -- every decision, in order, with the networking spelled out for someone
-who does not spend their time in it.
+who does not spend their time in it. For the code itself -- the framing, the
+codec, the threads, the socket options, line by line -- see
+[remote-networking.md](remote-networking.md).
 
 Built 2026-08-18. **The SSH and Slurm half has never run against the real
 Snellius** -- only against a fake cluster (see [Testing](#8-testing-a-cluster-that-fits-on-one-machine)) --
@@ -52,6 +54,7 @@ the care goes into the frame encoding and none into the control channel.
 | file | what it is |
 |---|---|
 | `lammps_live/playgrounds/mesomem_remote.py` | the demo itself: 10k beads, and where it runs |
+| `lammps_live/playgrounds/mesomem_polymer.py` | the second one on the same target: a vesicle with a ring-polymer melt in it |
 | `lammps_live/remote/protocol.py` | the wire: message framing and the frame codec |
 | `lammps_live/remote/server.py` | the headless half -- runs on the GPU node |
 | `lammps_live/remote/client.py` | `RemoteSystem`: an `MDSystem3D` fed by a socket |
@@ -363,6 +366,29 @@ the panel, so a queue wait looks like a queue wait rather than a hang. The `%T|%
 format is explicitly separated by `|` because the pretty column format is ambiguous
 when a pending job has no node list to print.
 
+**What `--no-shell` does not do is return before the allocation is granted.** On a
+full `gpu_a100` it blocks for however long the queue is, which found the app as
+`remote command timed out after 120s` -- a connect failing for the most ordinary
+reason there is. So `salloc` is started as a process the session *watches* rather
+than a command it waits on:
+
+```
+salloc: Pending job allocation 9182733     ← the id, at submission
+salloc: job 9182733 queued and waiting for resources
+                                           ← polling starts here, not after this
+salloc: Granted job allocation 9182733
+```
+
+Slurm names the job when it is *submitted*, so the id is read off the `Pending`
+line and the `squeue` loop above takes over immediately -- with the state, the
+reason, the minutes so far, and a Cancel that works. The wait is bounded by
+`RemoteTarget.queue_wait`, an hour by default (`--time` bounds the allocation once
+it starts; `queue_wait` bounds getting one at all), and the poll eases from every
+3 s to every 15 s after the first minute, because a busy queue is answered by
+waiting rather than by asking more often. Cancelling kills the `salloc`, which gives
+up the place in the queue -- otherwise the request would be granted later and hold a
+GPU with nobody connected to it.
+
 ### The three ways the allocation is released
 
 An A100 held by a forgotten allocation is the one failure mode with a bill attached,
@@ -373,6 +399,24 @@ so this is deliberately over-engineered:
 | you close the window, or press Disconnect | the app runs `scancel` (`RemotePanel.release`) |
 | the app dies without running anything -- crash, `kill -9`, laptop lid | the *server* runs `scancel $SLURM_JOB_ID` when it exits, and it exits by itself after `--exit-when-idle` (default **15 minutes** with no client) |
 | everything above fails | Slurm's own `--time` (default **1 hour**) |
+
+**The first row is the one that had holes in it**, found after leftover jobs turned
+up in `squeue` long after the app was gone. Four of them, and all four came from the
+same assumption -- that the shutdown path would be reached, in one piece, with the
+SSH connection it started with:
+
+| the hole | what now closes it |
+|---|---|
+| the top-level `finally` was five bare statements, and `scancel` was the fourth. Anything raising before it -- the stepper re-raising the error that ended the run, a joystick whose device had gone -- skipped it | `App._shutdown` guards each step separately and releases FIRST. A second Ctrl-C on a teardown that looks slow (it is running an ssh) no longer aborts it either |
+| a `kill`, a closed terminal or a logout ends the process without unwinding anything, so no `finally` runs at all | SIGTERM/SIGHUP/SIGINT are caught and raised as `SystemExit`, which unwinds through that `finally`. Plus an `atexit` hook. SIGKILL still cannot be caught -- that one is what the middle row above is for |
+| the `scancel` was skipped in silence whenever the SSH control socket had gone: a second teardown (the first removed it), a connect thread that got its job id just after the window closed, a master that died while the allocation lived on | `RemoteSession._release_job` tries the master, then a connection of its own (`BatchMode=yes`, so it fails in seconds rather than stopping the shutdown on a prompt), and asks `squeue` afterwards whether it actually took. A job it cannot confirm is kept, not forgotten, and said so in the log |
+| Disconnect during the probe -- one ssh that can sit for a minute -- ran a whole teardown that correctly found nothing to cancel, and the flow then walked on into `salloc` and asked for a GPU nothing was left to release | `_allocate` checks `_cancel` for itself. It is the one step that does not reach the cluster through `_remote`, which had that check all along |
+
+**Firing a `scancel` is not the same as the job having stopped**, which is why the
+release ends with a `squeue`. `CANCELLED` and `COMPLETING` both appear for a few
+seconds after a successful one and must not be read as failures; anything still
+`PENDING` or `RUNNING` is a real one, and gets said in the log the panel copies
+rather than swallowed.
 
 **Switching playground does NOT release it** (it used to). Going off to show the
 membrane patch and coming back is a normal thing to do mid-talk, and it should not
@@ -483,12 +527,15 @@ quantised, to **10 bytes per bead**:
 
 | field | encoding | bytes |
 |---|---|---|
-| position | 3 × uint16 across the cell | 6 |
-| director | 2 × uint16, octahedral | 4 |
+| position | 3 × 12 bits across the cell, packed in pairs | 4.5 |
+| director | 2 × uint8, octahedral | 2 |
 | per-bead energy | 1 × uint8 over the colour range | 1, and only on request |
 
-At 10k that is **100 kB/frame, 6 MB/s, 48 Mbit/s** -- comfortable on any real link,
-and `--fps 30` halves it.
+At 10k that is **65 kB/frame, 3.9 MB/s, 31 Mbit/s** -- comfortable on any real
+link. The bigger lever is the frame RATE: the default wire is 20 fps, not 60,
+which costs another factor of three and nothing in simulation speed (the server
+takes a proportionally longer stride) or in smoothness (the client fills in
+between frames). See remote-networking.md §8.
 
 ### Quantising positions
 
@@ -542,9 +589,22 @@ version was fragile: how many times `step()` runs per drawn frame is not somethi
 the client gets to assume). Toggle the colouring and the request follows a frame or
 two later; leave it off and the bytes are never sent.
 
+The third colouring -- CLUSTER, which paints each connected aggregate its own
+colour -- asks for nothing at all. It is a fact about geometry the client is
+already holding, so the client runs the labelling itself
+(`lammps_live/playground/clustering.py`) on the positions off the wire. That is
+the right side of the link for it: the far end is the scarce resource, and the
+answer would cost as many bytes to send as it costs to compute. What it does cost
+is *here*, and it is the one readout whose price scales with the bead count this
+playground exists to show off -- ~90 ms at 50k with a thousand aggregates in the
+cell, which is why the labelling is recomputed every 33 frames rather than every
+frame (aggregates coarsen over seconds; there is nothing in a per-frame labelling
+that was not in the last one).
+
 ### What is deliberately not built
 
-The plan's table continues down to 4.3 B/bead using temporal deltas and zlib. Not
+The plan's table continues below the codec's 6.5 B/bead using temporal deltas
+and zlib. Not
 implemented, on purpose: both need a **stateful decoder**, where a frame only
 decodes if the previous one arrived -- and this client *drops frames by design*.
 Every frame here stands alone. At 10k the link is not the bottleneck; when it is,
@@ -1000,9 +1060,9 @@ visible dip to ~31 fps at 7.5 Hz. That is the first thing on the list below.
 | trajectory smoothing | 0.4 ms |
 | client analysis, average | 6.8 ms/frame |
 | client analysis, peak (1 frame in 8) | 31.7 ms |
-| wire | 10 B/bead → 100 kB/frame, 48 Mbit/s at 60 fps |
-| position error | 0.0003σ |
-| director error | 0.0037° worst case |
+| wire (`q12`) | 6.5 B/bead → 65 kB/frame, 31 Mbit/s at 60 fps |
+| position error | 0.005σ (0.2 px windowed, 0.33 fullscreen) |
+| director error | 0.94° worst case; moves `nematic_S` by 8e-5 |
 | sim, A100, 10k, 20 steps | ~0.7 ms/frame (estimated from plan §4; the card is idling) |
 
 ---
@@ -1053,14 +1113,23 @@ arrays from per-point lists in Python.
 
 ### 3. The wire at 100k
 
-10 B/bead × 100k × 60 fps = **60 MB/s, 480 Mbit/s**. Fine on a wired research
-network, hopeless on a hotel connection. In order of payoff:
+6.5 B/bead × 100k × 60 fps = **39 MB/s, 312 Mbit/s** (it was 480 before the codec
+went to 12-bit positions and 8-bit directors -- see remote-networking.md §4).
+Fine on a wired research network, hopeless on a hotel connection. In order of
+payoff:
 
-1. **Send 30 fps and interpolate locally** (halves it, ~1 hour). Smoothed positions
-   are band-limited, so interpolating between them is nearly exact -- the plan
-   measured this. `--fps 30` already halves the bytes; the interpolation is what
-   keeps the motion smooth at 60 fps on screen.
-2. **Temporal delta + zstd** (~4.3 B/bead, so another 2.3×). This is where the
+1. **Send fewer frames** -- DONE, and it is the biggest single lever: the wire
+   defaults to 20 fps, so the numbers above are already 3x lower in practice
+   (13 MB/s, 104 Mbit/s at 100k). Two things had to come with it, and neither is
+   the interpolation this list originally called for. The server derives its
+   stride from the send rate so the demo's pace does not change; and the client
+   synthesises the thermal rattle between frames, because measurement showed
+   interpolation costs a whole wire frame of latency and EXTRAPOLATION IS WORSE
+   THAN FREEZING THE PICTURE (the motion between frames is uncorrelated noise, so
+   a velocity estimate is a random number). remote-networking.md §8 has the
+   measured table.
+2. **Temporal delta + zstd** (~4.3 B/bead against the *old* 10 B baseline, so
+   less headroom than it looks now that the codec is 6.5). This is where the
    stateless-frame decision has to be revisited: deltas need the previous frame, so
    the client would have to ask for a keyframe after a drop. Design it as
    "keyframe every N, delta in between, request a keyframe on loss" -- the same
@@ -1097,7 +1166,7 @@ the remaining costs scale gently:
 | GL render (measured, plan §4) | 2.6 ms | 6.4 ms | 10.3 ms |
 | decode + smoothing | 0.8 ms | ~8 ms | ~16 ms |
 | sim on one A100 (estimated) | 0.7 ms | 7 ms | 14 ms |
-| wire at 60 fps, 10 B/bead | 48 Mbit/s | 480 | 960 |
+| wire at 60 fps, 6.5 B/bead | 31 Mbit/s | 312 | 624 |
 
 So **100k at 60 fps is reachable** with items 1–3 done, and 200k is the point where
 the laptop's own per-frame numpy (decode, smoothing, the CPU-side scene assembly

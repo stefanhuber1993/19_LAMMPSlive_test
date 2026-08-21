@@ -89,6 +89,14 @@ def _truncating(emit, keep):
     truncates the build and leaves every live slider re-issuing the untruncated
     form. Which is a nastier bug than it sounds: it would work at startup and fail
     the first time the user touched k_tilt.
+
+    Under `pair_style hybrid` a coefficient line names its sub-style between the
+    type pair and the numbers -- `pair_coeff 1 1 mesomem 1.0 1.0 ...` -- so the
+    name is skipped rather than counted as one of them. Counting it would drop one
+    value too many from every hybrid line, which is what the vesicle playground
+    (the first hybrid one to run on the cluster) would have hit; and it would
+    truncate the sub-style name itself off a two-value line, which is not a
+    shorter command but a broken one.
     """
     def wrapped(params):
         out = []
@@ -96,10 +104,20 @@ def _truncating(emit, keep):
             if cmd.startswith("pair_coeff"):
                 bits = cmd.split()
                 head, values = bits[:3], bits[3:]     # `pair_coeff I J` + numbers
+                while values and not _is_number(values[0]):
+                    head.append(values.pop(0))        # ... and the sub-style name
                 cmd = " ".join(head + values[:keep])
             out.append(cmd)
         return out
     return wrapped
+
+
+def _is_number(token):
+    try:
+        float(token)
+    except ValueError:
+        return False
+    return True
 
 
 def _per_atom_mass(emit):

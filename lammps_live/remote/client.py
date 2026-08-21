@@ -37,12 +37,15 @@ import numpy as np
 from ..mdsystem import MDSystem3D
 from ..playground import forcefield as ff_registry
 from ..playground.modes import SimMode
+from ..playground.clustering import ClusterTracker, contact_cutoff
 from ..playground.faults import Fault
 from ..playground.observables import Analysis
 from ..playground.rdf import InPlaneRDF, RadialRDF3D
 from ..playground.smoothing import TrajectorySmoother
 from ..playground.state import Box, FrameState
-from ..playground.system import SMOOTHING_KEY, make_spec
+from ..playground import jitter
+from ..playground.jitter import RattleFill
+from ..playground.system import JITTER_KEY, SMOOTHING_KEY, make_spec
 from . import protocol
 
 
@@ -253,10 +256,21 @@ class RemoteSystem(MDSystem3D):
         # what lets the camera frame the scene, and the box outline be drawn, before
         # a single frame has arrived. The server's own box replaces it on connect
         # (authoritative: a scenario that lets a barostat settle would differ).
-        self.box = self.scenario.build(self.scenario_params,
-                                       np.random.default_rng(0)).box
-        self.natoms = int(self.scenario_params["n"]
-                          if self.scenario_params.has("n") else 0)
+        build = self.scenario.build(self.scenario_params, np.random.default_rng(0))
+        self.box = build.box
+        # THE COMPOSITION IS KNOWN HERE, and it has to be, because none of it
+        # travels: the wire carries positions, directors and (on request) energies,
+        # and nothing that is the same on every frame. Which species each bead is
+        # is exactly that -- fixed when the far end built the very same scenario
+        # this line just built -- so it is recovered rather than sent, and the
+        # analysis at this end gets the type-aware answers it would otherwise
+        # silently skip (a two-species force field with no types reports the whole
+        # system as one species; see MesoMemPolymer.energy_terms).
+        self._types = (np.asarray(build.types, dtype=int)
+                       if self.force_field.n_types > 1 else None)
+        self._tints = self.scenario.render_tints(self.scenario_params)
+        self.natoms = len(build.positions) or int(
+            self.scenario_params["n"] if self.scenario_params.has("n") else 0)
         self.all_ids = np.arange(1, self.natoms + 1)
         self.bonds = []
         self.brightness = None
@@ -268,10 +282,37 @@ class RemoteSystem(MDSystem3D):
         self._rdf = self._make_rdf()
         self._smoother = TrajectorySmoother()
         self._smoothing_tau = 0.0
+        # The other half of the drawn-state filtering, and the one that only a
+        # remote system needs: the wire runs slower than the screen, so something
+        # has to move between the frames it delivers. See playground/jitter.py.
+        self._rattle = RattleFill()
+        self._jitter_strength = jitter.DEFAULT_JITTER
         self._render_cache = None
         self._render_frame = -1
+        # `_render_state` is called two or three times per DRAWN frame (positions,
+        # directors, the 2D readout) and must advance the rattle exactly once, so
+        # the cache is keyed on wall time as well as on the received frame. Any
+        # calls closer together than this share a result; the next drawn frame is
+        # a whole 60 Hz period later and gets a fresh one.
+        self._render_wall = 0.0
+        # Wall seconds between the last two received frames. The rattle needs no
+        # such thing -- it runs on wall time directly -- but the smoother's weight
+        # is quoted in SIMULATED time, so converting a drawn frame's share of it
+        # needs to know how long a wire frame lasts here.
+        self._wire_period = 0.0
+        self._frame_wall = 0.0
         self._energy_cache = None
         self._energy_render_frame = -1
+        # The cluster colouring, computed at THIS end from the positions off the
+        # wire. Nothing about it has to travel: it is a fact about the geometry
+        # already in hand, and the far end has enough to do. See clustering.py --
+        # and note it is the one readout whose cost grows with the bead count the
+        # remote playground exists to show off.
+        self._clusters = ClusterTracker(contact_cutoff(self.spec.atom_radius_A))
+        # The labelling itself, computed when a frame lands rather than when the
+        # renderer asks -- see _ingest. None until one has been.
+        self._cluster_slots = None
+        self._clusters_asked_frame = -999
         self._frame = 0
         self._state = None
         self._energies = None
@@ -300,6 +341,7 @@ class RemoteSystem(MDSystem3D):
         # Waiting for the far side to finish rebuilding after a Reset -- see reset()
         # and _ingest, which clears it when a frame from the new run arrives.
         self._resetting = False
+        self._reset_started = 0.0
 
     # ---- the connection -----------------------------------------------------
 
@@ -332,7 +374,15 @@ class RemoteSystem(MDSystem3D):
         self._energies = None
         self._energy_cache = None
         self._energy_render_frame = -1
+        self._clusters.reset()
+        self._cluster_slots = None
         self._smoother.reset()
+        # A fresh connection is a fresh scene: nothing measured off the previous
+        # one's frames (the rattle's amplitude, the wire's period) carries over.
+        self._rattle.reset()
+        self._wire_period = 0.0
+        self._frame_wall = 0.0
+        self._render_wall = 0.0
         self.status = (f"{welcome.get('host', '?')} "
                        f"[{welcome.get('profile', '?')}], "
                        f"{self.natoms:,} beads, job {welcome.get('slurm_job') or '-'}")
@@ -397,6 +447,9 @@ class RemoteSystem(MDSystem3D):
         if key == SMOOTHING_KEY:
             self._smoothing_tau = max(0.0, float(value))
             return
+        if key == JITTER_KEY:
+            self._jitter_strength = max(0.0, float(value))
+            return
         if not self.params.has(key):
             return
         if not self.params.set(key, value):
@@ -452,13 +505,19 @@ class RemoteSystem(MDSystem3D):
     def reset(self):
         """Re-randomize the box on the far side, keeping the current parameters.
 
-        The rebuild happens THERE and takes as long as it takes -- at 10k beads,
-        LAMMPS' setup plus a rejection-sampled random fill, which is seconds during
-        which no frames come back at all. So this also latches `_resetting`, and the
-        HUD says the far side is rebuilding until a frame from the new run arrives
-        (the server restarts its sequence at 0, which is how that is recognised).
-        Without it the picture simply sits on the last frame of the OLD run, which
-        is indistinguishable from a Reset that did nothing.
+        The rebuild happens THERE and takes as long as it takes: LAMMPS' setup plus
+        a rejection-sampled random fill, and no frames come back for any of it.
+        TENS OF SECONDS, not the "moment" it sounds like -- 44s measured for this
+        playground's 50,000 beads, against 43s for the initial build, which is the
+        same work. The GPU does not help: `create_atoms random ... overlap` places
+        particles on the host and rejects the ones that land too close, so the cost
+        follows the bead count wherever the integration runs.
+
+        So this latches `_resetting` and the HUD says the far side is rebuilding,
+        with the seconds on it, until a frame from the new run arrives (see
+        `_is_new_run`). Without that the picture simply sits on the last frame of
+        the OLD run, which is indistinguishable from a Reset that did nothing --
+        and with only a static notice, indistinguishable from one that hung.
 
         Called only with the simulation thread idle (App._reset_simulation waits
         first): it replaces the analysis and clears the smoother, both of which the
@@ -468,14 +527,47 @@ class RemoteSystem(MDSystem3D):
         self._energies = None          # the old run's colours are not the new box's
         self._energy_cache = None
         self._energy_render_frame = -1
+        self._clusters.reset()
+        self._cluster_slots = None
         self._smoother.reset()
+        # Both filters, and for the same reason: the new run's coordinates have
+        # nothing to do with the old run's, so a carried-over wobble or average
+        # would be drawn on top of a scene it was never measured from.
+        self._rattle.reset()
+        self._wire_period = 0.0
+        self._frame_wall = 0.0
+        self._render_wall = 0.0
         self._rdf.reset()
         self.analysis = Analysis(self.force_field, self.playground.observables,
                                  energy_every=self.playground.analysis_energy_every)
         self._playing = False
-        if self.connected:
+        # LATCHED ONLY IF THE ASK ACTUALLY WENT OUT. `send` answers False on a dead
+        # socket rather than raising (a slider must not end the app), so latching
+        # first would leave the HUD saying the far side is rebuilding when nothing
+        # over there ever heard the request.
+        if self.connected and self.link.send({"t": "reset"}):
             self._resetting = True
-            self.link.send({"t": "reset"})
+            self._reset_started = time.perf_counter()
+
+    def _is_new_run(self, seq):
+        """Is this frame the first one the far side sent after a rebuild?
+
+        The server restarts its sequence at 0 on a reset and numbers the first
+        frame of the new run 1, so a number at or below the one we were on is the
+        giveaway -- and that test ALONE HAS A HOLE IN IT. A Reset pressed before
+        this system had ingested anything leaves `_seq` at 0, and no sequence
+        number is ever <= 0, so nothing would ever clear the notice: a perfectly
+        healthy run streamed on behind "rebuilding from a fresh state..." with
+        frames arriving the whole time and no way out short of reconnecting. Which
+        is the worst possible place to put that, because Reset is the button
+        somebody reaches for when the picture already looks wrong.
+
+        So a literal 1 counts as well. The cost of the extra test is a notice that
+        clears one frame early if a frame from the OLD run happened to be numbered
+        1 and was still in flight -- a fresh connection's very first frame, nothing
+        else -- and a notice that goes away a moment early is not a failure mode.
+        """
+        return seq <= self._seq or seq == 1
 
     def set_input_force(self, fx, fy):
         pass
@@ -488,13 +580,31 @@ class RemoteSystem(MDSystem3D):
 
     # ---- the frame ----------------------------------------------------------
 
+    # The longest this end will block waiting for a frame. THIS IS WHAT DECOUPLES
+    # THE WINDOW FROM THE WIRE, and it is the whole reason a 20 fps wire is usable
+    # at all: `App._tick` begins by waiting for the step launched under the last
+    # frame's drawing, so as long as `step()` blocks for a wire period, the app
+    # loop runs at the wire's rate and no amount of filling in between frames can
+    # help. Returning promptly instead lets the window keep its own 60 Hz and pick
+    # frames up as they land.
+    #
+    # Not zero, because a stepper that returns instantly spins a core; a short
+    # sleep is what a "nothing yet" answer costs. Sized under half a 60 Hz frame
+    # so a frame that arrives during one is picked up on the very next tick.
+    FRAME_POLL = 0.006
+
     def step(self, n):
-        """Wait for the next frame and take it in.
+        """Take in the next frame if one has arrived, and do not wait long if not.
 
         Called on the stepper's worker thread, which is what puts both the network
         wait and the analysis alongside the drawing rather than in front of it.
         `n` is ignored: how far the simulation advances per frame is the server's
         decision, and it reports it (the `dt` on each frame).
+
+        Most calls return with nothing, and that is the normal case rather than a
+        failure: at a 20 fps wire and a 60 fps window, two drawn frames in three
+        have no new state behind them. What they draw instead is `_render_state`'s
+        business.
         """
         if not self.connected:
             # Nothing to wait for. Sleep out a frame rather than spinning, so a
@@ -507,7 +617,7 @@ class RemoteSystem(MDSystem3D):
             self._ping_countdown = 60
             self.link.ping()
         t0 = time.perf_counter()
-        frame = self.link.take_frame(timeout=0.25)
+        frame = self.link.take_frame(timeout=self.FRAME_POLL)
         self.wait_seconds = time.perf_counter() - t0
         if frame is not None:
             self._ingest(frame)
@@ -530,7 +640,7 @@ class RemoteSystem(MDSystem3D):
     def _ingest(self, frame):
         """Decode one frame and run this end's analysis on it."""
         header, payload = frame
-        codec = header.get("codec", "q16")
+        codec = header.get("codec", protocol.DEFAULT_CODEC)
         arrays = protocol.decode_frame(
             header.get("arrays") or [], payload, self.box,
             energy_range=self.spec.render_style.energy_range, codec=codec)
@@ -541,14 +651,16 @@ class RemoteSystem(MDSystem3D):
         if n != len(self.all_ids):
             self.all_ids = np.arange(1, n + 1)
             self.natoms = n
+            # Labelled beads that no longer exist: dropped rather than handed to
+            # the renderer alongside a different number of positions.
+            self._cluster_slots = None
         self._state = FrameState(positions=positions,
                                  directors=arrays.get("directors"),
-                                 types=None, ids=self.all_ids, box=self.box)
+                                 types=self._frame_types(n), ids=self.all_ids,
+                                 box=self.box)
         self._energies = arrays.get("energies")
         seq = int(header.get("seq") or 0)
-        # The server restarts its sequence at 0 on a rebuild, so a frame numbered
-        # at or below the one we were on is the first of the NEW run.
-        if self._resetting and seq <= self._seq:
+        if self._resetting and self._is_new_run(seq):
             self._resetting = False
         self._seq = seq
         self._sim_time = float(header.get("sim_time") or 0.0)
@@ -557,10 +669,49 @@ class RemoteSystem(MDSystem3D):
         if thermo and all(np.isfinite(v) for v in thermo):
             self._thermo = tuple(float(v) for v in thermo)
         self._unstable = header.get("unstable")
+        now = time.monotonic()
+        if self._frame_wall > 0.0:
+            measured = now - self._frame_wall
+            # Averaged, and only over plausible values: a frame that arrived after
+            # a stall, a pause or a Reset is not evidence about the wire's rate.
+            if 0.001 <= measured <= 1.0:
+                self._wire_period = (measured if self._wire_period <= 0.0
+                                     else self._wire_period
+                                     + 0.2 * (measured - self._wire_period))
+        self._frame_wall = now
         self._frame += 1
         self._render_cache = None
+        # The rattle's amplitude is measured off the frames that DO arrive, so
+        # this is where it learns how much motion the wire is dropping. Fed the
+        # raw received state, before any of the drawn-state filtering.
+        self._rattle.observe(self._state)
+        # One RDF sample per received frame -- see get_rdf for why it is here and
+        # _make_rdf for why that needs no throttle of its own.
+        if all(self.box.periodic):
+            self._rdf.add(self._state.positions)
+        else:
+            self._rdf.add(self._state.positions[:, :2])
         t0 = time.perf_counter()
         self.analysis.update(self._state, self.params)
+        # THE CLUSTER LABELLING BELONGS HERE, not in the readout it used to run
+        # in. It is an O(N) pass costing tens of milliseconds at this size, and
+        # `get_bead_clusters` is called from the app's own thread -- so every
+        # labelling was time the window spent not drawing, arriving as a hitch
+        # about every second and a half (clustering.py's own docstring predicted
+        # it and named this as the fix). Run from here it lands on the stepper
+        # thread beside the analysis, under the previous frame's drawing, where
+        # the tracker's pacing already keeps it inside a frame's worth of work.
+        #
+        # Only while the colouring is actually painting them, on the same
+        # asked-recently rule the per-bead energies use -- and on the received
+        # positions rather than the drawn ones, which is a difference of a
+        # fraction of a bead radius of synthetic rattle and no difference at all
+        # to which beads are in contact.
+        if (self._frame - self._clusters_asked_frame) < self.ENERGY_REQUEST_HOLD:
+            self._cluster_slots = self._clusters.slots(self._state.positions,
+                                                       self.box, self._frame)
+        # Both passes together: the app subtracts this from the step's wall time
+        # to show them apart from the wire wait in the --debug breakdown.
         self.analysis_seconds = time.perf_counter() - t0
 
     def _ensure_current(self):
@@ -577,23 +728,90 @@ class RemoteSystem(MDSystem3D):
         if frame is not None:
             self._ingest(frame)
 
+    # Two calls to `_render_state` closer together than this are taken to be the
+    # same drawn frame (they are: positions, directors and the 2D readout all
+    # land within microseconds of each other). A 60 Hz frame is 16.7 ms, so this
+    # separates "the same frame asking again" from "the next frame" with an order
+    # of magnitude of headroom either side.
+    RENDER_COALESCE = 0.002
+
     def _render_state(self):
-        """The frame as drawn: the received state, optionally smoothed. Mirrors
-        PlaygroundSystem._render_state, including that NOTHING which measures comes
-        through here."""
+        """The frame as drawn: the received state, rattled and optionally smoothed.
+
+        Mirrors PlaygroundSystem._render_state, including that NOTHING which
+        measures comes through here -- but with one difference that only a remote
+        system has, and it is the reason this is no longer a straight cache on the
+        received frame: THIS RUNS AT THE RATE THE SCREEN REFRESHES, not at the rate
+        frames arrive. The wire runs at 20 fps and the window at 60, so between two
+        received frames this is asked three times and must hand back three
+        different pictures or the scene is a slideshow.
+
+        Order matters and is the one thing to preserve here: rattle first, smooth
+        second, so that the Smoothing slider removes the synthetic motion exactly
+        as it removes the real kind.
+        """
         self._ensure_current()
         state = self._state
         if state is None:
             return None
+        now = time.monotonic()
+        fresh = (self._render_frame != self._frame
+                 or self._render_cache is None
+                 or (now - self._render_wall) >= self.RENDER_COALESCE)
+        if not fresh:
+            return self._render_cache
+
+        # The wall-clock slice this drawn frame covers. Clamped because the first
+        # frame after a connect, a window resize or a Reset can be an arbitrarily
+        # long gap, and neither filter should be handed one: the rattle would jump
+        # to a fresh independent draw (a visible twitch) and the smoother would
+        # take a step so large it discards its own history.
+        wall_dt = 0.0 if self._render_wall <= 0.0 else min(now - self._render_wall,
+                                                           4.0 / 60.0)
+        self._render_wall = now
+        self._render_frame = self._frame
+
+        share = self._render_share(wall_dt)
+        drawn = self._rattle.apply(state, self._jitter_strength,
+                                   wall_dt, share)
+
         if self._smoothing_tau <= 0.0:
             if self._smoother.active:
                 self._smoother.reset()
-            return state
-        if self._render_frame != self._frame or self._render_cache is None:
-            self._render_cache = self._smoother.apply(
-                state, self._smoothing_tau, self._last_step_dt)
-            self._render_frame = self._frame
+            self._render_cache = drawn
+            return drawn
+        # The smoother's weight comes from how much SIMULATED time a frame
+        # advanced, and it is now being applied once per DRAWN frame rather than
+        # once per received one -- so it must be given this frame's share of the
+        # wire frame's sim time, not the whole of it. Without the split, a 20 Hz
+        # wire drawn at 60 would apply three full steps of the filter per frame of
+        # physics and smooth three times as hard as the slider says.
+        self._render_cache = self._smoother.apply(
+            drawn, self._smoothing_tau, self._sim_dt_share(wall_dt))
         return self._render_cache
+
+    def _render_share(self, wall_dt):
+        """What fraction of one wire frame this drawn frame covers.
+
+        1.0 whenever the wire is not yet measured, or is slower than the window is
+        drawing -- the fallback both filters below want, since it says "this frame
+        stands for the whole of a wire frame", which is exactly true when they are
+        arriving no faster than they are drawn.
+        """
+        period = self._wire_period
+        if period <= 0.0 or wall_dt <= 0.0:
+            return 1.0
+        return min(wall_dt / period, 1.0)
+
+    def _sim_dt_share(self, wall_dt):
+        """How much of the last wire frame's simulated time this drawn frame is.
+
+        Falls back to the whole of it when there is no measured wire period yet
+        (the first frames after a connect), which is the pre-existing behaviour
+        and errs toward smoothing slightly too hard for a fraction of a second
+        rather than not at all.
+        """
+        return self._last_step_dt * self._render_share(wall_dt)
 
     # ---- readouts -----------------------------------------------------------
 
@@ -644,11 +862,57 @@ class RemoteSystem(MDSystem3D):
             self._energy_render_frame = self._frame
         return self._energy_cache
 
+    def get_bead_clusters(self):
+        """Per-bead cluster colour slot, computed here from the drawn positions.
+
+        Same call and same meaning as PlaygroundSystem.get_bead_clusters -- and
+        unlike the energies it needs nothing from the far end, so there is no
+        request to make and no lag on the toggle beyond the frame it takes for
+        the ask to reach the labelling.
+
+        ASKING IS ALL THIS DOES. The labelling runs where the frame arrives (see
+        _ingest), so what the renderer gets here is the last one computed, and
+        what it costs the drawing thread is a dictionary lookup.
+        """
+        self._clusters_asked_frame = self._frame
+        return self._cluster_slots
+
+    def _frame_types(self, n):
+        """The species of each bead in a frame of `n` of them, or None.
+
+        Guarded on the length rather than trusted, because the two ends agreeing
+        is exactly the thing that could stop being true -- a server built from a
+        different revision of this package, or a scenario whose count depends on
+        something the client resolved differently. A mismatch degrades to "no
+        types", which every consumer already handles, instead of mislabelling
+        half the system.
+        """
+        if self._types is None or len(self._types) != n:
+            return None
+        return self._types
+
+    def get_bead_tints(self):
+        # Static, and derived from this end's own build of the scenario -- see
+        # __init__. Guarded on the count for the same reason _frame_types is.
+        if self._tints is None or len(self._tints) != self.natoms:
+            return None
+        return self._tints
+
     def get_bead_brightness(self):
         return None
 
     def get_bonds_3d(self):
         return []
+
+    def get_glyph_spheres(self):
+        """The rod's body, derived at THIS end.
+
+        Nothing has to come down the wire for it: the shape is a function of the
+        force field's own parameters and the frame's positions and directors, both
+        of which this end already has. Same call as the local system makes, off the
+        same render state, so a remote rod would draw identically.
+        """
+        return self.force_field.glyph_spheres(self._render_state(), self.params)
 
     def get_thermo_state(self):
         self._ensure_current()
@@ -658,13 +922,14 @@ class RemoteSystem(MDSystem3D):
         return self._sim_time
 
     def get_rdf(self):
-        state = self._state
-        if state is None:
-            return self._rdf.get()
-        if all(self.box.periodic):
-            self._rdf.add(state.positions)
-        else:
-            self._rdf.add(state.positions[:, :2])
+        """The rolling g(r). A pure read: the sampling happens in _ingest.
+
+        It used to sample here, which put an O(max_atoms^2) pair pass -- 5.9 ms at
+        this scale -- on the drawing thread once every `sample_every` DRAWN frames.
+        On a 60 Hz window in front of a vsync'd flip that is 5.9 ms the frame does
+        not have, for a plot that is a rolling average over dozens of frames and
+        cannot tell which thread fed it.
+        """
         return self._rdf.get()
 
     def get_potential_terms(self):
@@ -688,7 +953,14 @@ class RemoteSystem(MDSystem3D):
                     (error[:40] if error else "press N to connect")]
         lines = []
         if self._resetting:
-            lines.append("REMOTE: rebuilding from a fresh state...")
+            # WITH THE CLOCK ON IT. A rebuild there is a whole LAMMPS setup -- the
+            # plugin, a rejection-sampled random fill, the neighbour lists -- and at
+            # this size that is tens of seconds during which nothing comes back and
+            # the picture does not move. Without a number the only two explanations
+            # available to whoever is watching are "slow" and "hung", and they look
+            # identical; with one, a count that is still going up is an answer.
+            waited = time.perf_counter() - self._reset_started
+            lines.append(f"REMOTE: rebuilding from a fresh state... {waited:.0f}s")
         if self._unstable:
             lines += ["SIMULATION UNSTABLE on the remote node -- these parameters "
                       "destroyed it.", str(self._unstable),
@@ -752,11 +1024,20 @@ class RemoteSystem(MDSystem3D):
 
     def _make_rdf(self):
         """The same choice PlaygroundSystem makes, minus the scenario override --
-        which takes a live LAMMPS instance to build, and there isn't one here."""
+        which takes a live LAMMPS instance to build, and there isn't one here.
+
+        `sample_every=1` throughout, unlike the local systems': the throttle
+        exists to keep an O(max_atoms^2) pass off every frame, and here the caller
+        IS the wire (see _ingest), which is already three times slower than the
+        window. Left at the default the average would cover three times as much
+        wall time as it does locally, which is a different plot rather than a
+        cheaper one.
+        """
         lengths = self.box.lengths
         if all(self.box.periodic):
-            return RadialRDF3D(min(0.5 * min(lengths), 6.0), lengths[0])
+            return RadialRDF3D(min(0.5 * min(lengths), 6.0), lengths[0],
+                               sample_every=1)
         if self.box.periodic[0] and self.box.periodic[1]:
             return InPlaneRDF(min(0.5 * min(lengths[0], lengths[1]), 6.0),
-                              box=(lengths[0], lengths[1]))
+                              box=(lengths[0], lengths[1]), sample_every=1)
         return InPlaneRDF(3.0, nbins=48, box=None, sample_every=1)

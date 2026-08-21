@@ -13,6 +13,8 @@ path without editing it.
 import os
 from dataclasses import dataclass, fields, replace
 
+from . import protocol
+
 
 @dataclass(frozen=True)
 class RemoteTarget:
@@ -31,6 +33,14 @@ class RemoteTarget:
     # everything else fails to -- a crashed app, a lost network, a closed lid --
     # so it is deliberately not generous.
     time: str = "01:00:00"
+    # How long a queued request may sit before the session gives up. A GPU
+    # partition that is full is the normal case, not the exceptional one, and a
+    # request behind other people's jobs waits however long they take -- so the
+    # cutoff is an hour, not the couple of minutes an idle queue needs. The wait
+    # is polled and reported (state and Slurm's own reason), and Cancel ends it,
+    # so a long one is legible rather than a spinner. `--time` above is what
+    # bounds the allocation once it starts; this bounds getting one at all.
+    queue_wait: float = 3600.0
     account: str = ""
     job_name: str = "mesomem-live"
     extra_salloc: tuple = ()
@@ -66,8 +76,28 @@ class RemoteTarget:
     # a PAM stack that lets the owner of a running job in (`pam_slurm_adopt`). Where
     # that is not allowed, one hop is the only way through.
     tunnel: str = "jump"               # "jump" | "forward"
-    codec: str = "q16"
-    fps: float = 60.0
+    codec: str = protocol.DEFAULT_CODEC
+    # HOW OFTEN THE FAR SIDE SENDS, not how often the window draws. Those were the
+    # same number until the client learned to fill in between frames
+    # (playground/jitter.py), and separating them is what makes a 50k demo
+    # affordable: at 6.5 B/bead a 60 fps wire is 19.5 MB/s, and 20 fps is 6.5 --
+    # over an SSH tunnel from Amsterdam that is the difference between a link that
+    # keeps up and one that does not.
+    #
+    # It costs nothing in simulation speed: the server takes a proportionally
+    # LONGER stride per frame (see FrameServer._stride_for), so the demo advances
+    # at exactly the pace its scenario was tuned at, and only the sampling of the
+    # trajectory gets coarser -- which is what the client-side rattle exists to
+    # hide. What it does not do is keep the GPU busy; the A100 idles ~96% either
+    # way, and that is fine (it is here to make 50k beads possible, not to
+    # maximise steps per second).
+    fps: float = 20.0
+    # Integrate flat out between sends instead of taking one honest stride. Looks
+    # like the way to use the idle GPU and is a trap: at 20 fps on an A100 it
+    # advances 1,420 steps a frame instead of 60, running the demo 23x fast and
+    # leaving consecutive frames so far apart that they are nearly uncorrelated --
+    # which is exactly the input the client's smoothing and rattle fill cannot do
+    # anything with. Off, and it should stay off unless the pace is the point.
     free_run: bool = False
     # Idle timeout handed to the server, so an abandoned allocation ends itself
     # even if the teardown never runs. Slurm's --time is the outer backstop; this

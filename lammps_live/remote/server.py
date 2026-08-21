@@ -23,13 +23,22 @@ GAME MODE IS NOT SERVED. A haptic loop over a network is a different project (a
 2 ms force-feedback loop cannot survive a 10 ms RTT), so the server refuses
 anything but sim mode rather than appearing to support it.
 
-PACING. One chunk per sent frame, capped at `--fps`, so the simulation advances at
-the same rate per wall-clock second as the local demo and the picture is the state
-the user is steering. `--free-run` lets the integrator run flat out between sends
-instead, which on an A100 that can do several hundred chunks a second turns the
-demo into a fast-forward of the same physics; it is a legitimate thing to want
-(assembly by t ~ 2000 tau arrives in seconds) but it is not the default, because
-then the sliders act on something that has already moved on.
+PACING. One stride per sent frame, capped at `--fps`, and the STRIDE IS DERIVED
+FROM THE RATE (`_stride_for`) so that the simulation advances at the same rate per
+wall-clock second as the local demo whatever the send rate is. That indirection is
+the whole reason the wire can drop to 20 fps to save bandwidth without also
+running the demo at a third speed: 20 fps takes three times the stride, the pace is
+unchanged, and only the sampling of the trajectory gets coarser (which is what the
+client fills in -- see playground/jitter.py).
+
+`--free-run` lets the integrator run flat out between sends instead, turning the
+demo into a fast-forward of the same physics. It is a legitimate thing to want
+(assembly by t ~ 2000 tau arrives in seconds) and it is not the default, for two
+reasons: the sliders then act on something that has already moved on, and at 20
+fps on an A100 it puts consecutive frames ~14 tau apart, far enough that they are
+nearly uncorrelated -- which leaves the client's smoothing and rattle fill nothing
+to work with. The GPU idling ~96% at the honest pace is not a reason to reach for
+it; the A100 is here to make 50k beads possible, not to maximise steps per second.
 
 RECONNECTING IS FREE. The system is built on the first connection and kept
 afterwards, so a dropped tunnel, a closed laptop lid or a restarted client picks up
@@ -101,7 +110,8 @@ class ControlChannel:
 class FrameServer:
     def __init__(self, playground="mesomem_remote", profile="cluster-gpu",
                  port=protocol.DEFAULT_PORT, bind="0.0.0.0", token="",
-                 fps=60.0, steps_per_frame=None, codec="q16", free_run=False,
+                 fps=60.0, steps_per_frame=None, free_run=False,
+                 codec=protocol.DEFAULT_CODEC,
                  coeff_values=None, exit_when_idle=0.0, verbose=True):
         self.playground_ref = playground
         self.profile_name = profile
@@ -162,14 +172,49 @@ class FrameServer:
         t0 = time.perf_counter()
         self.system = PlaygroundSystem(playground, mode_name="sim",
                                        host_profile=profile, analysis=False)
-        self.steps_per_frame = int(self.steps_override or max(
-            1, round(self.system.scenario.sim_time_per_frame
-                     / self.system.scenario.timestep)))
+        self.steps_per_frame = self._stride_for(self.fps)
         self.log(f"built {self.system.natoms} particles in "
                  f"{time.perf_counter() - t0:.1f}s, "
                  f"{self.steps_per_frame} steps/frame, "
                  f"box {self.system.box.lengths[0]:.2f} sigma")
         return self.system
+
+    # The frame rate a scenario's `sim_time_per_frame` is quoted against. It is
+    # the app's own refresh rate, because that is what the local playgrounds run
+    # at and what every one of these scenarios was tuned watching.
+    REFERENCE_FPS = 60.0
+
+    def _stride_for(self, fps):
+        """MD steps per sent frame, such that the SIMULATION'S PACE does not
+        depend on how often frames are sent.
+
+        A scenario declares `sim_time_per_frame`: how much simulated time one
+        DRAWN frame should advance, chosen by watching it. Sending at 20 fps
+        instead of 60 must therefore take three times the stride, or the same
+        demo runs three times slower in wall-clock -- and this is easy to get
+        wrong in the other direction too. `free_run` (integrate flat out until
+        the next send is due) looks like the obvious way to keep the GPU busy,
+        and on an A100 at 50k beads it advances 1,420 steps per frame instead of
+        60: the pace goes from 12 tau/s to 284, which is not the demo, and
+        consecutive frames land ~14 tau apart, far enough that they are nearly
+        uncorrelated. Nothing on the client can fill in between two frames that
+        share no motion, so it takes the trajectory smoothing and the rattle fill
+        down with it.
+
+        The GPU sitting ~96% idle at the honest pace is not a problem worth
+        solving. The A100 is here to make 50k beads possible at all, not to
+        maximise steps per second; the allocation costs the same either way.
+        """
+        if self.steps_override:
+            return max(1, int(self.steps_override))
+        scenario = self.system.scenario
+        per_frame = max(1, round(scenario.sim_time_per_frame / scenario.timestep))
+        if fps <= 0:
+            # No pacing at all (the loopback tests, and `--fps 0`): there is no
+            # send rate to hold the pace against, so the scenario's own stride is
+            # the only meaningful answer.
+            return per_frame
+        return max(1, round(per_frame * self.REFERENCE_FPS / float(fps)))
 
     def stop(self):
         """Ask the serve loop to return. Safe from any thread; `close()` is not."""
@@ -385,19 +430,35 @@ class FrameServer:
         elif kind == "pause":
             self.playing = False
         elif kind == "reset":
+            # TIMED, AND SAID AFTERWARDS AS WELL AS BEFORE. This call is the whole
+            # of a LAMMPS rebuild and it blocks this thread -- no frames go out and
+            # no control message is answered until it returns -- so the log line
+            # that opens it used to be the last thing anybody heard for as long as
+            # it took. The pair of lines is what tells a rebuild that is merely slow
+            # apart from one that never came back, in the log the panel copies.
             self.log("reset: rebuilding from a fresh random state")
+            t0 = time.monotonic()
             system.reset()
+            self.log(f"reset: rebuilt in {time.monotonic() - t0:.1f}s")
             self.playing = False
             self.seq = 0
         elif kind == "config":
             if "fps" in msg:
                 self.fps = float(msg["fps"])
+                # The stride follows, so that changing how OFTEN frames are sent
+                # does not also change how fast the simulation runs. Skipped when
+                # the stride was pinned explicitly (--steps-per-frame), which is
+                # the one case where somebody has said what they want.
+                self.steps_per_frame = self._stride_for(self.fps)
             if "codec" in msg and msg["codec"] in protocol.CODECS:
                 self.codec = msg["codec"]
             if "energies" in msg:
                 self.want_energies = bool(msg["energies"])
             if "steps_per_frame" in msg:
-                self.steps_per_frame = max(1, int(msg["steps_per_frame"]))
+                # An explicit stride pins it: it survives later fps changes, the
+                # same way --steps-per-frame does.
+                self.steps_override = max(1, int(msg["steps_per_frame"]))
+                self.steps_per_frame = self.steps_override
             if "free_run" in msg:
                 self.free_run = bool(msg["free_run"])
         elif kind == "ping":
@@ -509,7 +570,7 @@ def build_parser():
                    help="cap on frames sent per second; 0 for uncapped")
     p.add_argument("--steps-per-frame", type=int, default=None,
                    help="MD steps per frame (default: the scenario's own cadence)")
-    p.add_argument("--codec", default="q16", choices=protocol.CODECS)
+    p.add_argument("--codec", default=protocol.DEFAULT_CODEC, choices=protocol.CODECS)
     p.add_argument("--free-run", action="store_true",
                    help="integrate flat out between sends instead of one chunk per "
                         "frame -- the same physics, fast-forwarded")

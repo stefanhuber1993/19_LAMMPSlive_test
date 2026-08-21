@@ -19,7 +19,7 @@ import pytest
 
 from dataclasses import replace
 
-from lammps_live.remote import RemoteTarget, session as session_mod
+from lammps_live.remote import RemoteTarget, protocol, session as session_mod
 from lammps_live.remote.session import FAILED, READY, RemoteSession
 
 # tests/ is on sys.path (pytest's default import mode), and there is no
@@ -145,7 +145,11 @@ def test_the_whole_flow_ends_in_frames(session, cluster):
     assert frame is not None, "no frame came through the forward"
     header, payload = frame
     assert header["n"] == 600
-    assert len(payload) == 600 * 10          # q16: 6 bytes position, 4 director
+    # q12: 4.5 bytes of packed position, 2 of octahedral director. Asserted
+    # against the codec rather than a literal, so this test says "the frames
+    # that came down the real forward are the size the codec claims" and does
+    # not have to be edited every time the codec is retuned.
+    assert len(payload) == 600 * protocol.bytes_per_bead(protocol.DEFAULT_CODEC)
 
 
 def test_the_build_is_checked_in_two_places(session, cluster):
@@ -197,6 +201,9 @@ def test_teardown_gives_the_gpu_back(session, cluster):
     session.shutdown()
 
     assert "scancel 4242" in cluster["slurm_log"].read_text()
+    # AND SLURM WAS ASKED WHETHER IT TOOK. Firing a scancel is not the same as the
+    # job having stopped, and the difference is an A100 for the rest of the hour.
+    assert any("scancel 4242: released" in line for line in session.log)
     assert session.link is None
     assert session.job_id is None
     assert session.local_port is None
@@ -210,6 +217,101 @@ def test_teardown_gives_the_gpu_back(session, cluster):
     assert not cluster["ssh_log"].read_text().count("unhandled")
 
 
+def test_closing_during_the_queue_wait_still_cancels_the_job(cluster, monkeypatch):
+    """THE LEAK THIS PAIR OF TESTS EXISTS FOR, and the one that was really happening:
+    old `mesomem-live` jobs sitting in `squeue` long after the app was gone.
+
+    Slurm names a job the instant it is SUBMITTED and grants it whenever the queue
+    gets round to it, which on a full GPU partition is minutes. The session used to
+    record the number only once the whole submission call returned, so a Disconnect
+    or a closed window during that wait tore down a session that believed it held
+    nothing -- while a real request sat in the queue, was granted later, and held a
+    GPU with nothing on it until the time limit ran out. Nothing else would have
+    cancelled it either: the server that runs its own `scancel` on the way out had
+    never been started.
+    """
+    monkeypatch.setenv("FAKE_SALLOC_QUEUE", "30")     # still queued when we give up
+    sess = RemoteSession(cluster["target"], playground_ref=cluster["playground"])
+    try:
+        sess.start()
+        deadline = time.monotonic() + 60
+        while sess.job_id is None and time.monotonic() < deadline:
+            if sess.prompt:
+                sess.answer(PASSWORD if "assword" in sess.prompt else OTP)
+            time.sleep(0.02)
+        assert sess.job_id == "4242", f"never named: {sess.state} {sess.detail}"
+    finally:
+        sess.shutdown()
+    assert "scancel 4242" in cluster["slurm_log"].read_text()
+
+
+def test_no_gpu_is_asked_for_after_the_session_has_been_told_to_stop(cluster):
+    """The worst version of the leak, and the cheapest guard against it.
+
+    Every step of the flow reaches the cluster through `_remote`, which refuses
+    once `_cancel` is set -- but a Disconnect landing DURING one of those calls
+    (the probe is a single ssh that can sit for a minute) only takes effect at the
+    next one. `salloc` was the next one, and it does not go through `_remote`: it
+    starts its own process. So the flow could come back from an interrupted probe
+    and ask a cluster for an A100 on behalf of a session that had already been torn
+    down -- with nothing left anywhere that would give it back. Not the teardown,
+    which had been and gone; not the server's own `scancel`, which is only ever
+    reached if the server starts.
+    """
+    sess = RemoteSession(cluster["target"], playground_ref=cluster["playground"])
+    sess._cancel.set()                     # what shutdown() does first
+
+    with pytest.raises(session_mod.SessionError, match="cancelled"):
+        sess._allocate()
+
+    # Not "salloc ran and was refused": salloc was never reached at all.
+    assert not cluster["slurm_log"].exists()
+    assert not cluster["ssh_log"].exists()
+
+
+def test_the_job_goes_back_even_with_no_control_master_left(session, cluster,
+                                                            monkeypatch):
+    """A teardown cannot assume the shared ssh is still there.
+
+    It is the first thing a dropped network takes, and there are ordinary ways to
+    arrive here without one -- a session torn down a second time (the first
+    teardown removed the socket), a connect thread that got its job id just after
+    the window closed, a master that died while the allocation lived on. All of
+    them used to reach the same `if ... os.path.exists(control)` and skip the
+    scancel in silence. Now the release opens a connection of its own.
+    """
+    monkeypatch.setenv("FAKE_SSH_DIRECT", "1")        # this cluster takes a key
+    _drive(session)
+    assert session.state == READY, session.error
+    cluster["slurm_log"].write_text("")               # only what teardown does
+    session._control_path = str(cluster["tmp"] / "no-such-socket")
+
+    session.shutdown()
+
+    assert "scancel 4242" in cluster["slurm_log"].read_text()
+    assert any("scancel 4242: released" in line for line in session.log)
+    assert session.job_id is None
+
+
+def test_a_job_that_could_not_be_released_is_reported_not_forgotten(session, cluster):
+    """The one failure with a bill attached must never be silent.
+
+    No control master and a cluster that will not take a keyless connection: there
+    is nothing more this end can do. What it can do is say which job is still out
+    there and keep hold of the number, so the report the panel copies names it and
+    a second attempt has something to cancel -- rather than clearing `job_id` and
+    leaving the GPU to the time limit with nobody told.
+    """
+    _drive(session)
+    assert session.state == READY, session.error
+    session._control_path = str(cluster["tmp"] / "no-such-socket")
+
+    session.shutdown()
+
+    assert session.job_id == "4242"
+    assert any("COULD NOT BE CONFIRMED" in line for line in session.log)
+
+
 def test_the_server_cancels_its_own_allocation_when_it_exits(session, cluster):
     """The backstop for a hard-killed app: the remote command ends with a scancel of
     its own job, so an abandoned allocation costs minutes, not the time limit."""
@@ -221,6 +323,35 @@ def test_the_server_cancels_its_own_allocation_when_it_exits(session, cluster):
     assert command is not None
     assert "scancel $SLURM_JOB_ID" in command
     assert "--exit-when-idle 60.0" in command
+
+
+def test_a_job_that_waits_in_the_queue_still_connects(cluster, monkeypatch):
+    """The failure a real Snellius run hit, and the reason this is not a timeout.
+
+    `salloc --no-shell` returns when the allocation is GRANTED, not when it is
+    submitted -- so on a full gpu_a100 partition it sits there for as long as the
+    people ahead of you do. Waiting on it as a command meant the connect died with
+    "remote command timed out after 120s" for the most ordinary reason there is:
+    the GPUs were busy.
+
+    Slurm names the job at submission, so the connect goes on without waiting for
+    the grant. Here the request is still in the queue when the session is already
+    streaming, which is only possible if the id came off the "Pending" line.
+    """
+    monkeypatch.setenv("FAKE_SALLOC_QUEUE", "180")
+    sess = RemoteSession(cluster["target"], playground_ref=cluster["playground"])
+    try:
+        _drive(sess, timeout=120)
+        assert sess.state == READY, f"{sess.error}\n" + "\n".join(sess.log)
+        assert sess.job_id == "4242"
+        salloc = sess._salloc_proc
+        assert salloc.poll() is None, "the connect waited for salloc to return"
+        assert "queued: PENDING" in "\n".join(sess.log)
+    finally:
+        sess.shutdown()
+    # And the queued request is given up on the way out, rather than left to be
+    # granted later and hold a GPU that nobody is connected to.
+    assert salloc.wait(timeout=10) is not None
 
 
 def test_a_wrong_answer_fails_with_something_readable(cluster):

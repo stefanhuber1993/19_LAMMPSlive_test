@@ -55,6 +55,9 @@ throttled live, linear to 100k (a full update at 100k = 275 ms). This caps N at
 | 10x cheaper (cadence / subsample) | ~60,000 |
 | off, or from GPU-side computes | ~125,000 |
 
+The middle row is the one that happened -- by subsampling the pair list, measured
+at 10x on the nose. See "The wall came down by subsampling" below.
+
 ### Re-measured at 10k, on the real thing (2026-08-18)
 
 Against a *coarsened* 10k configuration -- 22.8 neighbours per bead, not the 11.5
@@ -86,6 +89,62 @@ things to do about it, cheapest first: build the pair list with
 `query_ball_point(..., workers=-1)` (multithreaded, unlike `query_pairs`);
 subsample `coordination`, which only needs a mean; or move the energy decomposition
 to a GPU-side compute and off this machine entirely.
+
+### The wall came down by subsampling (2026-08-20)
+
+The middle option, generalized: **the whole pair list** is now built over a
+bounded uniform random sample of the beads rather than `coordination` alone
+(`Analysis.MAX_PAIR_BEADS = 6000`), because the list is the cost and every
+consumer of it tolerates sampling. `PairData.dilution` carries the fraction, and
+each consumer divides it back out -- once for a per-particle mean, twice for a
+pair sum, since a pair survives only if both its beads were drawn.
+
+Measured at **N = 50,000** (the size `mesomem_remote` now runs), against a
+condensed configuration:
+
+| | full list | sampled |
+|---|---|---|
+| `build_pairs` | 66-95 ms (313k-438k pairs) | 5.8 ms |
+| one `Analysis.update` on a due frame | **113 ms** | **11 ms** |
+| per second of a 20 fps wire | 564 ms (56% of the thread) | 57 ms (5.7%) |
+
+564 ms of work per second is why the demo stalled several times a second: each
+113 ms lump is six times the 17 ms render it was supposed to hide under, so
+`stepper.wait()` blocked for the remainder and the window stopped. It is now
+five 11 ms lumps, all of which fit.
+
+Accuracy, over 12 redrawn samples at a 5x dilution on a physical (non-overlapping)
+20k configuration -- see `tests/test_analysis_budget.py`, which asserts these:
+
+| | exact | sampled | error |
+|---|---|---|---|
+| coordination | 47.997 | 47.835 | +0.3% (0.33 spread per frame) |
+| isotropic energy | -80578 | -80763 | +0.2% |
+| tilt energy | 81493 | 82330 | +1.0% |
+| splay energy | 13551 | 13569 | +0.1% |
+
+The sample is redrawn every analysis frame, so the per-frame noise averages away
+over a second rather than sitting there as a fixed wrong answer. Two limits are
+deliberate: naming a particle (`keep_index`, used by every puller playground for
+its single-bead panel) switches sampling off entirely, because one bead's fraction
+of its own neighbours is a handful of pairs and no scale factor repairs that; and
+every local playground is under the budget, so none of them sample at all.
+
+Two smaller things moved off the drawing thread at the same time, both O(N) work
+that was running in front of a vsync'd `flip()`:
+
+- the **cluster labelling** (39-52 ms at 50k, once every ~1.6 s when the colouring
+  is on) now runs in `RemoteSystem._ingest`, on the stepper thread, which is what
+  `playground/clustering.py` already named as the fix;
+- the **RDF sample** (5.9 ms per sample) likewise, with `sample_every=1` on the
+  remote path so the number of samples per second, and the window the rolling
+  average covers, is unchanged.
+
+The remaining per-frame gather on the drawing thread is **0.8 ms** at 50k, down
+from 3.1 ms. Note for reading the `--debug` line: `flip()` is inside the render
+timer and swap interval is never set, so on macOS `render` includes the wait for
+the next refresh -- it is frame pacing, not GPU work, and total work above 16.7 ms
+doubles the frame to 33 ms rather than degrading smoothly.
 
 ## 4. Budget table
 
@@ -145,9 +204,18 @@ coding.
 
 Ways to actually fit a thin link, in order of payoff:
 
-1. **Send fewer frames and interpolate locally.** 30 fps stream -> 104 Mb/s, 20 fps
-   -> 69 Mb/s. Smoothed positions are band-limited, so interpolation is nearly
-   exact -- this is the cheapest big win.
+1. **Send fewer frames.** SHIPPED (2026-08-20), at 20 fps by default -- and with
+   `q12` underneath that is 45 Mb/s at 100k rather than this row's 69. Two
+   corrections to what this line originally said, both measured:
+   *the interpolation is not what shipped.* It is the most accurate filler (1 px
+   from the 60 Hz truth with smoothing on, against 10 px for holding the frame)
+   but it plays a whole wire frame behind, which is 50 ms on every slider.
+   *Extrapolation, the zero-latency alternative, is worse than freezing the
+   picture* -- between frames the motion is uncorrelated thermal noise, so a
+   velocity fitted to two samples is a random number. What ships instead
+   synthesises the rattle (playground/jitter.py). Note also that "smoothed
+   positions are band-limited" is not load-bearing: the demo runs with the
+   Smoothing slider at zero.
 2. **Server-side camera-aware culling.** The client already knows the camera; send
    it up and drop occluded beads. A dense 81 sigma box only ever shows its shell:
    a 2 sigma outer shell is ~14% of beads, so up to ~7x. Caveat: lamellae are
@@ -161,14 +229,21 @@ wired research network, not happening over a home VPN.
 
 ### What shipped (2026-08-18)
 
-`lammps_live/remote/protocol.py` implements the second row of that table, with one
-deliberate difference: **octahedral-16 directors, not octahedral-8**, so 10 B/bead
-rather than 8. The extra 2 bytes buy 0.0037 deg worst-case angular error instead of
-0.87, and the reason is not the picture -- it is that the client MEASURES from
-these directors as well as drawing them (`nematic_S` is the number the k_tilt
-transition shows up in), and an order parameter should not carry a codec's error.
-At the 10k demo size that is 100 kB/frame, 6 MB/s at 60 fps, 48 Mb/s -- fine on
-any real link, and `--fps 30` halves it.
+`lammps_live/remote/protocol.py` implements the second row of that table, and then
+went *past* it. It first shipped with **octahedral-16 directors, not
+octahedral-8**, so 10 B/bead rather than 8, on the argument that the client
+MEASURES from these directors as well as drawing them (`nematic_S` is the number
+the k_tilt transition shows up in) and an order parameter should not carry a
+codec's error.
+
+**That was measured and reversed (2026-08-20.)** Coding directors at 8 bits moves
+`nematic_S` by 8e-5 -- the angular error is random and zero-mean and S is a second
+moment over the whole population, so it averages out rather than accumulating.
+Positions went to 12 bits per axis at the same time (0.2 px of quantisation in the
+windowed viewport, 0.33 fullscreen), packed two codes to three bytes. The shipped
+`q12` codec is **6.5 B/bead**: 65 kB/frame, 3.9 MB/s at 10k and 60 fps, 31 Mb/s.
+`q16` is still selectable. The reasoning, and the pixel table both bit counts were
+chosen from, is remote-networking.md §4.
 
 Everything below the second row is deliberately NOT built. Delta coding and
 entropy coding both need a stateful decoder that a dropped frame invalidates, and

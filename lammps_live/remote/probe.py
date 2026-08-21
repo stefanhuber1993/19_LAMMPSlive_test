@@ -119,6 +119,14 @@ try:
         "fix/nve/sphere": has("fix", "nve/sphere"),
         "fix/nve/sphere/kk": has("fix", "nve/sphere/kk"),
         "fix/langevin/kk": has("fix", "langevin/kk"),
+        # The bonded half, which only mesomem_polymer needs: a chain wants
+        # `pair_style hybrid` to route two species, and the MOLECULE package for
+        # the bond and angle styles. Asked here rather than discovered on the node
+        # halfway through a build, because a missing package there arrives as an
+        # error on a `bond_style` line with an allocation already spent.
+        "pair/hybrid": has("pair", "hybrid"),
+        "bond/fene": has("bond", "fene"),
+        "angle/cosine": has("angle", "cosine"),
     }
 except _StopHere:
     pass
@@ -392,6 +400,16 @@ def verdict(report):
             lines.append("WARNING no `nve/sphere/kk`: the integrator will copy "
                          "state host<->device every step "
                          "(docs/snellius/README.md point 2)")
+    # Not fatal: it stops ONE playground, and the note says which. A build with no
+    # MOLECULE package runs mesomem_remote perfectly well.
+    missing = [name for name in ("pair/hybrid", "bond/fene", "angle/cosine")
+               if not styles.get(name)]
+    if missing:
+        lines.append("note: no " + ", ".join(f"`{m.split('/', 1)[1]}`"
+                                             for m in missing)
+                     + " in this build -- `mesomem_polymer` (the vesicle with the "
+                       "ring-polymer melt) needs them; every other playground is "
+                       "unaffected. They come with the MOLECULE package.")
     coeff = report.get("coeff") or {}
     rejected = (coeff.get("rejected") or {}).values()
     if any("atom mass" in str(r) for r in rejected):

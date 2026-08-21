@@ -75,7 +75,20 @@ if "-N" in argv and "-L" in argv and "-M" not in argv:
               os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.py"),
               local, host, remote])
 
-if control is None or not os.path.exists(control):
+# A CONNECTION OF ITS OWN, with no master to ride. This is the route the teardown
+# falls back to when the control socket has gone, and whether it works is a
+# property of the cluster rather than of the app: it needs a key the agent can
+# offer, because `BatchMode=yes` means there is no prompt to fall back on. So it
+# is off unless the test says this cluster has one, and off is the honest default
+# -- a fake that always let a keyless ssh through would prove nothing about the
+# machine that asks for a one-time code.
+if control is None:
+    if os.environ.get("FAKE_SSH_DIRECT") != "1":
+        note("direct refused", " ".join(argv))
+        print("fake ssh: Permission denied (publickey,keyboard-interactive).",
+              file=sys.stderr)
+        sys.exit(255)
+elif not os.path.exists(control):
     print("fake ssh: no control connection", file=sys.stderr)
     sys.exit(255)
 
@@ -205,17 +218,40 @@ sys.exit(subprocess.run(command, env=env).returncode)
 '''
 
 _SALLOC = r'''#!@PYTHON@
-"""salloc --no-shell: create an allocation, print its id, return."""
-import os, sys
+"""salloc --no-shell: create an allocation, print its id, return.
+
+FAITHFUL ABOUT THE QUEUE, which is the thing worth standing in for here: the real
+salloc names the job as soon as it is submitted and then does NOT return until the
+allocation is granted -- for as long as the partition is full. FAKE_SALLOC_QUEUE
+seconds of that is what makes a test able to tell "waited in the queue" apart from
+"timed out", and the default of 0 keeps every other test instant.
+"""
+import os, sys, time
 open(os.environ["FAKE_SLURM_LOG"], "a").write("salloc " + " ".join(sys.argv[1:]) + "\n")
-print("salloc: Pending job allocation 4242", file=sys.stderr)
-print("salloc: Granted job allocation 4242", file=sys.stderr)
+print("salloc: Pending job allocation 4242", file=sys.stderr, flush=True)
+time.sleep(float(os.environ.get("FAKE_SALLOC_QUEUE", 0)))
+print("salloc: Granted job allocation 4242", file=sys.stderr, flush=True)
 '''
 
 _SQUEUE = r'''#!@PYTHON@
-"""squeue: pending for the first call, then running on localhost."""
+"""squeue: pending for the first call, then running on localhost -- and gone once
+the job has been cancelled.
+
+THE CANCELLED HALF MATTERS AS MUCH AS THE QUEUE HALF. The teardown does not trust
+its own `scancel` to have worked; it asks Slurm afterwards. A fake that answered
+RUNNING forever would make every clean release report a failure, and one that
+answered nothing would make a failed release look clean.
+"""
 import os, sys
-path = os.environ["FAKE_SLURM_LOG"] + ".squeue"
+log = os.environ["FAKE_SLURM_LOG"]
+argv = sys.argv[1:]
+job = argv[argv.index("-j") + 1] if "-j" in argv else ""
+cancelled = set()
+if os.path.exists(log + ".cancelled"):
+    cancelled = set(open(log + ".cancelled").read().split())
+if job and job in cancelled:
+    sys.exit(0)                      # not in the queue: no line at all
+path = log + ".squeue"
 calls = 0
 if os.path.exists(path):
     calls = int(open(path).read() or 0)
@@ -228,7 +264,10 @@ else:
 
 _SCANCEL = r'''#!@PYTHON@
 import os, sys
-open(os.environ["FAKE_SLURM_LOG"], "a").write("scancel " + " ".join(sys.argv[1:]) + "\n")
+log = os.environ["FAKE_SLURM_LOG"]
+open(log, "a").write("scancel " + " ".join(sys.argv[1:]) + "\n")
+ids = [a for a in sys.argv[1:] if not a.startswith("-")]
+open(log + ".cancelled", "a").write(" ".join(ids) + "\n")
 '''
 
 

@@ -45,6 +45,12 @@ name, the job's lifetime, the teardown -- hangs off that pipe staying alive. Wit
 returns: the allocation exists on its own, `squeue` says where it is, `srun
 --jobid=` puts work on it and `scancel` ends it. Nothing depends on a pipe.
 
+WHAT `--no-shell` DOES NOT DO is return before the allocation is GRANTED. On a
+full GPU partition that is however long the queue is, so salloc is started as a
+process this watches rather than a command this waits on: Slurm prints "Pending
+job allocation N" at submission, and that id is enough to poll `squeue` for the
+state and the reason, show them, and let Cancel end the wait (step 4, below).
+
 HOW THE PASSWORD AND THE ONE-TIME CODE GET IN. ssh will not read a secret from a
 pipe -- deliberately, and no amount of arranging changes that. What it will do is
 run an SSH_ASKPASS helper and use what it prints. So this writes a small helper
@@ -281,6 +287,7 @@ class RemoteSession:
         self._bridge = None
         self._master = None                 # the ControlMaster ssh process
         self._server_proc = None            # the srun holding the server
+        self._salloc_proc = None            # the salloc waiting in the queue
         self._control_path = None
         self._tmpdir = None
         self._thread = None
@@ -786,21 +793,100 @@ class RemoteSession:
         target = self.target
         self._say(f"asking for {target.gpus} GPU on {target.partition} "
                   f"for {target.time}", ALLOCATE)
-        proc = self._remote(" ".join(target.salloc_args()), timeout=120,
-                            check=False)
-        text = proc.stdout + proc.stderr
-        for line in text.splitlines():
-            if line.strip():
-                self._log_line("salloc: " + line.strip())
-        match = re.search(r"Granted job allocation (\d+)", text)
-        if not match:
-            raise SessionError("salloc did not grant an allocation: "
-                               + (text.strip().splitlines() or ["no output"])[-1])
-        self.job_id = match.group(1)
+        # NOTHING IS ASKED FOR AFTER THE SESSION HAS BEEN TOLD TO STOP. Every other
+        # step reaches the cluster through `_remote`, which refuses once `_cancel`
+        # is set; this one starts its own process, so it checks for itself. Without
+        # it, a Disconnect landing here submits the allocation anyway -- and the
+        # teardown that Disconnect ran has already been and gone.
+        if self._cancel.is_set():
+            raise SessionError("cancelled")
+        self._submit_allocation()
         self._say(f"job {self.job_id} allocated; waiting for the node")
-        # A queued job is normal and can take a while; report the reason so the
-        # wait is legible rather than a spinner.
-        deadline = time.monotonic() + 1800
+        self._await_node()
+
+    def _submit_allocation(self):
+        """Start `salloc --no-shell` and set `job_id` as soon as it names one.
+
+        WATCHED AS A PROCESS, NOT WAITED ON AS A CALL, and that is the whole point:
+        `--no-shell` returns as soon as the allocation is GRANTED, which on a busy
+        GPU partition is not two minutes -- it is however long the people ahead of
+        you take. Running it under a fixed-timeout `_remote` therefore failed the
+        connect with "remote command timed out after 120s" whenever the queue was
+        anything but empty, which is the ordinary case rather than the exceptional
+        one.
+
+        Slurm names the job the moment it is submitted ("salloc: Pending job
+        allocation N"), long before it grants it, so reading the output live gets
+        the id out of a still-queued request -- and an id is what turns the wait
+        into something with a state, a reason and a Cancel behind it (`_await_node`)
+        rather than an ssh sitting silently on a timeout.
+        """
+        argv = self._ssh_base() + [
+            self.target.destination,
+            self._login_shell(" ".join(self.target.salloc_args()))]
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, start_new_session=True)
+        self._salloc_proc = proc
+        named = threading.Event()
+        found = {}
+        lines = []
+
+        def watch():
+            for line in iter(proc.stdout.readline, ""):
+                line = line.rstrip()
+                if not line:
+                    continue
+                lines.append(line)
+                self._log_line("salloc: " + line)
+                match = re.search(r"(?:Pending|Granted) job allocation (\d+)", line)
+                if match and "id" not in found:
+                    found["id"] = match.group(1)
+                    # PUBLISHED FROM THE WATCHER, not from the return value, and
+                    # that ordering is the whole point: from the instant Slurm names
+                    # a job there is something that can hold a GPU, and `_teardown`
+                    # cancels whatever `job_id` holds. Setting it only once
+                    # `_submit_allocation` returned left a window -- short, but
+                    # exactly the one a Disconnect during the queue wait lands in --
+                    # where the allocation existed and the session did not know its
+                    # number, so the teardown found nothing to cancel and the job
+                    # ran on alone.
+                    self.job_id = match.group(1)
+                    named.set()
+
+        reader = threading.Thread(target=watch, name="salloc-log", daemon=True)
+        reader.start()
+        deadline = time.monotonic() + self.target.queue_wait
+        while not named.wait(0.5):
+            if self._cancel.is_set():
+                raise SessionError("cancelled")
+            if proc.poll() is not None:
+                # Drain first: a salloc that failed outright exits within
+                # milliseconds of printing why, and the reader thread may not have
+                # been scheduled yet. Reporting "no output" there would throw away
+                # the only line that says what went wrong.
+                reader.join(timeout=5.0)
+                if named.is_set():
+                    break
+                raise SessionError("salloc did not grant an allocation: "
+                                   + (lines[-1] if lines else "no output"))
+            if time.monotonic() > deadline:
+                raise SessionError(
+                    f"salloc never named a job in "
+                    f"{self.target.queue_wait / 60:.0f} minutes")
+
+    def _await_node(self):
+        """Poll the queue until the job is running and has a node.
+
+        A queued job is normal and can sit for the best part of an hour, so this
+        reports Slurm's own state and reason -- "queued: PENDING Resources", with
+        the minutes so far once there are any -- rather than spinning silently. The
+        poll eases off after the first minute: a busy queue is answered by waiting,
+        not by asking more often, and every ask is an ssh round trip on the shared
+        master connection.
+        """
+        deadline = time.monotonic() + self.target.queue_wait
+        started = time.monotonic()
         last = None
         while time.monotonic() < deadline:
             if self._cancel.is_set():
@@ -818,13 +904,18 @@ class RemoteSession:
                 self.node = self._single_hostname(node)
                 self._say(f"got {self.node}")
                 return
+            waited = time.monotonic() - started
             status = f"queued: {state} {reason}".strip()
+            if waited >= 60:
+                status += f" ({waited / 60:.0f} min)"
             if status != last:
                 self._say(status)
                 last = status
-            time.sleep(3.0)
-        raise SessionError("the allocation never started -- the queue is busy; "
-                           "the job has been cancelled")
+            time.sleep(3.0 if waited < 60 else 15.0)
+        raise SessionError(
+            f"the allocation never started within "
+            f"{self.target.queue_wait / 60:.0f} minutes -- the queue is busy; "
+            f"the job has been cancelled")
 
     def _single_hostname(self, nodelist):
         """One real hostname from what squeue printed.
@@ -1240,15 +1331,21 @@ class RemoteSession:
     def _teardown(self):
         """Undo everything, in the order that leaves nothing stranded.
 
-        Stop drawing, stop the job, stop the forward, close the login: cancelling
-        the job first would leave the client blocked on a socket that will never
-        answer again. Each field is taken and cleared under the lock before it is
-        used, so two threads arriving here at once (the worker abandoning a failed
-        step, the window closing) cannot trip over each other's cleanup.
+        Stop drawing, stop the job, stop the forward, close the login. The link
+        goes first because cancelling underneath it would leave the client blocked
+        on a socket that will never answer again; the job goes next, ahead of the
+        tunnel and the login, because it is the only one of these that costs
+        anything to still be holding a minute from now -- and the tunnel's kill
+        alone is worth ten seconds of waiting that the GPU should not be behind.
+
+        Each field is taken and cleared under the lock before it is used, so two
+        threads arriving here at once (the worker abandoning a failed step, the
+        window closing) cannot trip over each other's cleanup.
         """
         with self._teardown_lock:
             link, self.link = self.link, None
             server, self._server_proc = self._server_proc, None
+            salloc, self._salloc_proc = self._salloc_proc, None
             tunnel, self._tunnel_proc = self._tunnel_proc, None
             job_id, self.job_id = self.job_id, None
             forwarded, self._forwarded = self._forwarded, None
@@ -1272,6 +1369,24 @@ class RemoteSession:
                 server.terminate()
             except Exception:                          # noqa: BLE001
                 pass
+        if salloc is not None and salloc.poll() is None:
+            # Still queued, then -- a granted salloc --no-shell has long since
+            # exited. Killing it is what gives up the place in the queue: a
+            # pending request that nobody is waiting for would otherwise be
+            # granted later and hold a GPU with nothing on it. Dropping the ssh
+            # hangs up on the far side's salloc, which cancels its own pending
+            # request; the scancel below is the guarantee, this is the immediate
+            # one and it does not need another round trip to be sure of.
+            try:
+                salloc.terminate()
+            except Exception:                          # noqa: BLE001
+                pass
+        if job_id and not self._release_job(job_id, control):
+            # NOT CONFIRMED GONE, so it is still ours: put the id back rather than
+            # forgetting it. A second teardown then tries again, the report the
+            # panel copies names the job that has to be cancelled by hand, and the
+            # one failure with a bill attached stops being silent.
+            self.job_id = job_id
         if tunnel is not None:
             # The two-hop tunnel is a process of its own; killing it takes the
             # forward and the session on the node with it.
@@ -1281,12 +1396,6 @@ class RemoteSession:
             except subprocess.TimeoutExpired:
                 tunnel.kill()
             except OSError:
-                pass
-        if job_id and control and os.path.exists(control):
-            try:
-                self._remote_over(control, f"scancel {job_id}")
-                self._log_line(f"scancel {job_id}")
-            except Exception:                          # noqa: BLE001
                 pass
         if forwarded and control and os.path.exists(control):
             self._control_op(control, ["-O", "cancel", "-L", forwarded])
@@ -1302,6 +1411,89 @@ class RemoteSession:
             shutil.rmtree(tmpdir, ignore_errors=True)
             self._control_path = None
 
+    # How long the release may spend on any one ssh. Short on purpose: this runs
+    # while the window is closing, and a laptop being shut must not sit out a
+    # two-minute timeout on a connection that is already gone. Two routes are tried
+    # inside this budget, so the whole release is bounded by about four times it.
+    RELEASE_TIMEOUT = 15
+
+    # What `squeue` prints for a job that still has the GPU. Anything else -- no
+    # line at all, or a state that has stopped -- means the scancel took. CANCELLED
+    # and COMPLETING both appear for a few seconds after a successful scancel and
+    # must NOT be read as a failure, or every clean teardown would report one.
+    HOLDING_STATES = ("PENDING", "RUNNING", "CONFIGURING", "SUSPENDED", "RESIZING")
+
+    def _release_job(self, job_id, control):
+        """Cancel `job_id`, and check with Slurm that it actually went.
+
+        TWO ROUTES, BECAUSE THE CONTROL MASTER IS NOT A GUARANTEE. It is the first
+        thing a dropped network takes and the last thing a teardown can lean on,
+        and there are ordinary ways to reach here without one: a session torn down
+        twice (the second teardown has already removed the socket), a connect
+        thread that got its job id a moment after the window closed, an ssh master
+        that died while the allocation lived on. Every one of those used to end in
+        the same place -- the `scancel` quietly skipped, and an A100 held until
+        Slurm's own `--time` ran out an hour later.
+
+        So the master is tried first (it costs nothing and needs no authentication)
+        and a connection of its own second. That one is BatchMode: with no
+        interactive fallback it fails in seconds against a cluster that would ask
+        for a password, rather than stopping the shutdown on a prompt that nobody
+        is there to answer.
+
+        FIRING IT IS NOT THE SAME AS IT HAVING WORKED, which is why each route ends
+        with a `squeue`. Returns True only when Slurm agrees the job has stopped.
+        """
+        routes = []
+        if control and os.path.exists(control):
+            routes.append(["ssh", "-S", control])
+        routes.append(["ssh", "-o", "BatchMode=yes",
+                       "-o", "StrictHostKeyChecking=accept-new",
+                       "-o", f"ConnectTimeout={self.RELEASE_TIMEOUT}"])
+        for prefix in routes:
+            self._release_over(prefix, f"scancel {job_id}")
+            state = self._job_state(prefix, job_id)
+            if state is not None and state not in self.HOLDING_STATES:
+                self._log_line(f"scancel {job_id}: released"
+                               + (f" ({state})" if state else ""))
+                return True
+        self._log_line(
+            f"scancel {job_id} COULD NOT BE CONFIRMED -- the job may still be "
+            f"holding a GPU. Check it with `squeue -j {job_id}` and cancel it by "
+            f"hand if it is still there.")
+        return False
+
+    def _release_over(self, prefix, command):
+        """One teardown command down one route. Never raises: a route that does not
+        work is the reason the next one is tried."""
+        try:
+            return subprocess.run(prefix + [self.target.destination,
+                                            self._login_shell(command)],
+                                  capture_output=True, text=True,
+                                  timeout=self.RELEASE_TIMEOUT)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _job_state(self, prefix, job_id):
+        """Slurm's state for `job_id`: "" if it is no longer in the queue at all,
+        None if the question could not be asked (which is not an answer, and must
+        not be mistaken for one)."""
+        proc = self._release_over(prefix, f"squeue -h -j {job_id} -o %T")
+        if proc is None:
+            return None
+        text = (proc.stdout or "").strip()
+        if proc.returncode != 0:
+            # `squeue` refuses an id it has never heard of ("Invalid job id
+            # specified"), which is the strongest possible confirmation: Slurm has
+            # forgotten the job entirely. Any other failure is the ssh's, and says
+            # nothing about the job.
+            if "invalid job id" in (proc.stderr or "").lower():
+                return ""
+            return None
+        # The fields are separated for the caller elsewhere; take the first
+        # whatever the separator, so this reads the same output `_await_node` does.
+        return text.replace("|", " ").split()[0] if text else ""
+
     def _control_op(self, control, args):
         """One `ssh -O ...` control operation, ignoring its outcome -- during
         teardown there is nothing useful to do about a failure."""
@@ -1309,13 +1501,6 @@ class RemoteSession:
             return
         subprocess.run(["ssh", "-S", control] + args + [self.target.destination],
                        capture_output=True, text=True)
-
-    def _remote_over(self, control, command, timeout=60):
-        """Like `_remote`, but with the control path passed in: teardown has
-        already cleared the instance's copy."""
-        subprocess.run(["ssh", "-S", control, self.target.destination,
-                        self._login_shell(command)],
-                       capture_output=True, text=True, timeout=timeout)
 
 
 # --- driving it from a terminal -----------------------------------------------

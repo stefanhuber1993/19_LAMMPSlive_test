@@ -21,6 +21,8 @@ import time
 import numpy as np
 import pytest
 
+from lammps_live.playground import jitter
+from lammps_live.playground.system import JITTER_KEY
 from lammps_live.remote import RemoteTarget, protocol
 from lammps_live.remote.client import FrameLink, LinkClosed
 from lammps_live.remote import server as server_mod
@@ -211,15 +213,26 @@ def test_frames_arrive_and_are_the_servers_state(system, server):
     assert positions.min() > -9.5 and positions.max() < 9.5
     assert positions.std() > 2.0
 
-    # The same coordinates the server holds, to the codec's precision. Compared
-    # with the run PAUSED and after a frame taken since: the server is uncapped in
-    # this test and would otherwise have integrated past the frame being checked,
-    # which reads as a codec error of a tenth of a sigma.
+    # The same coordinates the server holds, to the codec's precision. Three
+    # things have to be arranged before that comparison means anything:
+    #
+    #  * PAUSED, and with a frame taken since. The server is uncapped in this test
+    #    and would otherwise have integrated past the frame being checked, which
+    #    reads as a codec error of a tenth of a sigma.
+    #  * LIVELINESS OFF. The drawn state is deliberately not the received state --
+    #    the synthetic rattle (playground/jitter.py) moves every bead by design,
+    #    so leaving it on turns this into an assertion about the fill's amplitude
+    #    instead of the codec's precision. Same reasoning as the Smoothing slider,
+    #    which is off by default and so never had to be said out loud.
+    #  * A FRAME DRAWN AFTER the slider moved, so the render cache is rebuilt
+    #    without the wobble rather than handing back the last filled one.
     system.set_playing(False)
+    system.set_extra_param(JITTER_KEY, 0.0)
     _advance(system, frames=3)
     remote_state = srv.system.current_state()
     drawn = system.get_positions_3d()[1]
     assert np.abs(drawn - remote_state.positions).max() < 5e-3
+    system.set_extra_param(JITTER_KEY, jitter.DEFAULT_JITTER)
     system.set_playing(True)
 
     directors = system.get_dipoles_3d()
@@ -320,6 +333,49 @@ def test_reset_rebuilds_on_the_far_side(system, server):
     assert np.abs(after - before).max() > 1.0        # a genuinely new configuration
     # ... and the notice clears itself once frames from the new run arrive.
     assert not any("rebuilding" in line for line in system.get_hud_lines())
+
+
+def test_a_new_run_is_recognised_from_a_standing_start(playground_file):
+    """The rule that clears the rebuild notice, and the hole that used to be in it.
+
+    The far side restarts its frame numbering on a rebuild, so the client knows the
+    new run by a frame numbered at or below the one it was on. With nothing ingested
+    yet that number is 0, and no sequence number is ever <= 0 -- so a Reset pressed
+    before the first frame landed left the notice on forever, over a run that was
+    streaming perfectly well. Narrow, and exactly where somebody who has just
+    connected and does not like what they see is standing.
+    """
+    from lammps_live.playground import registry
+    sys_ = registry.build(playground_file)
+    try:
+        sys_._seq = 0                      # before the first frame of all
+        assert sys_._is_new_run(1)         # <- used to be False, and latched
+        sys_._seq = 37                     # mid-run, the ordinary case
+        assert sys_._is_new_run(1)
+        assert not sys_._is_new_run(38)    # just the next frame of the same run
+    finally:
+        sys_.close()
+
+
+def test_a_reset_that_never_went_out_does_not_claim_to_be_rebuilding(system,
+                                                                     monkeypatch):
+    """`send` answers False on a socket that has died rather than raising -- a
+    slider must not be able to end the app -- so latching the notice before asking
+    left the HUD reporting a rebuild that nothing on the far side had heard of."""
+    monkeypatch.setattr(system.link, "send", lambda message: False)
+    system.reset()
+    assert not system._resetting
+    assert not any("rebuilding" in line for line in system.get_hud_lines())
+
+
+def test_the_rebuild_notice_counts_the_seconds(system):
+    """The only two explanations available to somebody watching a picture that has
+    stopped are "slow" and "hung", and they look identical. A number that is going
+    up is the difference -- and at this playground's size a rebuild there is a whole
+    LAMMPS setup, so slow is the common answer."""
+    system.reset()
+    line = next(l for l in system.get_hud_lines() if "rebuilding" in l)
+    assert line.rstrip().endswith("s"), line
 
 
 def test_energies_are_only_sent_when_the_colouring_asks(system, server):

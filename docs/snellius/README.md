@@ -26,6 +26,15 @@ node builds the same `Playground` file the client draws, so there is exactly one
 definition of the experiment. Select it in the app (key 4, or Tab), press **N**, and
 press Connect.
 
+`mesomem_polymer` is the second playground on the same target and reaches the node
+by exactly the same route -- a closed vesicle with a melt of ring polymers sealed
+inside it, ~50,000 particles, which is the collaborator's `polymer/` system built
+from the same `Playground` file rather than from a data file. It asks two things of
+the node's LAMMPS that `mesomem_remote` does not, both of which the in-tree build
+already has: the MOLECULE package (`bond_style fene`, `angle_style cosine`), and an
+atom style carrying the molecule and bond fields -- which is what
+`dipole_sphere_angle` is, and why it is named that.
+
 What the panel then does, and roughly how long each step takes:
 
 | step | what runs | typical |
@@ -33,7 +42,7 @@ What the panel then does, and roughly how long each step takes:
 | login | one SSH `ControlMaster` -- prompts appear in the panel | you type it |
 | deploy | `tar` of `lammps_live/` over that connection into `~/.lammps_live_remote` | ~2 s |
 | probe | `python -m lammps_live.remote.probe --level light` on the LOGIN node: interpreter, numpy, the module files | ~20 s |
-| allocate | `salloc --no-shell`, then `squeue` until the node appears | queue |
+| allocate | `salloc --no-shell`, then `squeue` until the node appears -- the job id comes off Slurm's `Pending` line, so the wait is polled and reported rather than blocked on | queue, up to an hour |
 | check | `srun --jobid=N ... probe --level full` on the NODE: opens liblammps, reads the styles and the `pair_coeff` arity | ~15 s |
 | launch | `srun --jobid=N python -m lammps_live.remote.server` | ~10 s |
 | tunnel | a second `ssh` that ENDS on the node, jumping through the login node over the connection that is already authenticated | instant |
@@ -113,9 +122,9 @@ lammps-live --playground mesomem_remote --remote 127.0.0.1:5723 --token dev
 
 ### What the wire carries
 
-Positions as 3 x uint16 over the cell, directors octahedral-16, per-bead energies as
-uint8 and only while the energy colouring is switched on: 10 B/bead, so 100 kB and
-6 MB/s at 10k and 60 fps. Control goes the other way as JSON -- one message per
+Positions as 3 x 12 bits over the cell (packed two codes to three bytes), directors
+octahedral-8, per-bead energies as uint8 and only while the energy colouring is
+switched on: 6.5 B/bead, so 65 kB and 3.9 MB/s at 10k and 60 fps. Control goes the other way as JSON -- one message per
 slider change, which is the same LAMMPS command the local app issues on itself.
 Details and the measured precision in `lammps_live/remote/protocol.py`; the
 bandwidth table it implements is §5 of ../a100-plan.md.
